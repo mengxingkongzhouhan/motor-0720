@@ -24,9 +24,10 @@ class Workload(BaseModel):
 
     active_kv_cache: float = Field(default=0, description="Active KV cache size")
     active_tokens: float = Field(default=0, description="Number of active requests")
-    prefill_cost: float = Field(
+    prefill_cost: int = Field(
         default=0,
-        description="Outstanding KV-affinity prefill cost on this endpoint; 0 for other policies",
+        description="KV-affinity prefill cost of in-flight requests on this endpoint; "
+        "released with tokens; 0 for other policies",
     )
 
     def __iadd__(self, other):

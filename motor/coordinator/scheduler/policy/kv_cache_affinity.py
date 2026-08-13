@@ -237,7 +237,7 @@ class KvCacheAffinityPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         tenant: dict,
         isl: int,
         overlap_credit: float,
-    ) -> tuple[list[tuple[float, int, float, Instance, Endpoint]], bool]:
+    ) -> tuple[list[tuple[float, int, int, Instance, Endpoint]], bool]:
         """
         Build the per-endpoint scoring tuples shared by the load-aware selection modes.
 
@@ -247,7 +247,7 @@ class KvCacheAffinityPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         ``(candidates, any_instance)``; ``any_instance`` distinguishes "conductor reported nothing
         for our instances" (fall back) from "reported, but no endpoints".
         """
-        candidates: list[tuple[float, int, float, Instance, Endpoint]] = []
+        candidates: list[tuple[float, int, int, Instance, Endpoint]] = []
         any_instance = False
         for instance in instances:
             instance_data = tenant.get(conductor_instance_id(instance), None)
@@ -263,7 +263,7 @@ class KvCacheAffinityPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
                 # /query spec); cap at the prompt length as a safety bound, since a matched
                 # prefix cannot be longer than the prompt itself.
                 matched_tokens = min(matched, isl) if isl > 0 else 0
-                prefill_cost = max(0.0, isl - overlap_credit * matched_tokens)
+                prefill_cost = max(0, round(isl - overlap_credit * matched_tokens))
                 load_cost = ep.workload.calculate_workload_score(PDRole.ROLE_P)
                 candidates.append((load_cost, matched_tokens, prefill_cost, instance, ep))
         return candidates, any_instance
@@ -271,7 +271,7 @@ class KvCacheAffinityPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
     @staticmethod
     def _stash_affinity_debug(
         req_info: RequestInfo | None,
-        raw: list[tuple[float, int, float, Instance, Endpoint]],
+        raw: list[tuple[float, int, int, Instance, Endpoint]],
     ) -> None:
         """
         Cache per-endpoint ``(matched_tokens, load_cost, prefill_cost)`` on ``req_info``.
@@ -285,7 +285,8 @@ class KvCacheAffinityPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
           them by its own fresh load (``prefill_load_scale * prefill_cost + load_weight * load``) --
           a global selection with no fixed top-k;
         * workload accounting, which adds the committed endpoint's ``prefill_cost`` to that
-          endpoint's ledger (other policies leave this cache unset, so the field stays 0).
+          endpoint's ledger until tokens are released (other policies leave this cache unset, so
+          the field stays 0).
 
         Best-effort: never fail selection over a debug cache.
         """

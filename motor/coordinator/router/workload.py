@@ -115,15 +115,17 @@ class WorkloadActionHandler:
                 return (None, None)
             workload_change = Workload(
                 active_kv_cache=-current_workload.active_kv_cache,
-                prefill_cost=-current_workload.prefill_cost,
             )
             current_workload.active_kv_cache = 0
-            current_workload.prefill_cost = 0
             if attempt_seq is None:
                 await request_mgr.update_req_workload(req_id, role, current_workload)
             else:
                 await request_mgr.update_req_attempt_workload(req_id, attempt_seq, role, current_workload)
             if current_workload.active_tokens <= 0:
+                # Tokens already gone: drop leftover prefill_cost so the endpoint ledger cannot leak.
+                if current_workload.prefill_cost:
+                    workload_change.prefill_cost = -current_workload.prefill_cost
+                    current_workload.prefill_cost = 0
                 if attempt_seq is None:
                     await request_mgr.del_req_workload(req_id, role)
                 else:
@@ -140,16 +142,17 @@ class WorkloadActionHandler:
                     "Request %s attempt %s not allocated for role %s, tokens release ignored", req_id, attempt_seq, role
                 )
                 return (None, None)
-            workload_change = Workload(active_tokens=-current_workload.active_tokens)
+            workload_change = Workload(
+                active_tokens=-current_workload.active_tokens,
+                prefill_cost=-current_workload.prefill_cost,
+            )
             current_workload.active_tokens = 0
+            current_workload.prefill_cost = 0
             if attempt_seq is None:
                 await request_mgr.update_req_workload(req_id, role, current_workload)
             else:
                 await request_mgr.update_req_attempt_workload(req_id, attempt_seq, role, current_workload)
             if current_workload.active_kv_cache <= 0:
-                if current_workload.prefill_cost:
-                    workload_change.prefill_cost = -current_workload.prefill_cost
-                    current_workload.prefill_cost = 0
                 if attempt_seq is None:
                     await request_mgr.del_req_workload(req_id, role)
                 else:

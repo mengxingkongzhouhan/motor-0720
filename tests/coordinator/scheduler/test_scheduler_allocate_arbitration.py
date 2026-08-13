@@ -740,7 +740,7 @@ async def test_allocate_only_stamps_selected_endpoint_prefill_cost():
             "candidates": [
                 {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 10000.0},
                 {"instance_id": 1, "endpoint_id": 11, "prefill_cost": 10000.0},
-                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 42.0},
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 42},
                 {"instance_id": 2, "endpoint_id": 21, "prefill_cost": 10000.0},
             ],
             "role": PDRole.ROLE_P.value,
@@ -761,7 +761,7 @@ async def test_allocate_only_stamps_selected_endpoint_prefill_cost():
     assert response.data["instance"]["id"] == 2
     assert response.data["endpoint"]["id"] == 20
     _, selected_workload = await instance_manager.get_endpoint_workload(2, 20)
-    assert selected_workload.prefill_cost == 42.0
+    assert selected_workload.prefill_cost == 42
     assert selected_workload.active_tokens == 53.0
     _, other_workload = await instance_manager.get_endpoint_workload(1, 10)
     assert other_workload.prefill_cost == 0
@@ -799,7 +799,7 @@ async def test_allocate_only_load_gated_prefill_cost_does_not_trigger_global_ran
             "endpoint_id": 10,
             "candidates": [
                 {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 0.0},
-                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 99.0},
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 99},
             ],
             "role": PDRole.ROLE_P.value,
             "req_id": "req-kv-load-gated-cost",
@@ -819,7 +819,7 @@ async def test_allocate_only_load_gated_prefill_cost_does_not_trigger_global_ran
     assert response.data["endpoint"]["id"] == 20
     _, selected_workload = await instance_manager.get_endpoint_workload(2, 20)
     assert selected_workload.active_tokens == 13
-    assert selected_workload.prefill_cost == 99.0
+    assert selected_workload.prefill_cost == 99
     _, skipped = await instance_manager.get_endpoint_workload(1, 11)
     assert skipped.active_tokens == 5
     assert skipped.prefill_cost == 0

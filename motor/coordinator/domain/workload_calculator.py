@@ -27,7 +27,7 @@ def affinity_prefill_cost(
     req_info: RequestInfo | None,
     instance_id: int | None = None,
     endpoint_id: int | None = None,
-) -> float:
+) -> int:
     """
     KV-affinity prefill cost for one endpoint, or 0 when absent.
 
@@ -35,23 +35,23 @@ def affinity_prefill_cost(
     leave that cache unset, so the endpoint ledger stays at the default 0.
     """
     if req_info is None or instance_id is None or endpoint_id is None:
-        return 0.0
+        return 0
     debug = getattr(req_info, "kv_affinity_debug", None)
     if not isinstance(debug, dict):
-        return 0.0
+        return 0
     rec = debug.get((instance_id, endpoint_id))
     if rec is None:
-        return 0.0
+        return 0
     try:
         cost = rec[2]
     except (IndexError, TypeError, KeyError):
-        return 0.0
+        return 0
     if cost is None:
-        return 0.0
+        return 0
     try:
-        return max(0.0, float(cost))
+        return max(0, int(round(float(cost))))
     except (TypeError, ValueError):
-        return 0.0
+        return 0
 
 
 def calculate_demand_workload(role: PDRole, req_info: RequestInfo) -> Workload:

@@ -739,7 +739,7 @@ class _SchedulerRequestDispatcher:
             return None
 
     @staticmethod
-    def _extract_affinity_candidates(data: dict) -> list[tuple[int, int, float]]:
+    def _extract_affinity_candidates(data: dict) -> list[tuple[int, int, int]]:
         """
         Parse worker-reported candidates that include an affinity-discounted ``prefill_cost``.
 
@@ -748,7 +748,7 @@ class _SchedulerRequestDispatcher:
         the field is absent (other policies). Entries missing a numeric prefill_cost are skipped.
         """
         raw = data.get(_KEY_CANDIDATES)
-        result: list[tuple[int, int, float]] = []
+        result: list[tuple[int, int, int]] = []
         if not isinstance(raw, list):
             return result
         for item in raw:
@@ -760,22 +760,22 @@ class _SchedulerRequestDispatcher:
             if instance_id is None or endpoint_id is None or prefill_cost is None:
                 continue
             try:
-                result.append((int(instance_id), int(endpoint_id), float(prefill_cost)))
+                result.append((int(instance_id), int(endpoint_id), max(0, int(round(float(prefill_cost))))))
             except (TypeError, ValueError):
                 continue
         return result
 
     @staticmethod
     def _lookup_candidate_prefill_cost(
-        affinity_candidates: list[tuple[int, int, float]],
+        affinity_candidates: list[tuple[int, int, int]],
         instance_id: int,
         endpoint_id: int,
-    ) -> float:
+    ) -> int:
         """Return the committed endpoint's KV-affinity prefill_cost, or 0 when absent."""
         for cand_instance_id, cand_endpoint_id, cost in affinity_candidates:
             if cand_instance_id == instance_id and cand_endpoint_id == endpoint_id:
-                return max(0.0, cost)
-        return 0.0
+                return cost
+        return 0
 
     @staticmethod
     def _extract_allocate_candidate(data: dict) -> tuple[int, int] | None:
@@ -823,7 +823,7 @@ class _SchedulerRequestDispatcher:
         candidates: list[tuple[int, int]],
         role: PDRole,
         candidate_policy: str | None,
-        affinity_candidates: list[tuple[int, int, float]] | None = None,
+        affinity_candidates: list[tuple[int, int, int]] | None = None,
         prefill_load_scale: float | None = None,
         load_weight: float | None = None,
     ) -> tuple[Instance, Endpoint, float] | None:
@@ -857,7 +857,7 @@ class _SchedulerRequestDispatcher:
 
     def _select_affinity_global(
         self,
-        affinity_candidates: list[tuple[int, int, float]],
+        affinity_candidates: list[tuple[int, int, int]],
         role: PDRole,
         prefill_load_scale: float | None,
         load_weight: float | None,
@@ -873,7 +873,7 @@ class _SchedulerRequestDispatcher:
         """
         pscale = prefill_load_scale if prefill_load_scale is not None else 1.0
         lweight = load_weight if load_weight is not None else 1.0
-        best: tuple[Instance, Endpoint, float, float] | None = None  # (..., combined, prefill_cost)
+        best: tuple[Instance, Endpoint, float, int] | None = None  # (..., combined, prefill_cost)
         for instance_id, endpoint_id, prefill_cost in affinity_candidates:
             if self._is_instance_circuit_open(instance_id):
                 continue

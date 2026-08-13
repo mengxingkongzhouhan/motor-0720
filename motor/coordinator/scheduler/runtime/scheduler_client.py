@@ -191,7 +191,7 @@ class _SchedulerInstanceCache:
         role: PDRole,
         active_tokens: float,
         active_kv_cache: float,
-        prefill_cost: float = 0.0,
+        prefill_cost: int = 0,
     ) -> None:
         """Patch single endpoint workload from shared memory. Skip if not in cache."""
         role_map = self._instance_map.get(role) or {}
@@ -211,7 +211,7 @@ class _SchedulerInstanceCache:
             cached_instance.gathered_workload = Workload()
         cached_instance.gathered_workload.active_tokens += active_tokens - old_workload.active_tokens
         cached_instance.gathered_workload.active_kv_cache += active_kv_cache - old_workload.active_kv_cache
-        cached_instance.gathered_workload.prefill_cost += prefill_cost - getattr(old_workload, "prefill_cost", 0.0)
+        cached_instance.gathered_workload.prefill_cost += prefill_cost - getattr(old_workload, "prefill_cost", 0)
 
     def _apply_role_under_lock(self, role: PDRole, instances: list[Instance]) -> None:
         """Update cache and maps for one role. Must be called with _lock held."""

@@ -63,7 +63,7 @@ class RequestInfo(BaseModel):
         description="Per-endpoint (matched_tokens, load_cost, prefill_cost) cached by the "
         "kv_cache_affinity policy at selection; the worker forwards prefill_cost for the "
         "scheduler's global fresh-load re-rank, stamps the committed endpoint's cost onto the "
-        "workload ledger, and logs matched/load for that endpoint. "
+        "workload ledger (released with tokens), and logs matched/load for that endpoint. "
         "Keyed by (instance_id, endpoint_id) tuples, so excluded from serialization.",
     )
     api: str = Field(..., description="API need to be forwarded")

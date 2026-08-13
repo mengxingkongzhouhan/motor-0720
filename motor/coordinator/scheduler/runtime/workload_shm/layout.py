@@ -44,9 +44,9 @@ HEARTBEAT_STALE_SEC = 5.0  # If heartbeat unchanged for this long, Infer treats 
 
 # Entry: 32 bytes
 # instance_id 4B, endpoint_id 4B, role 1B, padding 3B, active_tokens 8B, active_kv_cache 8B,
-# prefill_cost 4B (float32; 0 for non KV-affinity policies)
+# prefill_cost 4B (int32; 0 for non KV-affinity policies)
 ENTRY_SIZE = 32
-ENTRY_FMT = "<i i B 3x d d f"
+ENTRY_FMT = "<i i B 3x d d i"
 
 # Max number of (instance, endpoint) workload entries in shared memory. Not user-configurable.
 DEFAULT_WORKLOAD_SHM_MAX_ENTRIES = 10240
@@ -61,7 +61,7 @@ class WorkloadShmEntry:
     role: int
     active_tokens: float
     active_kv_cache: float
-    prefill_cost: float = 0.0
+    prefill_cost: int = 0
 
 
 @dataclass(frozen=True)
@@ -141,7 +141,7 @@ def pack_entry(entry: WorkloadShmEntry) -> bytes:
         entry.role,
         entry.active_tokens,
         entry.active_kv_cache,
-        entry.prefill_cost,
+        int(entry.prefill_cost),
     )
 
 

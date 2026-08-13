@@ -643,36 +643,43 @@ class _SchedulerRequestDispatcher:
             worker_instance_version,
             role,
         )
-        # SMetric's average/ratio gate must see every request from every Worker; skip the
-        # worker-top-1 fast path so this Scheduler's shared tracker is always consulted.
         if candidate_policy == CANDIDATE_POLICY_SMETRIC:
-            fast_path = False
-        selected = (
-            self._select_valid_candidate(selected_candidate, role)
-            if fast_path
-            else self._select_authoritative_allocate_candidate(
+            # Gate always runs here (shared average). If it keeps SMetric and the worker's view is
+            # fresh, honor that min-cost top-1 — that is the work the worker already did.
+            selected = self._select_smetric_hybrid(
                 selected_candidate,
-                selected_candidates,
-                role,
-                candidate_policy,
                 affinity_candidates,
-                worker_prefill_load_scale,
-                worker_load_weight,
-                worker_isl,
-            )
-        )
-        if fast_path and selected is None:
-            selected = self._select_authoritative_allocate_candidate(
-                selected_candidate,
-                selected_candidates,
                 role,
-                candidate_policy,
-                affinity_candidates,
-                worker_prefill_load_scale,
-                worker_load_weight,
                 worker_isl,
+                fast_path,
             )
-            fast_path = False
+            if selected is None or (selected[0].id, selected[1].id) != selected_candidate:
+                fast_path = False
+        else:
+            selected = (
+                self._select_valid_candidate(selected_candidate, role)
+                if fast_path
+                else self._select_authoritative_allocate_candidate(
+                    selected_candidate,
+                    selected_candidates,
+                    role,
+                    candidate_policy,
+                    affinity_candidates,
+                    worker_prefill_load_scale,
+                    worker_load_weight,
+                )
+            )
+            if fast_path and selected is None:
+                selected = self._select_authoritative_allocate_candidate(
+                    selected_candidate,
+                    selected_candidates,
+                    role,
+                    candidate_policy,
+                    affinity_candidates,
+                    worker_prefill_load_scale,
+                    worker_load_weight,
+                )
+                fast_path = False
         if selected is None:
             logger.warning(
                 "ALLOCATE_ONLY endpoint unavailable req_id=%s candidate=%s",
@@ -840,7 +847,6 @@ class _SchedulerRequestDispatcher:
         affinity_candidates: list[tuple[int, int, int]] | None = None,
         prefill_load_scale: float | None = None,
         load_weight: float | None = None,
-        isl: int | None = None,
     ) -> tuple[Instance, Endpoint, float] | None:
         """
         Select allocation target using SchedulerServer's authoritative workload view.
@@ -850,10 +856,7 @@ class _SchedulerRequestDispatcher:
         load_weight*fresh_load`` (a global selection that fuses affinity and the scheduler's fresh
         load -- the worker already did the affinity math, the scheduler supplies fresh load). Older
         affinity callers without per-endpoint prefill_cost fall back to "least-loaded among the
-        worker's ranked alternates". SMetric consults the Scheduler's running prefill_cost average:
-        above-average or ``cost/isl <= 0.5`` falls back to global load-balance, otherwise the
-        lowest ``prefill_cost`` wins. The running average is updated with the **committed**
-        endpoint's prefill_cost after allocation. Other policies keep the worker-proposed endpoint.
+        worker's ranked alternates". Other policies keep the worker-proposed endpoint.
         """
         if self._should_scan_global_load_balance(candidate_policy):
             selected = self._select_global_load_balance_candidate(role)
@@ -871,10 +874,6 @@ class _SchedulerRequestDispatcher:
                 selected = self._select_lowest_load_among_candidates(candidates, role)
                 if selected is not None:
                     return selected
-        if candidate_policy == CANDIDATE_POLICY_SMETRIC:
-            selected = self._select_smetric_hybrid(affinity_candidates, role, isl)
-            if selected is not None:
-                return selected
         return self._select_authoritative_candidate(candidate, role)
 
     def _select_affinity_global(
@@ -935,16 +934,22 @@ class _SchedulerRequestDispatcher:
 
     def _select_smetric_hybrid(
         self,
+        worker_candidate: tuple[int, int],
         smetric_candidates: list[tuple[int, int, int]] | None,
         role: PDRole,
         isl: int | None,
+        fast_path: bool,
     ) -> tuple[Instance, Endpoint, float] | None:
-        """Apply the shared average / ratio gate, then min-cost SMetric or global load-balance."""
+        """Gate on the shared average, then worker min-cost top-1, scheduler min-cost, or global LB."""
         if not smetric_candidates:
             return None
         req_cost = min(cost for _iid, _eid, cost in smetric_candidates)
         prompt_isl = isl if isl is not None else 0
         if self._smetric_prefill.use_smetric_rank(req_cost, prompt_isl):
+            if fast_path:
+                picked = self._select_valid_candidate(worker_candidate, role)
+                if picked is not None:
+                    return picked
             return self._select_smetric_min_cost(smetric_candidates, role)
         return self._select_global_load_balance_candidate(role)
 

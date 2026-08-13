@@ -130,10 +130,11 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
     """
     Score every reported endpoint by remaining prefill; the lowest cost is the SMetric candidate.
 
-    ``prefill_cost = max(0, isl - matched_tokens)`` (overlap_credit is always 1). Workers only
-    compute and forward these costs. The central Scheduler keeps a running average of the
-    **allocated** endpoint's prefill_cost and uses that, plus ``cost/isl``, to decide min-cost
-    ranking vs load-balance.
+    ``prefill_cost = max(0, isl - matched_tokens)`` (overlap_credit is always 1). Workers compute
+    and rank by these costs, then forward every endpoint cost plus the min-cost top-1 and ``isl``.
+    The central Scheduler keeps a running average of the **allocated** endpoint's prefill_cost
+    and uses that, plus ``cost/isl``, to decide min-cost ranking vs load-balance. When the gate
+    keeps SMetric and the worker's workload view is fresh, the worker top-1 is committed as-is.
 
     Conductor lookup and ``smetric_debug`` are owned here; KvCacheAffinityPolicy is not called.
     """

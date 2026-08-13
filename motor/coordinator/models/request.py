@@ -66,6 +66,12 @@ class RequestInfo(BaseModel):
         "workload ledger (released with tokens), and logs matched/load for that endpoint. "
         "Keyed by (instance_id, endpoint_id) tuples, so excluded from serialization.",
     )
+    smetric_debug: dict | None = Field(
+        default=None,
+        exclude=True,
+        description="Per-endpoint prefill_cost cached by the smetric policy at selection "
+        "(overlap_credit=1). Keyed by (instance_id, endpoint_id); excluded from serialization.",
+    )
     api: str = Field(..., description="API need to be forwarded")
     entry_api: str = Field(
         default="",

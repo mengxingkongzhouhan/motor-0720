@@ -23,6 +23,31 @@ from motor.common.utils.image_utils import get_mul_token
 logger = get_logger(__name__)
 
 
+def allocated_prefill_cost(
+    req_info: RequestInfo | None,
+    instance_id: int | None = None,
+    endpoint_id: int | None = None,
+) -> int:
+    """
+    Prefill cost stamped onto the committed endpoint's workload.
+
+    SMetric and KV affinity each keep their own request cache. Only one policy runs per
+    scheduler, so at most one cache is populated. Missing/invalid entries yield 0.
+    """
+    if req_info is None or instance_id is None or endpoint_id is None:
+        return 0
+    smetric = getattr(req_info, "smetric_debug", None)
+    if isinstance(smetric, dict):
+        rec = smetric.get((instance_id, endpoint_id))
+        if rec is None:
+            return 0
+        try:
+            return max(0, int(round(float(rec))))
+        except (TypeError, ValueError):
+            return 0
+    return affinity_prefill_cost(req_info, instance_id, endpoint_id)
+
+
 def affinity_prefill_cost(
     req_info: RequestInfo | None,
     instance_id: int | None = None,

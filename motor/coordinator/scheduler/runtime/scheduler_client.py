@@ -40,6 +40,7 @@ from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_LOAD_BALANCE,
     CANDIDATE_POLICY_ROUND_ROBIN,
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+    CANDIDATE_POLICY_SMETRIC,
     pack_send_frames,
     unpack_recv_payload,
     ZMQMessageSerializer,
@@ -55,7 +56,8 @@ from motor.coordinator.fault_tolerance.precision.streak_result import (
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.kv_cache_affinity import KvCacheAffinityPolicy
-from motor.coordinator.domain.workload_calculator import affinity_prefill_cost, calculate_demand_workload
+from motor.coordinator.scheduler.policy.smetric import SMetricPolicy
+from motor.coordinator.domain.workload_calculator import allocated_prefill_cost, calculate_demand_workload
 from motor.coordinator.domain.scheduling_pin import (
     resolve_pinned_instance,
     select_endpoint_for_instance,
@@ -138,9 +140,15 @@ def _candidate_endpoint_payload(
     instance_id: int,
     endpoint_id: int,
     affinity_debug: dict | None,
+    smetric_debug: dict | None = None,
 ) -> dict:
-    """Build one ALLOCATE_ONLY candidate; include prefill_cost when KV affinity cached it."""
+    """Build one ALLOCATE_ONLY candidate; include prefill_cost when a policy cached it."""
     item: dict = {"instance_id": instance_id, "endpoint_id": endpoint_id}
+    if isinstance(smetric_debug, dict):
+        cost = smetric_debug.get((instance_id, endpoint_id))
+        if cost is not None:
+            item["prefill_cost"] = cost
+            return item
     if not isinstance(affinity_debug, dict):
         return item
     rec = affinity_debug.get((instance_id, endpoint_id))
@@ -510,6 +518,8 @@ OnCircuitBreakerChangeNotify = Callable[[int, str], Awaitable[None]]
 _INSTANCE_PUB_SUB_SETTLE_MS = 150
 # Roles that should use kv_cache_affinity scheduling.
 _KVA_SELECT_ROLES = frozenset({PDRole.ROLE_P, PDRole.ROLE_U})
+# Roles that should use smetric scheduling (prefill_cost ranking).
+_SMETRIC_SELECT_ROLES = frozenset({PDRole.ROLE_P, PDRole.ROLE_U})
 
 
 class _InstancePushSubscriber:
@@ -893,6 +903,7 @@ class AsyncSchedulerClient:
                     instance.id,
                     endpoint.id,
                     getattr(req_info, "kv_affinity_debug", None),
+                    getattr(req_info, "smetric_debug", None),
                 )
             ]
         else:
@@ -921,6 +932,7 @@ class AsyncSchedulerClient:
             # global selection, no fixed top-k. Other policies/modes forward the worker's ranked
             # alternates (best-first) for the scheduler's existing re-pick.
             affinity_debug = getattr(req_info, "kv_affinity_debug", None)
+            smetric_debug = getattr(req_info, "smetric_debug", None)
             # Unified forwards every endpoint for a global re-rank. load_gated still proposes a
             # fixed ranked set (hard load bound) but includes per-endpoint prefill_cost so the
             # scheduler can credit the committed endpoint's affinity cost on the workload ledger.
@@ -930,7 +942,17 @@ class AsyncSchedulerClient:
                 and isinstance(affinity_debug, dict)
                 and any(rec[2] is not None for rec in affinity_debug.values())
             )
-            if global_affinity:
+            if candidate_policy == CANDIDATE_POLICY_SMETRIC and isinstance(smetric_debug, dict):
+                candidate_endpoints = [
+                    {
+                        "instance_id": ins_id,
+                        "endpoint_id": ep_id,
+                        "prefill_cost": cost,
+                    }
+                    for (ins_id, ep_id), cost in smetric_debug.items()
+                    if cost is not None
+                ]
+            elif global_affinity:
                 candidate_endpoints = [
                     {
                         "instance_id": ins_id,
@@ -942,7 +964,9 @@ class AsyncSchedulerClient:
                 ]
             else:
                 candidate_endpoints = [
-                    _candidate_endpoint_payload(cand_instance.id, cand_endpoint.id, affinity_debug)
+                    _candidate_endpoint_payload(
+                        cand_instance.id, cand_endpoint.id, affinity_debug, smetric_debug
+                    )
                     for cand_instance, cand_endpoint, _score in candidates
                 ]
 
@@ -1040,9 +1064,9 @@ class AsyncSchedulerClient:
                     instance.id,
                     endpoint.id,
                 )
-                # Stamp the committed endpoint's affinity cost so RequestManager can release it.
-                # Other policies leave kv_affinity_debug unset, so this stays 0.
-                workload.prefill_cost = affinity_prefill_cost(req_info, out_instance.id, out_endpoint.id)
+                # Stamp the committed endpoint's prefill_cost so RequestManager can release it.
+                # SMetric / KV affinity each keep their own cache; other policies stay 0.
+                workload.prefill_cost = allocated_prefill_cost(req_info, out_instance.id, out_endpoint.id)
                 return (out_instance, out_endpoint, workload)
         return None
 
@@ -1543,6 +1567,18 @@ class AsyncSchedulerClient:
             if candidates:
                 return candidates, CANDIDATE_POLICY_LOAD_BALANCE
             logger.warning("load_balance unavailable, falling back to round-robin")
+        elif st == "smetric":
+            if role in _SMETRIC_SELECT_ROLES:
+                ranked = SMetricPolicy.select_endpoint_candidates_from_list(
+                    instances, req_info, top_k=max(1, top_k)
+                )
+                if ranked:
+                    return ranked, CANDIDATE_POLICY_SMETRIC
+                logger.warning("smetric unavailable (no conductor match), falling back to load_balance")
+            candidates = self._select_endpoint_candidates_by_load_balance(instances, role, top_k)
+            if candidates:
+                return candidates, CANDIDATE_POLICY_LOAD_BALANCE
+            logger.warning("load_balance unavailable, falling back to round-robin")
         # Round-robin path: default policy or load_balance fallback
         if role not in self._instance_rr_counters:
             self._instance_rr_counters[role] = 0
@@ -1567,7 +1603,7 @@ class AsyncSchedulerClient:
         if not all_endpoints:
             return None
         st = self._scheduler_type or "round_robin"
-        if st in ("load_balance", "kv_cache_affinity"):
+        if st in ("load_balance", "kv_cache_affinity", "smetric"):
             ep = LoadBalancePolicy.select_endpoint_from_instance(instance)
             if ep:
                 return (instance, ep)

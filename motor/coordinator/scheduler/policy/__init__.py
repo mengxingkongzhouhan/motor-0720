@@ -7,7 +7,7 @@
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
 
-"""Scheduling policies: LoadBalance, RoundRobin, and factory."""
+"""Scheduling policies: LoadBalance, RoundRobin, KvCacheAffinity, SMetric, and factory."""
 
 __all__ = [
     "BaseSchedulingPolicy",

@@ -21,6 +21,7 @@ from motor.coordinator.scheduler.runtime.scheduler_server import _SchedulerReque
 from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
     CANDIDATE_POLICY_LOAD_BALANCE,
+    CANDIDATE_POLICY_SMETRIC,
     SchedulerRequest,
     SchedulerRequestType,
     SchedulerResponseType,
@@ -823,4 +824,66 @@ async def test_allocate_only_load_gated_prefill_cost_does_not_trigger_global_ran
     _, skipped = await instance_manager.get_endpoint_workload(1, 11)
     assert skipped.active_tokens == 5
     assert skipped.prefill_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_smetric_picks_lowest_cost_ignoring_load():
+    """SMetric ALLOCATE_ONLY ranks by prefill_cost only; a busier but cheaper endpoint wins."""
+    config = CoordinatorConfig()
+    config.scheduler_config.scheduler_type = SchedulerType.SMETRIC
+    config.scheduler_config.endpoint_instance_score_weight = 0.0
+    instance_manager = InstanceManager(config)
+
+    inst_a = _make_prefill_instance(1, (10, 11))
+    inst_b = _make_prefill_instance(2, (20, 21))
+    await instance_manager.refresh_instances(EventType.ADD, [inst_a, inst_b])
+    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=1))
+    await instance_manager.update_instance_workload(1, 11, Workload(active_tokens=1))
+    await instance_manager.update_instance_workload(2, 20, Workload(active_tokens=50))
+    await instance_manager.update_instance_workload(2, 21, Workload(active_tokens=1))
+
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    workload_writer = _DummyWorkloadWriter()
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager,
+        scheduler,
+        config,
+        workload_writer=workload_writer,
+    )
+    request = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-smetric-min-cost",
+        data={
+            "instance_id": 1,
+            "endpoint_id": 10,  # worker top-1 (stale)
+            "candidates": [
+                {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 100},
+                {"instance_id": 1, "endpoint_id": 11, "prefill_cost": 80},
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 12},
+                {"instance_id": 2, "endpoint_id": 21, "prefill_cost": 90},
+            ],
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-smetric-min-cost",
+            "workload_sequence": workload_writer.sequence - 2,
+            "instance_version": workload_writer.instance_version,
+            "workload_active_tokens": 3.0,
+            "workload_active_kv_cache": 3.0,
+            "candidate_policy": CANDIDATE_POLICY_SMETRIC,
+            # No prefill_load_scale / load_weight: must not enter KVA unified re-rank.
+        },
+    )
+
+    response = await dispatcher.dispatch(request)
+
+    assert response.response_type == SchedulerResponseType.SUCCESS
+    assert response.data["fast_path"] is False
+    assert response.data["instance"]["id"] == 2
+    assert response.data["endpoint"]["id"] == 20
+    _, selected_workload = await instance_manager.get_endpoint_workload(2, 20)
+    assert selected_workload.prefill_cost == 12
+    assert selected_workload.active_tokens == 53.0
+    _, other_workload = await instance_manager.get_endpoint_workload(1, 10)
+    assert other_workload.prefill_cost == 0
+    assert other_workload.active_tokens == 1
+    assert workload_writer.writes == [(2, 20)]
 

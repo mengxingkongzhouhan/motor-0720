@@ -20,7 +20,7 @@ from motor.common.resources.instance import PDRole
 from motor.common.logger import get_logger
 from motor.coordinator.domain.request_manager import RequestManager
 from motor.coordinator.domain import ScheduledResource
-from motor.coordinator.domain.workload_calculator import affinity_prefill_cost, calculate_demand_workload
+from motor.coordinator.domain.workload_calculator import allocated_prefill_cost, calculate_demand_workload
 from motor.coordinator.models.request import RequestInfo
 
 logger = get_logger(__name__)
@@ -88,7 +88,7 @@ class WorkloadActionHandler:
 
         if action == WorkloadAction.ALLOCATION:
             allocate_workload = calculate_demand_workload(role, req_info)
-            allocate_workload.prefill_cost = affinity_prefill_cost(
+            allocate_workload.prefill_cost = allocated_prefill_cost(
                 req_info, resource.instance.id, resource.endpoint.id
             )
             if attempt_seq is None:

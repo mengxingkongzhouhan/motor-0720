@@ -133,15 +133,15 @@ class TestCollectEntriesAndSlotMap(unittest.TestCase):
 
         self.assertEqual(
             entries[0],
-            (1, 10, ROLE_PREFILL, 100.0, 200.0),
+            (1, 10, ROLE_PREFILL, 100.0, 200.0, 0.0),
         )
         self.assertEqual(
             entries[1],
-            (2, 20, ROLE_DECODE, 300.0, 400.0),
+            (2, 20, ROLE_DECODE, 300.0, 400.0, 0.0),
         )
         self.assertEqual(
             entries[2],
-            (3, 30, ROLE_HYBRID, 500.0, 600.0),
+            (3, 30, ROLE_HYBRID, 500.0, 600.0, 0.0),
         )
 
     # ---------------------------------------------------------------
@@ -426,3 +426,22 @@ class TestWorkloadSharedMemoryWriter(unittest.TestCase):
                 b"\x00" * ENTRY_SIZE,
                 msg=f"Slot {slot} should be untouched",
             )
+
+    def test_pack_entry_round_trips_num_requests(self):
+        """num_requests occupies the former 4-byte padding slot."""
+        from motor.coordinator.scheduler.runtime.workload_shm.layout import unpack_entry
+
+        shm = _make_mock_shm()
+        writer = WorkloadSharedMemoryWriter(shm, MagicMock())
+        entry = WorkloadShmEntry(
+            instance_id=1,
+            endpoint_id=2,
+            role=ROLE_PREFILL,
+            active_tokens=40.0,
+            active_kv_cache=10.0,
+            num_requests=4.0,
+        )
+        writer._write_entry_at_slot(0, entry)
+        unpacked = unpack_entry(writer._buf, 0)
+        self.assertEqual(unpacked.num_requests, 4.0)
+        self.assertEqual(unpacked.active_tokens, 40.0)

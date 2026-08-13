@@ -43,6 +43,9 @@ def _clamp_workload_floor(workload: Workload) -> bool:
     if workload.active_kv_cache < 0:
         workload.active_kv_cache = 0.0
         floored = True
+    if workload.num_requests < 0:
+        workload.num_requests = 0.0
+        floored = True
     return floored
 
 
@@ -50,6 +53,7 @@ def _rebuild_instance_workload(instance: Instance) -> bool:
     """Rebuild an instance workload from its endpoint ledgers and floor invalid values."""
     active_tokens = 0.0
     active_kv_cache = 0.0
+    num_requests = 0.0
     floored = False
     for pod_endpoints in (instance.endpoints or {}).values():
         for endpoint in (pod_endpoints or {}).values():
@@ -58,9 +62,11 @@ def _rebuild_instance_workload(instance: Instance) -> bool:
             floored = _clamp_workload_floor(endpoint.workload) or floored
             active_tokens += endpoint.workload.active_tokens
             active_kv_cache += endpoint.workload.active_kv_cache
+            num_requests += endpoint.workload.num_requests
     instance.gathered_workload = Workload(
         active_tokens=active_tokens,
         active_kv_cache=active_kv_cache,
+        num_requests=num_requests,
     )
     return floored
 
@@ -210,7 +216,9 @@ class InstanceManager:
                 f"workload_floor:{instance_id}:{endpoint_id}",
                 "Workload floored to 0 (release exceeded allocation, accounting gap) "
                 f"instance_id={instance_id} endpoint_id={endpoint_id} "
-                f"change=(tokens={workload_change.active_tokens},kv={workload_change.active_kv_cache})",
+                f"change=(tokens={workload_change.active_tokens},"
+                f"kv={workload_change.active_kv_cache},"
+                f"reqs={workload_change.num_requests})",
                 window_sec=60,
                 level="WARNING",
             )

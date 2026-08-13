@@ -34,6 +34,7 @@ class TestCalculateDemandWorkload:
         assert w.active_kv_cache > 0
         assert w.active_tokens > 0
         assert w.active_kv_cache == w.active_tokens
+        assert w.num_requests == 1
 
     def test_prefill_role_uses_real_tokens_when_present(self):
         """ROLE_P: when req_info.token_ids is set, load is the real token count (not req_len)."""
@@ -43,6 +44,7 @@ class TestCalculateDemandWorkload:
         w = calculate_demand_workload(PDRole.ROLE_P, req_info)
         assert w.active_tokens == 5.0
         assert w.active_kv_cache == 5.0
+        assert w.num_requests == 1
 
     def test_prefill_role_falls_back_when_token_ids_empty(self):
         """ROLE_P: empty/absent token_ids falls back to the legacy byte-length heuristic."""
@@ -61,6 +63,7 @@ class TestCalculateDemandWorkload:
         w = calculate_demand_workload(PDRole.ROLE_D, req_info)
         assert w.active_tokens == 10.0
         assert w.active_kv_cache == 0
+        assert w.num_requests == 1
 
     def test_encode_role_uses_tokens_without_kv_cache(self, monkeypatch):
         """ROLE_E: encode allocation should not leave KV cache workload to release."""
@@ -210,9 +213,24 @@ class TestWorkloadActionHandler:
         assert role == PDRole.ROLE_P
         assert workload_change is not None
         assert workload_change.active_kv_cache == -100.0
+        assert workload_change.num_requests == 0
         mock_request_manager.update_req_workload.assert_called_once()
         # After RELEASE_KV, active_tokens still > 0 so del_req_workload not called
         mock_request_manager.del_req_workload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_release_kv_after_tokens_clears_request_count(self, mock_request_manager, valid_resource):
+        """Last release of a request also decrements endpoint num_requests."""
+        current = Workload(active_kv_cache=100.0, active_tokens=0.0, num_requests=1)
+        mock_request_manager.get_req_workload = AsyncMock(return_value=current)
+        handler = WorkloadActionHandler(mock_request_manager)
+        req_info = MagicMock()
+        workload_change, role = await handler.compute_and_update(
+            valid_resource, "req-1", WorkloadAction.RELEASE_KV, req_info=req_info
+        )
+        assert role == PDRole.ROLE_P
+        assert workload_change == Workload(active_kv_cache=-100.0, num_requests=-1)
+        mock_request_manager.del_req_workload.assert_called_once_with("req-1", PDRole.ROLE_P)
 
     @pytest.mark.asyncio
     async def test_compute_and_update_release_tokens_no_record_returns_none(self, mock_request_manager, valid_resource):
@@ -246,7 +264,7 @@ class TestWorkloadActionHandler:
             status=EndpointStatus.NORMAL,
         )
         resource = ScheduledResource(instance=instance, endpoint=endpoint)
-        current = Workload(active_tokens=42)
+        current = Workload(active_tokens=42, num_requests=1)
         mock_request_manager.get_req_workload = AsyncMock(return_value=current)
         handler = WorkloadActionHandler(mock_request_manager)
         req_info = MagicMock()
@@ -256,7 +274,7 @@ class TestWorkloadActionHandler:
         )
 
         assert role == PDRole.ROLE_E
-        assert workload_change == Workload(active_tokens=-42)
+        assert workload_change == Workload(active_tokens=-42, num_requests=-1)
         mock_request_manager.update_req_workload.assert_called_once()
         mock_request_manager.del_req_workload.assert_called_once_with("req-encode", PDRole.ROLE_E)
 

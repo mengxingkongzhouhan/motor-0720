@@ -170,6 +170,7 @@ class _SchedulerInstanceCache:
         role: PDRole,
         active_tokens: float,
         active_kv_cache: float,
+        num_requests: float = 0.0,
     ) -> None:
         """Patch single endpoint workload from shared memory. Skip if not in cache."""
         role_map = self._instance_map.get(role) or {}
@@ -183,11 +184,13 @@ class _SchedulerInstanceCache:
         cached_endpoint.workload = Workload(
             active_tokens=active_tokens,
             active_kv_cache=active_kv_cache,
+            num_requests=num_requests,
         )
         if cached_instance.gathered_workload is None:
             cached_instance.gathered_workload = Workload()
         cached_instance.gathered_workload.active_tokens += active_tokens - old_workload.active_tokens
         cached_instance.gathered_workload.active_kv_cache += active_kv_cache - old_workload.active_kv_cache
+        cached_instance.gathered_workload.num_requests += num_requests - getattr(old_workload, "num_requests", 0.0)
 
     def _apply_role_under_lock(self, role: PDRole, instances: list[Instance]) -> None:
         """Update cache and maps for one role. Must be called with _lock held."""
@@ -933,10 +936,11 @@ class AsyncSchedulerClient:
             "workload_sequence": workload_sequence,
             "role_workload_sequence": role_workload_sequence,
             "instance_version": self._last_instance_version,
-            # Workload demand as two raw floats: avoids a pydantic dump here and a model_validate on
-            # the scheduler. RR sends 0.0/0.0 (Workload() has no demand) rather than a dumped model.
+            # Workload demand as raw floats: avoids a pydantic dump here and a model_validate on
+            # the scheduler. RR sends 0.0/0.0/0.0 (Workload() has no demand) rather than a dumped model.
             "workload_active_tokens": workload.active_tokens,
             "workload_active_kv_cache": workload.active_kv_cache,
+            "workload_num_requests": workload.num_requests,
             "candidate_policy": candidate_policy,
         }
         if global_affinity:

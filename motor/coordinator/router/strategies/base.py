@@ -365,6 +365,7 @@ class BaseRouter(ABC):
         rollback_workload = Workload(
             active_kv_cache=-allocate_workload.active_kv_cache,
             active_tokens=-allocate_workload.active_tokens,
+            num_requests=-allocate_workload.num_requests,
         )
         params = UpdateWorkloadParams(
             instance_id=instance.id,

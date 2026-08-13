@@ -69,54 +69,39 @@ def _prefill_cost(isl: int, matched_tokens: int) -> int:
     return max(0, isl - _SMETRIC_OVERLAP_CREDIT * matched)
 
 
-class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
+class SMetricPrefillCostTracker:
     """
-    Hybrid SMetric / load-balance policy.
+    Running average of per-request min prefill_cost.
 
-    Each request's ``prefill_cost`` is the minimum remaining prefill among reported endpoints
-    (``max(0, isl - matched_tokens)``, overlap_credit always 1). A process-wide running average of
-    those per-request costs is kept. Then:
-
-    - if this request's cost is above the average → load-balance
-    - else if ``cost / isl > 0.5`` → pick the lowest-cost endpoint (original SMetric)
-    - else → load-balance
-
-    Conductor lookup and ``smetric_debug`` are owned here; KvCacheAffinityPolicy is not called.
+    Owned by the central Scheduler (one process). Workers only report costs; they must not keep
+    their own copy, or each Worker would count a different subset of traffic.
     """
 
-    _prefill_cost_avg: float = 0.0
-    _prefill_cost_count: int = 0
-    _prefill_cost_lock = threading.Lock()
+    def __init__(self) -> None:
+        self._avg = 0.0
+        self._count = 0
+        self._lock = threading.Lock()
 
-    def __init__(self, instance_provider: InstanceProvider):
-        super().__init__(instance_provider=instance_provider)
-        logger.info("SMetricPolicy started.")
+    def reset(self) -> None:
+        with self._lock:
+            self._avg = 0.0
+            self._count = 0
 
-    @classmethod
-    def reset_prefill_cost_average(cls) -> None:
-        """Drop the running average. Tests use this to isolate cases."""
-        with cls._prefill_cost_lock:
-            cls._prefill_cost_avg = 0.0
-            cls._prefill_cost_count = 0
-
-    @classmethod
-    def prefill_cost_average(cls) -> tuple[float, int]:
+    def snapshot(self) -> tuple[float, int]:
         """Return ``(average, sample_count)``. Average is 0.0 when no samples."""
-        with cls._prefill_cost_lock:
-            return cls._prefill_cost_avg, cls._prefill_cost_count
+        with self._lock:
+            return self._avg, self._count
 
-    @classmethod
-    def _record_prefill_cost(cls, req_cost: int) -> None:
-        with cls._prefill_cost_lock:
-            cls._prefill_cost_count += 1
-            cls._prefill_cost_avg += (req_cost - cls._prefill_cost_avg) / cls._prefill_cost_count
+    def record(self, req_cost: int) -> None:
+        with self._lock:
+            self._count += 1
+            self._avg += (req_cost - self._avg) / self._count
 
-    @classmethod
-    def _use_smetric_rank(cls, req_cost: int, isl: int) -> bool:
+    def use_smetric_rank(self, req_cost: int, isl: int) -> bool:
         """True when this request should pick the lowest-cost endpoint instead of load-balance."""
-        with cls._prefill_cost_lock:
-            count = cls._prefill_cost_count
-            avg = cls._prefill_cost_avg
+        with self._lock:
+            count = self._count
+            avg = self._avg
         if count > 0 and req_cost > avg:
             logger.info(
                 "smetric: prefill_cost=%s > avg=%.3f (n=%d), using load_balance",
@@ -140,6 +125,22 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         )
         return False
 
+
+class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
+    """
+    Score every reported endpoint by remaining prefill; the lowest cost is the SMetric candidate.
+
+    ``prefill_cost = max(0, isl - matched_tokens)`` (overlap_credit is always 1). Workers only
+    compute and forward these costs. The central Scheduler keeps the running average and decides
+    whether to honor min-cost ranking or fall back to load-balance.
+
+    Conductor lookup and ``smetric_debug`` are owned here; KvCacheAffinityPolicy is not called.
+    """
+
+    def __init__(self, instance_provider: InstanceProvider):
+        super().__init__(instance_provider=instance_provider)
+        logger.info("SMetricPolicy started.")
+
     @staticmethod
     def select_endpoint_candidates_from_list(
         instances: list[Instance],
@@ -149,8 +150,8 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         """
         Return up to ``top_k`` ``(instance, endpoint, prefill_cost)`` tuples, lowest cost first.
 
-        ``None`` means the caller should fall back to load-balance: no conductor data, or the
-        average / ``cost/isl`` gates chose load-balance for this request.
+        ``None`` means no conductor data; the caller should fall back. Hybrid average / ratio
+        gating is applied later by the central Scheduler, not here.
         """
         encoded_ids = _prompt_token_ids(req_info)
         isl = len(encoded_ids)
@@ -189,11 +190,6 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
             return None
 
         scored.sort(key=lambda item: (item[0], item[1], item[2]))
-        req_cost = scored[0][0]
-        use_smetric = SMetricPolicy._use_smetric_rank(req_cost, isl)
-        SMetricPolicy._record_prefill_cost(req_cost)
-        if not use_smetric:
-            return None
         SMetricPolicy._stash_debug(req_info, scored)
         ranked = scored[: max(1, top_k)]
         top_cost, _iid, _eid, top_inst, top_ep = ranked[0]

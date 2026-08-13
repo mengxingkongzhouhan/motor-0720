@@ -997,6 +997,9 @@ class AsyncSchedulerClient:
             "workload_active_kv_cache": workload.active_kv_cache,
             "candidate_policy": candidate_policy,
         }
+        if candidate_policy == CANDIDATE_POLICY_SMETRIC:
+            token_ids = getattr(req_info, "token_ids", None)
+            req_data["isl"] = len(token_ids) if isinstance(token_ids, list) else 0
         if global_affinity:
             # Scalars the scheduler needs to recompute the unified score against its fresh load:
             # combined = prefill_load_scale * prefill_cost + load_weight * fresh_load.

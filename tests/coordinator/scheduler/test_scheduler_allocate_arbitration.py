@@ -869,7 +869,7 @@ async def test_allocate_only_smetric_picks_lowest_cost_ignoring_load():
             "workload_active_tokens": 3.0,
             "workload_active_kv_cache": 3.0,
             "candidate_policy": CANDIDATE_POLICY_SMETRIC,
-            # No prefill_load_scale / load_weight: must not enter KVA unified re-rank.
+            "isl": 20,  # min cost 12 / 20 > 0.5 so min-cost ranking applies (empty average)
         },
     )
 
@@ -886,4 +886,133 @@ async def test_allocate_only_smetric_picks_lowest_cost_ignoring_load():
     assert other_workload.prefill_cost == 0
     assert other_workload.active_tokens == 1
     assert workload_writer.writes == [(2, 20)]
+
+
+def _smetric_allocate_dispatcher():
+    config = CoordinatorConfig()
+    config.scheduler_config.scheduler_type = SchedulerType.SMETRIC
+    config.scheduler_config.endpoint_instance_score_weight = 0.0
+    instance_manager = InstanceManager(config)
+    return config, instance_manager
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_smetric_low_ratio_uses_load_balance():
+    """First request with cost/isl <= 0.5 should load-balance, not pick the cheapest cache."""
+    config, instance_manager = _smetric_allocate_dispatcher()
+    inst_a = _make_prefill_instance(1, (10, 11))
+    inst_b = _make_prefill_instance(2, (20, 21))
+    await instance_manager.refresh_instances(EventType.ADD, [inst_a, inst_b])
+    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=1))
+    await instance_manager.update_instance_workload(1, 11, Workload(active_tokens=30))
+    await instance_manager.update_instance_workload(2, 20, Workload(active_tokens=50))
+    await instance_manager.update_instance_workload(2, 21, Workload(active_tokens=40))
+
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    workload_writer = _DummyWorkloadWriter()
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager, scheduler, config, workload_writer=workload_writer
+    )
+    request = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-smetric-low-ratio",
+        data={
+            "instance_id": 2,
+            "endpoint_id": 20,  # cheapest cache
+            "candidates": [
+                {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 40},
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 20},
+            ],
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-smetric-low-ratio",
+            "workload_sequence": workload_writer.sequence - 2,
+            "instance_version": workload_writer.instance_version,
+            "workload_active_tokens": 3.0,
+            "workload_active_kv_cache": 3.0,
+            "candidate_policy": CANDIDATE_POLICY_SMETRIC,
+            "isl": 100,  # 20/100 <= 0.5
+        },
+    )
+
+    response = await dispatcher.dispatch(request)
+
+    assert response.response_type == SchedulerResponseType.SUCCESS
+    assert response.data["instance"]["id"] == 1
+    assert response.data["endpoint"]["id"] == 10
+    _, selected_workload = await instance_manager.get_endpoint_workload(1, 10)
+    assert selected_workload.active_tokens == 4.0
+    avg, count = dispatcher._smetric_prefill.snapshot()
+    assert count == 1
+    assert avg == 20
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_smetric_average_is_shared_across_requests():
+    """Two ALLOCATE_ONLY calls (as from two Workers) share the Scheduler's running average."""
+    config, instance_manager = _smetric_allocate_dispatcher()
+    inst_a = _make_prefill_instance(1, (10, 11))
+    inst_b = _make_prefill_instance(2, (20, 21))
+    await instance_manager.refresh_instances(EventType.ADD, [inst_a, inst_b])
+    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=1))
+    await instance_manager.update_instance_workload(1, 11, Workload(active_tokens=30))
+    await instance_manager.update_instance_workload(2, 20, Workload(active_tokens=50))
+    await instance_manager.update_instance_workload(2, 21, Workload(active_tokens=40))
+
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    workload_writer = _DummyWorkloadWriter()
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager, scheduler, config, workload_writer=workload_writer
+    )
+
+    first = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-smetric-avg-1",
+        data={
+            "instance_id": 2,
+            "endpoint_id": 20,
+            "candidates": [
+                {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 90},
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 12},
+            ],
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-smetric-avg-1",
+            "workload_sequence": workload_writer.sequence - 2,
+            "instance_version": workload_writer.instance_version,
+            "workload_active_tokens": 3.0,
+            "workload_active_kv_cache": 3.0,
+            "candidate_policy": CANDIDATE_POLICY_SMETRIC,
+            "isl": 20,  # 12/20 > 0.5, no history → min-cost
+        },
+    )
+    first_resp = await dispatcher.dispatch(first)
+    assert first_resp.data["instance"]["id"] == 2
+    assert first_resp.data["endpoint"]["id"] == 20
+    assert dispatcher._smetric_prefill.snapshot() == (12.0, 1)
+
+    second = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-smetric-avg-2",
+        data={
+            "instance_id": 2,
+            "endpoint_id": 20,
+            "candidates": [
+                {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 90},
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 80},
+            ],
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-smetric-avg-2",
+            "workload_sequence": workload_writer.sequence - 2,
+            "instance_version": workload_writer.instance_version,
+            "workload_active_tokens": 3.0,
+            "workload_active_kv_cache": 3.0,
+            "candidate_policy": CANDIDATE_POLICY_SMETRIC,
+            "isl": 100,  # 80/100 > 0.5 but 80 > avg 12 → load-balance
+        },
+    )
+    second_resp = await dispatcher.dispatch(second)
+    assert second_resp.data["instance"]["id"] == 1
+    assert second_resp.data["endpoint"]["id"] == 10
+    avg, count = dispatcher._smetric_prefill.snapshot()
+    assert count == 2
+    assert avg == 46.0  # (12 + 80) / 2
 

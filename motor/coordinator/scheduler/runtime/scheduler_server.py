@@ -37,6 +37,7 @@ from motor.coordinator.models.constants import DEFAULT_REQUEST_ID, REQUEST_ID_KE
 from motor.coordinator.domain.instance_manager import InstanceManager
 from motor.coordinator.scheduler.scheduler import Scheduler
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
+from motor.coordinator.scheduler.policy.smetric import SMetricPrefillCostTracker
 from motor.coordinator.scheduler.runtime.workload_shm import WorkloadSharedMemoryWriter
 from motor.coordinator.scheduler.runtime.workload_shm.layout import (
     DEFAULT_WORKLOAD_SHM_MAX_ENTRIES,
@@ -120,6 +121,7 @@ _KEY_CANDIDATES = "candidates"
 _KEY_PREFILL_COST = "prefill_cost"
 _KEY_LOAD_WEIGHT = "load_weight"
 _KEY_PREFILL_LOAD_SCALE = "prefill_load_scale"
+_KEY_ISL = "isl"
 
 
 def _should_log_scheduling_sample(sample_key: str) -> bool:
@@ -210,6 +212,8 @@ class _SchedulerRequestDispatcher:
         )
         scheduler_type = getattr(config.scheduler_config, "scheduler_type", "")
         self._is_load_balance_scheduler = getattr(scheduler_type, "value", scheduler_type) == "load_balance"
+        # One running average for all Workers that ALLOCATE_ONLY into this Scheduler process.
+        self._smetric_prefill = SMetricPrefillCostTracker()
 
     async def dispatch(self, request: SchedulerRequest) -> SchedulerResponse:
         """Dispatch request to the appropriate handler (async handlers supported)."""
@@ -585,6 +589,7 @@ class _SchedulerRequestDispatcher:
         candidate_policy = request.data.get(_KEY_CANDIDATE_POLICY)
         worker_load_weight = self._parse_optional_float(request.data.get(_KEY_LOAD_WEIGHT))
         worker_prefill_load_scale = self._parse_optional_float(request.data.get(_KEY_PREFILL_LOAD_SCALE))
+        worker_isl = self._parse_optional_int(request.data.get(_KEY_ISL))
 
         if instance_id is None or endpoint_id is None:
             return SchedulerResponse(
@@ -638,6 +643,10 @@ class _SchedulerRequestDispatcher:
             worker_instance_version,
             role,
         )
+        # SMetric's average/ratio gate must see every request from every Worker; skip the
+        # worker-top-1 fast path so this Scheduler's shared tracker is always consulted.
+        if candidate_policy == CANDIDATE_POLICY_SMETRIC:
+            fast_path = False
         selected = (
             self._select_valid_candidate(selected_candidate, role)
             if fast_path
@@ -649,6 +658,7 @@ class _SchedulerRequestDispatcher:
                 affinity_candidates,
                 worker_prefill_load_scale,
                 worker_load_weight,
+                worker_isl,
             )
         )
         if fast_path and selected is None:
@@ -660,6 +670,7 @@ class _SchedulerRequestDispatcher:
                 affinity_candidates,
                 worker_prefill_load_scale,
                 worker_load_weight,
+                worker_isl,
             )
             fast_path = False
         if selected is None:
@@ -826,6 +837,7 @@ class _SchedulerRequestDispatcher:
         affinity_candidates: list[tuple[int, int, int]] | None = None,
         prefill_load_scale: float | None = None,
         load_weight: float | None = None,
+        isl: int | None = None,
     ) -> tuple[Instance, Endpoint, float] | None:
         """
         Select allocation target using SchedulerServer's authoritative workload view.
@@ -835,8 +847,9 @@ class _SchedulerRequestDispatcher:
         load_weight*fresh_load`` (a global selection that fuses affinity and the scheduler's fresh
         load -- the worker already did the affinity math, the scheduler supplies fresh load). Older
         affinity callers without per-endpoint prefill_cost fall back to "least-loaded among the
-        worker's ranked alternates". SMetric picks the lowest ``prefill_cost`` and ignores load.
-        Other policies keep the worker-proposed endpoint.
+        worker's ranked alternates". SMetric consults the Scheduler's running prefill_cost average:
+        above-average or ``cost/isl <= 0.5`` falls back to global load-balance, otherwise the
+        lowest ``prefill_cost`` wins. Other policies keep the worker-proposed endpoint.
         """
         if self._should_scan_global_load_balance(candidate_policy):
             selected = self._select_global_load_balance_candidate(role)
@@ -855,7 +868,7 @@ class _SchedulerRequestDispatcher:
                 if selected is not None:
                     return selected
         if candidate_policy == CANDIDATE_POLICY_SMETRIC:
-            selected = self._select_smetric_min_cost(affinity_candidates, role)
+            selected = self._select_smetric_hybrid(affinity_candidates, role, isl)
             if selected is not None:
                 return selected
         return self._select_authoritative_candidate(candidate, role)
@@ -915,6 +928,23 @@ class _SchedulerRequestDispatcher:
         if best is None:
             return None
         return (best[0], best[1], best[2])
+
+    def _select_smetric_hybrid(
+        self,
+        smetric_candidates: list[tuple[int, int, int]] | None,
+        role: PDRole,
+        isl: int | None,
+    ) -> tuple[Instance, Endpoint, float] | None:
+        """Apply the shared average / ratio gate, then min-cost SMetric or global load-balance."""
+        if not smetric_candidates:
+            return None
+        req_cost = min(cost for _iid, _eid, cost in smetric_candidates)
+        prompt_isl = isl if isl is not None else 0
+        use_smetric = self._smetric_prefill.use_smetric_rank(req_cost, prompt_isl)
+        self._smetric_prefill.record(req_cost)
+        if use_smetric:
+            return self._select_smetric_min_cost(smetric_candidates, role)
+        return self._select_global_load_balance_candidate(role)
 
     def _select_smetric_min_cost(
         self,

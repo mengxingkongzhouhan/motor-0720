@@ -434,14 +434,14 @@ class TestWorkloadSharedMemoryWriter(unittest.TestCase):
 
     # ---------------------------------------------------------------
     def test_pack_unpack_round_trips_prefill_cost(self):
-        """Entry layout stores prefill_cost as int32 in the former 4-byte padding."""
+        """Entry layout stores prefill_cost as float32 in the former 4-byte padding."""
         entry = WorkloadShmEntry(
             instance_id=1,
             endpoint_id=2,
             role=ROLE_PREFILL,
             active_tokens=10.0,
             active_kv_cache=20.0,
-            prefill_cost=42,
+            prefill_cost=42.5,
         )
         buf = bytearray(HEADER_SIZE + ENTRY_SIZE)
         buf[HEADER_SIZE : HEADER_SIZE + ENTRY_SIZE] = pack_entry(entry)
@@ -450,4 +450,4 @@ class TestWorkloadSharedMemoryWriter(unittest.TestCase):
         self.assertEqual(unpacked.endpoint_id, 2)
         self.assertEqual(unpacked.active_tokens, 10.0)
         self.assertEqual(unpacked.active_kv_cache, 20.0)
-        self.assertEqual(unpacked.prefill_cost, 42)
+        self.assertEqual(unpacked.prefill_cost, 42.5)

@@ -299,12 +299,12 @@ class TestAffinityPrefillCost:
         assert affinity_prefill_cost(req_info, 2, 20) == 100
         assert affinity_prefill_cost(req_info, 9, 9) == 0
         assert affinity_prefill_cost(None, 1, 10) == 0
-        assert isinstance(affinity_prefill_cost(req_info, 1, 10), int)
+        assert isinstance(affinity_prefill_cost(req_info, 1, 10), float)
 
-    def test_affinity_prefill_cost_rounds_float_to_int(self):
+    def test_affinity_prefill_cost_keeps_float(self):
         req_info = MagicMock()
         req_info.kv_affinity_debug = {(1, 10): (8, 1.0, 42.6)}
-        assert affinity_prefill_cost(req_info, 1, 10) == 43
+        assert affinity_prefill_cost(req_info, 1, 10) == 42.6
 
     def test_affinity_prefill_cost_none_record_is_zero(self):
         req_info = MagicMock()
@@ -318,7 +318,7 @@ class TestAffinityPrefillCost:
         assert allocated_prefill_cost(req_info, 1, 10) == 7
         assert allocated_prefill_cost(req_info, 2, 20) == 100
         assert allocated_prefill_cost(req_info, 9, 9) == 0
-        assert isinstance(allocated_prefill_cost(req_info, 1, 10), int)
+        assert isinstance(allocated_prefill_cost(req_info, 1, 10), float)
 
     def test_allocated_prefill_cost_smetric_miss_does_not_use_affinity(self):
         """SMetric's cache is independent: a miss must not fall through to kv_affinity_debug."""
@@ -339,7 +339,7 @@ class TestAffinityPrefillCost:
         assert total.active_tokens == 5
         assert total.active_kv_cache == 7
         assert total.prefill_cost == 9
-        assert isinstance(total.prefill_cost, int)
+        assert isinstance(total.prefill_cost, float)
 
 
 class TestWorkloadActionHandlerPrefillCost:

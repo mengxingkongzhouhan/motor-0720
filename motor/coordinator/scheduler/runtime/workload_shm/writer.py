@@ -62,12 +62,12 @@ def _pdrole_to_shm_role(role: PDRole) -> int:
     return ROLE_HYBRID
 
 
-def _entry_prefill_cost(workload) -> int:
+def _entry_prefill_cost(workload) -> float:
     """Read Workload.prefill_cost; 0 when the field is missing or not numeric (test doubles)."""
     try:
-        return max(0, int(round(float(getattr(workload, "prefill_cost", 0)))))
+        return max(0.0, float(getattr(workload, "prefill_cost", 0)))
     except (TypeError, ValueError):
-        return 0
+        return 0.0
 
 
 def _collect_entries_and_slot_map(instance_manager: InstanceManager, max_entries: int):
@@ -75,7 +75,7 @@ def _collect_entries_and_slot_map(instance_manager: InstanceManager, max_entries
     Collect (instance_id, endpoint_id, role, workload) from all pools and build slot_map.
     Returns (entries list, slot_map dict).
     """
-    entries: list[tuple[int, int, int, float, float, int]] = []
+    entries: list[tuple[int, int, int, float, float, float]] = []
     slot_map: dict[tuple[int, int], int] = {}
 
     for role in (PDRole.ROLE_E, PDRole.ROLE_P, PDRole.ROLE_D, PDRole.ROLE_U):

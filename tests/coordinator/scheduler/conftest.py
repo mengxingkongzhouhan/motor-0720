@@ -19,7 +19,7 @@ from motor.common.resources.endpoint import Endpoint, Workload, WorkloadAction
 
 
 def create_mock_workload(
-    active_tokens: float = 0.0, active_kv_cache: float = 0.0, prefill_cost: int = 0
+    active_tokens: float = 0.0, active_kv_cache: float = 0.0, prefill_cost: float = 0.0
 ) -> Mock:
     """Create a mock Workload with given values."""
     wl = Mock(spec=Workload)

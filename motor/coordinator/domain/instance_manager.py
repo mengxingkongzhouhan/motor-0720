@@ -44,7 +44,7 @@ def _clamp_workload_floor(workload: Workload) -> bool:
         workload.active_kv_cache = 0.0
         floored = True
     if workload.prefill_cost < 0:
-        workload.prefill_cost = 0
+        workload.prefill_cost = 0.0
         floored = True
     return floored
 
@@ -53,7 +53,7 @@ def _rebuild_instance_workload(instance: Instance) -> bool:
     """Rebuild an instance workload from its endpoint ledgers and floor invalid values."""
     active_tokens = 0.0
     active_kv_cache = 0.0
-    prefill_cost = 0
+    prefill_cost = 0.0
     floored = False
     for pod_endpoints in (instance.endpoints or {}).values():
         for endpoint in (pod_endpoints or {}).values():

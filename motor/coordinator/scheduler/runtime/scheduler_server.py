@@ -760,7 +760,7 @@ class _SchedulerRequestDispatcher:
             return None
 
     @staticmethod
-    def _extract_affinity_candidates(data: dict) -> list[tuple[int, int, int]]:
+    def _extract_affinity_candidates(data: dict) -> list[tuple[int, int, float]]:
         """
         Parse worker-reported candidates that include a numeric ``prefill_cost``.
 
@@ -769,7 +769,7 @@ class _SchedulerRequestDispatcher:
         Empty when the field is absent. Entries missing a numeric prefill_cost are skipped.
         """
         raw = data.get(_KEY_CANDIDATES)
-        result: list[tuple[int, int, int]] = []
+        result: list[tuple[int, int, float]] = []
         if not isinstance(raw, list):
             return result
         for item in raw:
@@ -781,22 +781,22 @@ class _SchedulerRequestDispatcher:
             if instance_id is None or endpoint_id is None or prefill_cost is None:
                 continue
             try:
-                result.append((int(instance_id), int(endpoint_id), max(0, int(round(float(prefill_cost))))))
+                result.append((int(instance_id), int(endpoint_id), max(0.0, float(prefill_cost))))
             except (TypeError, ValueError):
                 continue
         return result
 
     @staticmethod
     def _lookup_candidate_prefill_cost(
-        affinity_candidates: list[tuple[int, int, int]],
+        affinity_candidates: list[tuple[int, int, float]],
         instance_id: int,
         endpoint_id: int,
-    ) -> int:
+    ) -> float:
         """Return the committed endpoint's prefill_cost, or 0 when absent."""
         for cand_instance_id, cand_endpoint_id, cost in affinity_candidates:
             if cand_instance_id == instance_id and cand_endpoint_id == endpoint_id:
-                return cost
-        return 0
+                return max(0.0, cost)
+        return 0.0
 
     @staticmethod
     def _extract_allocate_candidate(data: dict) -> tuple[int, int] | None:
@@ -844,7 +844,7 @@ class _SchedulerRequestDispatcher:
         candidates: list[tuple[int, int]],
         role: PDRole,
         candidate_policy: str | None,
-        affinity_candidates: list[tuple[int, int, int]] | None = None,
+        affinity_candidates: list[tuple[int, int, float]] | None = None,
         prefill_load_scale: float | None = None,
         load_weight: float | None = None,
     ) -> tuple[Instance, Endpoint, float] | None:
@@ -878,7 +878,7 @@ class _SchedulerRequestDispatcher:
 
     def _select_affinity_global(
         self,
-        affinity_candidates: list[tuple[int, int, int]],
+        affinity_candidates: list[tuple[int, int, float]],
         role: PDRole,
         prefill_load_scale: float | None,
         load_weight: float | None,
@@ -894,7 +894,7 @@ class _SchedulerRequestDispatcher:
         """
         pscale = prefill_load_scale if prefill_load_scale is not None else 1.0
         lweight = load_weight if load_weight is not None else 1.0
-        best: tuple[Instance, Endpoint, float, int] | None = None  # (..., combined, prefill_cost)
+        best: tuple[Instance, Endpoint, float, float] | None = None  # (..., combined, prefill_cost)
         for instance_id, endpoint_id, prefill_cost in affinity_candidates:
             if self._is_instance_circuit_open(instance_id):
                 continue
@@ -935,7 +935,7 @@ class _SchedulerRequestDispatcher:
     def _select_smetric_hybrid(
         self,
         worker_candidate: tuple[int, int],
-        smetric_candidates: list[tuple[int, int, int]] | None,
+        smetric_candidates: list[tuple[int, int, float]] | None,
         role: PDRole,
         isl: int | None,
         fast_path: bool,
@@ -955,13 +955,13 @@ class _SchedulerRequestDispatcher:
 
     def _select_smetric_min_cost(
         self,
-        smetric_candidates: list[tuple[int, int, int]] | None,
+        smetric_candidates: list[tuple[int, int, float]] | None,
         role: PDRole,
     ) -> tuple[Instance, Endpoint, float] | None:
         """Pick the available endpoint with the lowest SMetric prefill_cost. Load is ignored."""
         if not smetric_candidates:
             return None
-        best: tuple[Instance, Endpoint, int] | None = None
+        best: tuple[Instance, Endpoint, float] | None = None
         for instance_id, endpoint_id, prefill_cost in smetric_candidates:
             if self._is_instance_circuit_open(instance_id):
                 continue
@@ -981,7 +981,7 @@ class _SchedulerRequestDispatcher:
                 best = (instance, endpoint, prefill_cost)
         if best is None:
             return None
-        return (best[0], best[1], float(best[2]))
+        return (best[0], best[1], best[2])
 
     def _select_min_ledger_prefill_cost(
         self,
@@ -992,7 +992,7 @@ class _SchedulerRequestDispatcher:
         This is the SMetric dump path: remaining prefill on the ledger, not token-based
         load-balance and not this request's conductor cost. Ties break by (instance_id, endpoint_id).
         """
-        best: tuple[Instance, Endpoint, int] | None = None
+        best: tuple[Instance, Endpoint, float] | None = None
         for instance in self._instance_manager.get_available_instances(role).values():
             if self._is_instance_circuit_open(instance.id):
                 continue
@@ -1004,14 +1004,14 @@ class _SchedulerRequestDispatcher:
                     best = (instance, endpoint, cost)
         if best is None:
             return None
-        return (best[0], best[1], float(best[2]))
+        return (best[0], best[1], best[2])
 
     @staticmethod
-    def _endpoint_ledger_prefill_cost(endpoint: Endpoint) -> int:
+    def _endpoint_ledger_prefill_cost(endpoint: Endpoint) -> float:
         try:
-            return max(0, int(getattr(endpoint.workload, "prefill_cost", 0) or 0))
+            return max(0.0, float(getattr(endpoint.workload, "prefill_cost", 0) or 0))
         except (TypeError, ValueError):
-            return 0
+            return 0.0
 
     def _select_lowest_load_among_candidates(
         self,

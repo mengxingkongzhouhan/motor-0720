@@ -64,10 +64,10 @@ def _prompt_token_ids(req_info: RequestInfo) -> list[int]:
     return encoded_ids
 
 
-def _prefill_cost(isl: int, matched_tokens: int) -> int:
+def _prefill_cost(isl: int, matched_tokens: int) -> float:
     """Remaining prefill tokens with overlap_credit fixed at 1: max(0, isl - matched)."""
     matched = min(matched_tokens, isl) if isl > 0 else 0
-    return max(0, isl - _SMETRIC_OVERLAP_CREDIT * matched)
+    return float(max(0, isl - _SMETRIC_OVERLAP_CREDIT * matched))
 
 
 class SMetricPrefillCostTracker:
@@ -93,12 +93,12 @@ class SMetricPrefillCostTracker:
         with self._lock:
             return self._avg, self._count
 
-    def record(self, req_cost: int) -> None:
+    def record(self, req_cost: float) -> None:
         with self._lock:
             self._count += 1
             self._avg += (req_cost - self._avg) / self._count
 
-    def use_smetric_rank(self, req_cost: int, isl: int) -> bool:
+    def use_smetric_rank(self, req_cost: float, isl: int) -> bool:
         """True when this request should pick the lowest-cost endpoint instead of load-balance."""
         with self._lock:
             count = self._count
@@ -169,7 +169,7 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
             )
             return None
 
-        scored: list[tuple[int, int, int, Instance, Endpoint]] = []
+        scored: list[tuple[float, int, int, Instance, Endpoint]] = []
         any_instance = False
         for instance in instances:
             instance_data = tenant.get(conductor_instance_id(instance), None)
@@ -222,7 +222,7 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
     @staticmethod
     def _stash_debug(
         req_info: RequestInfo | None,
-        scored: list[tuple[int, int, int, Instance, Endpoint]],
+        scored: list[tuple[float, int, int, Instance, Endpoint]],
     ) -> None:
         """Cache per-endpoint prefill_cost on ``req_info.smetric_debug``. Never fail selection."""
         if req_info is None:

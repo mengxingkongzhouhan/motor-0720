@@ -10,6 +10,7 @@
 
 """Tests for SMetricPolicy: rank by prefill_cost with overlap_credit fixed at 1."""
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -129,6 +130,27 @@ class TestSMetricPolicyRanking:
         assert costs[1] == (2, 20, 50)
         assert costs[2] == (1, 10, 90)
         assert costs[3] == (2, 21, 100)
+
+    @patch("motor.coordinator.scheduler.policy.smetric.ConductorApiClient.query_conductor")
+    def test_logs_all_endpoint_match_lengths(self, mock_query, caplog):
+        inst_a = _instance(1, (10, 11))
+        inst_b = _instance(2, (20, 21))
+        req_info = _req_info(100)
+        req_info.req_id = "req-match-log"
+        mock_query.return_value = _conductor_tenant(
+            inst_a,
+            inst_b,
+            matched={(1, 10): 10, (1, 11): 90, (2, 20): 50, (2, 21): 0},
+        )
+
+        with caplog.at_level(logging.INFO):
+            SMetricPolicy.select_endpoint_candidates_from_list([inst_a, inst_b], req_info)
+
+        assert "smetric: req_id=req-match-log isl=100 endpoint_matches=[" in caplog.text
+        assert "1-10:10" in caplog.text
+        assert "1-11:90" in caplog.text
+        assert "2-20:50" in caplog.text
+        assert "2-21:0" in caplog.text
 
     @patch("motor.coordinator.scheduler.policy.smetric.ConductorApiClient.query_conductor")
     def test_ignores_load_when_cheaper_endpoint_is_busier(self, mock_query):

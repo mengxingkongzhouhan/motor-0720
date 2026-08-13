@@ -23,7 +23,7 @@ from motor.coordinator.api_client.conductor_api_client import (
     conductor_instance_id,
 )
 from motor.coordinator.domain import InstanceProvider
-from motor.coordinator.models.constants import OpenAIField
+from motor.coordinator.models.constants import DEFAULT_REQUEST_ID, OpenAIField
 from motor.coordinator.models.request import RequestInfo
 from motor.coordinator.scheduler.policy.base import BaseSchedulingPolicy, WorkloadLedgerMixin
 
@@ -170,6 +170,7 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
             return None
 
         scored: list[tuple[float, int, int, Instance, Endpoint]] = []
+        matches: list[tuple[int, int, int]] = []
         any_instance = False
         for instance in instances:
             instance_data = tenant.get(conductor_instance_id(instance), None)
@@ -184,6 +185,7 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
                 except (TypeError, ValueError):
                     matched_tokens = 0
                 cost = _prefill_cost(isl, matched_tokens)
+                matches.append((instance.id, ep.id, matched_tokens))
                 scored.append((cost, instance.id, ep.id, instance, ep))
 
         if not any_instance:
@@ -192,6 +194,14 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         if not scored:
             logger.warning("smetric: no endpoint selected")
             return None
+
+        matches.sort()
+        logger.info(
+            "smetric: req_id=%s isl=%s endpoint_matches=[%s]",
+            getattr(req_info, "req_id", None) or DEFAULT_REQUEST_ID,
+            isl,
+            ", ".join(f"{iid}-{eid}:{matched}" for iid, eid, matched in matches),
+        )
 
         scored.sort(key=lambda item: (item[0], item[1], item[2]))
         SMetricPolicy._stash_debug(req_info, scored)

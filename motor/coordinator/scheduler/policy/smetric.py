@@ -71,10 +71,10 @@ def _prefill_cost(isl: int, matched_tokens: int) -> int:
 
 class SMetricPrefillCostTracker:
     """
-    Running average of per-request min prefill_cost.
+    Running average of the prefill_cost actually committed on each allocation.
 
-    Owned by the central Scheduler (one process). Workers only report costs; they must not keep
-    their own copy, or each Worker would count a different subset of traffic.
+    Owned by the central Scheduler (one process). Workers only report per-endpoint costs; they
+    must not keep their own copy, or each Worker would count a different subset of traffic.
     """
 
     def __init__(self) -> None:
@@ -131,8 +131,9 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
     Score every reported endpoint by remaining prefill; the lowest cost is the SMetric candidate.
 
     ``prefill_cost = max(0, isl - matched_tokens)`` (overlap_credit is always 1). Workers only
-    compute and forward these costs. The central Scheduler keeps the running average and decides
-    whether to honor min-cost ranking or fall back to load-balance.
+    compute and forward these costs. The central Scheduler keeps a running average of the
+    **allocated** endpoint's prefill_cost and uses that, plus ``cost/isl``, to decide min-cost
+    ranking vs load-balance.
 
     Conductor lookup and ``smetric_debug`` are owned here; KvCacheAffinityPolicy is not called.
     """

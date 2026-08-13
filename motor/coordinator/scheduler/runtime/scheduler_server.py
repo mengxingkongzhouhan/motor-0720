@@ -700,6 +700,9 @@ class _SchedulerRequestDispatcher:
         success, updated_role, updated_workload = self._scheduler.update_workload_sync(params)
         if success:
             self._write_workload_entry(instance.id, endpoint.id, updated_role, updated_workload)
+            if candidate_policy == CANDIDATE_POLICY_SMETRIC:
+                # Average is of incurred remaining prefill, not the min among candidates.
+                self._smetric_prefill.record(workload.prefill_cost)
 
         if not success:
             return SchedulerResponse(
@@ -849,7 +852,8 @@ class _SchedulerRequestDispatcher:
         affinity callers without per-endpoint prefill_cost fall back to "least-loaded among the
         worker's ranked alternates". SMetric consults the Scheduler's running prefill_cost average:
         above-average or ``cost/isl <= 0.5`` falls back to global load-balance, otherwise the
-        lowest ``prefill_cost`` wins. Other policies keep the worker-proposed endpoint.
+        lowest ``prefill_cost`` wins. The running average is updated with the **committed**
+        endpoint's prefill_cost after allocation. Other policies keep the worker-proposed endpoint.
         """
         if self._should_scan_global_load_balance(candidate_policy):
             selected = self._select_global_load_balance_candidate(role)
@@ -940,9 +944,7 @@ class _SchedulerRequestDispatcher:
             return None
         req_cost = min(cost for _iid, _eid, cost in smetric_candidates)
         prompt_isl = isl if isl is not None else 0
-        use_smetric = self._smetric_prefill.use_smetric_rank(req_cost, prompt_isl)
-        self._smetric_prefill.record(req_cost)
-        if use_smetric:
+        if self._smetric_prefill.use_smetric_rank(req_cost, prompt_isl):
             return self._select_smetric_min_cost(smetric_candidates, role)
         return self._select_global_load_balance_candidate(role)
 

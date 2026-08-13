@@ -941,9 +941,10 @@ async def test_allocate_only_smetric_low_ratio_uses_load_balance():
     assert response.data["endpoint"]["id"] == 10
     _, selected_workload = await instance_manager.get_endpoint_workload(1, 10)
     assert selected_workload.active_tokens == 4.0
+    assert selected_workload.prefill_cost == 40
     avg, count = dispatcher._smetric_prefill.snapshot()
     assert count == 1
-    assert avg == 20
+    assert avg == 40  # allocated endpoint 1-10, not min candidate cost 20
 
 
 @pytest.mark.asyncio
@@ -1014,5 +1015,5 @@ async def test_allocate_only_smetric_average_is_shared_across_requests():
     assert second_resp.data["endpoint"]["id"] == 10
     avg, count = dispatcher._smetric_prefill.snapshot()
     assert count == 2
-    assert avg == 46.0  # (12 + 80) / 2
+    assert avg == 51.0  # allocated costs (12 + 90) / 2, not min candidate 80
 

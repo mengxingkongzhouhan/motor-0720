@@ -15,7 +15,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 from motor.common.resources.endpoint import Workload, WorkloadAction
 from motor.common.resources.instance import PDRole, Instance, InsStatus, ParallelConfig
-from motor.coordinator.domain.workload_calculator import calculate_demand_workload
+from motor.coordinator.domain.workload_calculator import (
+    affinity_prefill_cost,
+    allocated_prefill_cost,
+    calculate_demand_workload,
+)
 from motor.coordinator.router.workload import WorkloadActionHandler
 from motor.coordinator.domain import ScheduledResource
 from motor.common.resources.endpoint import Endpoint, EndpointStatus
@@ -43,6 +47,7 @@ class TestCalculateDemandWorkload:
         w = calculate_demand_workload(PDRole.ROLE_P, req_info)
         assert w.active_tokens == 5.0
         assert w.active_kv_cache == 5.0
+        assert w.prefill_cost == 0
 
     def test_prefill_role_falls_back_when_token_ids_empty(self):
         """ROLE_P: empty/absent token_ids falls back to the legacy byte-length heuristic."""
@@ -61,6 +66,7 @@ class TestCalculateDemandWorkload:
         w = calculate_demand_workload(PDRole.ROLE_D, req_info)
         assert w.active_tokens == 10.0
         assert w.active_kv_cache == 0
+        assert w.prefill_cost == 0
 
     def test_encode_role_uses_tokens_without_kv_cache(self, monkeypatch):
         """ROLE_E: encode allocation should not leave KV cache workload to release."""
@@ -271,3 +277,193 @@ class TestWorkloadActionHandler:
         )
         assert workload_change is None
         assert role is None
+
+
+class TestAffinityPrefillCost:
+    """KV-affinity prefill_cost overlay; other policies stay at 0."""
+
+    def test_demand_workload_defaults_prefill_cost_to_zero(self):
+        req_info = MagicMock()
+        req_info.req_len = 4
+        req_info.kv_affinity_debug = None
+        w = calculate_demand_workload(PDRole.ROLE_P, req_info)
+        assert w.prefill_cost == 0
+
+    def test_affinity_prefill_cost_reads_selected_endpoint(self):
+        req_info = MagicMock()
+        req_info.kv_affinity_debug = {
+            (1, 10): (8, 1.0, 42),
+            (2, 20): (0, 5.0, 100),
+        }
+        assert affinity_prefill_cost(req_info, 1, 10) == 42
+        assert affinity_prefill_cost(req_info, 2, 20) == 100
+        assert affinity_prefill_cost(req_info, 9, 9) == 0
+        assert affinity_prefill_cost(None, 1, 10) == 0
+        assert isinstance(affinity_prefill_cost(req_info, 1, 10), float)
+
+    def test_affinity_prefill_cost_keeps_float(self):
+        req_info = MagicMock()
+        req_info.kv_affinity_debug = {(1, 10): (8, 1.0, 42.6)}
+        assert affinity_prefill_cost(req_info, 1, 10) == 42.6
+
+    def test_affinity_prefill_cost_none_record_is_zero(self):
+        req_info = MagicMock()
+        req_info.kv_affinity_debug = {(1, 10): (8, 1.0, None)}
+        assert affinity_prefill_cost(req_info, 1, 10) == 0
+
+    def test_allocated_prefill_cost_reads_smetric_debug(self):
+        req_info = MagicMock()
+        req_info.smetric_debug = {(1, 10): 7, (2, 20): 100}
+        req_info.kv_affinity_debug = {(1, 10): (8, 1.0, 42)}
+        assert allocated_prefill_cost(req_info, 1, 10) == 7
+        assert allocated_prefill_cost(req_info, 2, 20) == 100
+        assert allocated_prefill_cost(req_info, 9, 9) == 0
+        assert isinstance(allocated_prefill_cost(req_info, 1, 10), float)
+
+    def test_allocated_prefill_cost_smetric_miss_does_not_use_affinity(self):
+        """SMetric's cache is independent: a miss must not fall through to kv_affinity_debug."""
+        req_info = MagicMock()
+        req_info.smetric_debug = {(2, 20): 5}
+        req_info.kv_affinity_debug = {(1, 10): (8, 1.0, 99)}
+        assert allocated_prefill_cost(req_info, 1, 10) == 0
+
+    def test_allocated_prefill_cost_falls_back_to_affinity_when_smetric_unset(self):
+        req_info = MagicMock()
+        req_info.smetric_debug = None
+        req_info.kv_affinity_debug = {(1, 10): (8, 1.0, 42)}
+        assert allocated_prefill_cost(req_info, 1, 10) == 42
+
+    def test_workload_iadd_includes_prefill_cost(self):
+        total = Workload(active_tokens=1, active_kv_cache=2, prefill_cost=3)
+        total += Workload(active_tokens=4, active_kv_cache=5, prefill_cost=6)
+        assert total.active_tokens == 5
+        assert total.active_kv_cache == 7
+        assert total.prefill_cost == 9
+        assert isinstance(total.prefill_cost, float)
+
+
+class TestWorkloadActionHandlerPrefillCost:
+    """ALLOCATION/RELEASE_TOKENS carry KV-affinity prefill_cost on the request ledger."""
+
+    @pytest.fixture
+    def mock_request_manager(self):
+        m = MagicMock()
+        m.add_req_workload = AsyncMock(return_value=True)
+        m.get_req_workload = AsyncMock(return_value=None)
+        m.update_req_workload = AsyncMock(return_value=True)
+        m.del_req_workload = AsyncMock(return_value=True)
+        return m
+
+    @pytest.fixture
+    def valid_resource(self):
+        instance = Instance(
+            job_name="test",
+            model_name="m",
+            id=1,
+            role=PDRole.ROLE_P,
+            status=InsStatus.ACTIVE,
+            parallel_config=ParallelConfig(dp_size=1),
+        )
+        endpoint = Endpoint(
+            id=10,
+            ip="127.0.0.1",
+            business_port="8080",
+            mgmt_port="8080",
+            status=EndpointStatus.NORMAL,
+        )
+        return ScheduledResource(instance=instance, endpoint=endpoint)
+
+    @pytest.mark.asyncio
+    async def test_allocation_stamps_kv_affinity_prefill_cost(self, mock_request_manager, valid_resource):
+        handler = WorkloadActionHandler(mock_request_manager)
+        req_info = MagicMock()
+        req_info.req_len = 4
+        req_info.token_ids = [1, 2, 3]
+        req_info.kv_affinity_debug = {(1, 10): (1, 0.0, 42)}
+        req_info.smetric_debug = None
+        workload_change, role = await handler.compute_and_update(
+            valid_resource, "req-1", WorkloadAction.ALLOCATION, req_info=req_info
+        )
+        assert role == PDRole.ROLE_P
+        assert workload_change is not None
+        assert workload_change.prefill_cost == 42
+        stored = mock_request_manager.add_req_workload.call_args[0][2]
+        assert stored.prefill_cost == 42
+
+    async def test_allocation_stamps_smetric_prefill_cost(self, mock_request_manager, valid_resource):
+        handler = WorkloadActionHandler(mock_request_manager)
+        req_info = MagicMock()
+        req_info.req_len = 4
+        req_info.token_ids = [1, 2, 3]
+        req_info.smetric_debug = {(1, 10): 17}
+        req_info.kv_affinity_debug = {(1, 10): (1, 0.0, 42)}
+        workload_change, role = await handler.compute_and_update(
+            valid_resource, "req-1", WorkloadAction.ALLOCATION, req_info=req_info
+        )
+        assert role == PDRole.ROLE_P
+        assert workload_change is not None
+        assert workload_change.prefill_cost == 17
+        stored = mock_request_manager.add_req_workload.call_args[0][2]
+        assert stored.prefill_cost == 17
+
+    @pytest.mark.asyncio
+    async def test_allocation_without_affinity_debug_keeps_prefill_cost_zero(
+        self, mock_request_manager, valid_resource
+    ):
+        handler = WorkloadActionHandler(mock_request_manager)
+        req_info = MagicMock()
+        req_info.req_len = 4
+        req_info.kv_affinity_debug = None
+        workload_change, _role = await handler.compute_and_update(
+            valid_resource, "req-1", WorkloadAction.ALLOCATION, req_info=req_info
+        )
+        assert workload_change is not None
+        assert workload_change.prefill_cost == 0
+
+    @pytest.mark.asyncio
+    async def test_release_kv_keeps_prefill_cost(self, mock_request_manager, valid_resource):
+        current = Workload(active_kv_cache=100.0, active_tokens=50.0, prefill_cost=42)
+        mock_request_manager.get_req_workload = AsyncMock(return_value=current)
+        handler = WorkloadActionHandler(mock_request_manager)
+        req_info = MagicMock()
+        req_info.req_len = 4
+        workload_change, role = await handler.compute_and_update(
+            valid_resource, "req-1", WorkloadAction.RELEASE_KV, req_info=req_info
+        )
+        assert role == PDRole.ROLE_P
+        assert workload_change == Workload(active_kv_cache=-100.0)
+        assert current.prefill_cost == 42
+        mock_request_manager.del_req_workload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_release_tokens_releases_prefill_cost(self, mock_request_manager, valid_resource):
+        current = Workload(active_kv_cache=0.0, active_tokens=50.0, prefill_cost=42)
+        mock_request_manager.get_req_workload = AsyncMock(return_value=current)
+        handler = WorkloadActionHandler(mock_request_manager)
+        req_info = MagicMock()
+        req_info.req_len = 4
+        workload_change, role = await handler.compute_and_update(
+            valid_resource, "req-1", WorkloadAction.RELEASE_TOKENS, req_info=req_info
+        )
+        assert role == PDRole.ROLE_P
+        assert workload_change == Workload(active_tokens=-50.0, prefill_cost=-42)
+        assert current.prefill_cost == 0
+        mock_request_manager.del_req_workload.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_release_kv_drops_leftover_prefill_cost_when_tokens_already_gone(
+        self, mock_request_manager, valid_resource
+    ):
+        current = Workload(active_kv_cache=100.0, active_tokens=0.0, prefill_cost=42)
+        mock_request_manager.get_req_workload = AsyncMock(return_value=current)
+        handler = WorkloadActionHandler(mock_request_manager)
+        req_info = MagicMock()
+        req_info.req_len = 4
+        workload_change, role = await handler.compute_and_update(
+            valid_resource, "req-1", WorkloadAction.RELEASE_KV, req_info=req_info
+        )
+        assert role == PDRole.ROLE_P
+        assert workload_change == Workload(active_kv_cache=-100.0, prefill_cost=-42)
+        assert current.prefill_cost == 0
+        mock_request_manager.del_req_workload.assert_called_once()
+

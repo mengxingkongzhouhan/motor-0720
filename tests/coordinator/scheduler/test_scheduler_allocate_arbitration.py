@@ -21,6 +21,7 @@ from motor.coordinator.scheduler.runtime.scheduler_server import _SchedulerReque
 from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
     CANDIDATE_POLICY_LOAD_BALANCE,
+    CANDIDATE_POLICY_SMETRIC,
     SchedulerRequest,
     SchedulerRequestType,
     SchedulerResponseType,
@@ -387,6 +388,7 @@ async def test_allocate_only_affinity_reselects_least_loaded_among_candidates():
     assert response.data["endpoint"]["id"] == 20
     _, selected_workload = await instance_manager.get_endpoint_workload(2, 20)
     assert selected_workload.active_tokens == 13
+    assert selected_workload.prefill_cost == 0
     assert workload_writer.writes == [(2, 20)]
 
 
@@ -452,6 +454,7 @@ async def test_allocate_only_affinity_global_prefers_cache_hit_despite_higher_lo
     assert response.data["selected_score"] == pytest.approx(50.0)
     _, selected_workload = await instance_manager.get_endpoint_workload(2, 20)
     assert selected_workload.active_tokens == 53
+    assert selected_workload.prefill_cost == 0
     assert workload_writer.writes == [(2, 20)]
 
 
@@ -701,4 +704,430 @@ async def test_allocate_only_fast_path_accepts_encode_candidate():
     selected_role, selected_workload = await instance_manager.get_endpoint_workload(1, 10)
     assert selected_role == PDRole.ROLE_E
     assert selected_workload.active_tokens == 3
+    assert selected_workload.prefill_cost == 0
     assert workload_writer.writes == [(1, 10)]
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_stamps_selected_endpoint_prefill_cost():
+    """KV-affinity ALLOCATE_ONLY adds the committed endpoint's prefill_cost to its ledger."""
+    config = CoordinatorConfig()
+    config.scheduler_config.scheduler_type = SchedulerType.KV_CACHE_AFFINITY
+    config.scheduler_config.endpoint_instance_score_weight = 0.0
+    instance_manager = InstanceManager(config)
+
+    inst_a = _make_prefill_instance(1, (10, 11))
+    inst_b = _make_prefill_instance(2, (20, 21))
+    await instance_manager.refresh_instances(EventType.ADD, [inst_a, inst_b])
+    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=1))
+    await instance_manager.update_instance_workload(1, 11, Workload(active_tokens=1))
+    await instance_manager.update_instance_workload(2, 20, Workload(active_tokens=50))
+    await instance_manager.update_instance_workload(2, 21, Workload(active_tokens=1))
+
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    workload_writer = _DummyWorkloadWriter()
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager,
+        scheduler,
+        config,
+        workload_writer=workload_writer,
+    )
+    request = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-kv-prefill-cost-ledger",
+        data={
+            "instance_id": 1,
+            "endpoint_id": 10,
+            "candidates": [
+                {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 10000.0},
+                {"instance_id": 1, "endpoint_id": 11, "prefill_cost": 10000.0},
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 42},
+                {"instance_id": 2, "endpoint_id": 21, "prefill_cost": 10000.0},
+            ],
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-kv-prefill-cost-ledger",
+            "workload_sequence": workload_writer.sequence - 2,
+            "instance_version": workload_writer.instance_version,
+            "workload_active_tokens": 3.0,
+            "workload_active_kv_cache": 3.0,
+            "candidate_policy": CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+            "prefill_load_scale": 1.0,
+            "load_weight": 0.0,  # affinity-only: 2-20 wins with prefill_cost=42
+        },
+    )
+
+    response = await dispatcher.dispatch(request)
+
+    assert response.response_type == SchedulerResponseType.SUCCESS
+    assert response.data["instance"]["id"] == 2
+    assert response.data["endpoint"]["id"] == 20
+    _, selected_workload = await instance_manager.get_endpoint_workload(2, 20)
+    assert selected_workload.prefill_cost == 42
+    assert selected_workload.active_tokens == 53.0
+    _, other_workload = await instance_manager.get_endpoint_workload(1, 10)
+    assert other_workload.prefill_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_load_gated_prefill_cost_does_not_trigger_global_rank():
+    """load_gated may send prefill_cost for accounting without switching to unified global rank."""
+    config = CoordinatorConfig()
+    config.scheduler_config.scheduler_type = SchedulerType.KV_CACHE_AFFINITY
+    config.scheduler_config.endpoint_instance_score_weight = 0.0
+    instance_manager = InstanceManager(config)
+
+    inst_a = _make_prefill_instance(1, (10, 11))
+    inst_b = _make_prefill_instance(2, (20, 21))
+    await instance_manager.refresh_instances(EventType.ADD, [inst_a, inst_b])
+    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=20))
+    await instance_manager.update_instance_workload(1, 11, Workload(active_tokens=5))
+    await instance_manager.update_instance_workload(2, 20, Workload(active_tokens=10))
+    await instance_manager.update_instance_workload(2, 21, Workload(active_tokens=40))
+
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    workload_writer = _DummyWorkloadWriter()
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager,
+        scheduler,
+        config,
+        workload_writer=workload_writer,
+    )
+    request = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-kv-load-gated-cost",
+        data={
+            "instance_id": 1,
+            "endpoint_id": 10,
+            "candidates": [
+                {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 0.0},
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 99},
+            ],
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-kv-load-gated-cost",
+            "workload_sequence": workload_writer.sequence - 2,
+            "instance_version": workload_writer.instance_version,
+            "workload_active_tokens": 3.0,
+            "workload_active_kv_cache": 0.0,
+            "candidate_policy": CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+            # No prefill_load_scale: must stay load_gated (least-loaded among proposed).
+        },
+    )
+
+    response = await dispatcher.dispatch(request)
+
+    assert response.response_type == SchedulerResponseType.SUCCESS
+    assert response.data["instance"]["id"] == 2
+    assert response.data["endpoint"]["id"] == 20
+    _, selected_workload = await instance_manager.get_endpoint_workload(2, 20)
+    assert selected_workload.active_tokens == 13
+    assert selected_workload.prefill_cost == 99
+    _, skipped = await instance_manager.get_endpoint_workload(1, 11)
+    assert skipped.active_tokens == 5
+    assert skipped.prefill_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_smetric_picks_lowest_cost_ignoring_load():
+    """SMetric ALLOCATE_ONLY ranks by prefill_cost only; a busier but cheaper endpoint wins."""
+    config = CoordinatorConfig()
+    config.scheduler_config.scheduler_type = SchedulerType.SMETRIC
+    config.scheduler_config.endpoint_instance_score_weight = 0.0
+    instance_manager = InstanceManager(config)
+
+    inst_a = _make_prefill_instance(1, (10, 11))
+    inst_b = _make_prefill_instance(2, (20, 21))
+    await instance_manager.refresh_instances(EventType.ADD, [inst_a, inst_b])
+    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=1))
+    await instance_manager.update_instance_workload(1, 11, Workload(active_tokens=1))
+    await instance_manager.update_instance_workload(2, 20, Workload(active_tokens=50))
+    await instance_manager.update_instance_workload(2, 21, Workload(active_tokens=1))
+
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    workload_writer = _DummyWorkloadWriter()
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager,
+        scheduler,
+        config,
+        workload_writer=workload_writer,
+    )
+    request = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-smetric-min-cost",
+        data={
+            "instance_id": 1,
+            "endpoint_id": 10,  # worker top-1 (stale)
+            "candidates": [
+                {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 100},
+                {"instance_id": 1, "endpoint_id": 11, "prefill_cost": 80},
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 12},
+                {"instance_id": 2, "endpoint_id": 21, "prefill_cost": 90},
+            ],
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-smetric-min-cost",
+            "workload_sequence": workload_writer.sequence - 2,
+            "instance_version": workload_writer.instance_version,
+            "workload_active_tokens": 3.0,
+            "workload_active_kv_cache": 3.0,
+            "candidate_policy": CANDIDATE_POLICY_SMETRIC,
+            "isl": 20,  # min cost 12 / 20 > 0.5 so min-cost ranking applies (empty average)
+        },
+    )
+
+    response = await dispatcher.dispatch(request)
+
+    assert response.response_type == SchedulerResponseType.SUCCESS
+    assert response.data["fast_path"] is False
+    assert response.data["instance"]["id"] == 2
+    assert response.data["endpoint"]["id"] == 20
+    _, selected_workload = await instance_manager.get_endpoint_workload(2, 20)
+    assert selected_workload.prefill_cost == 12
+    assert selected_workload.active_tokens == 53.0
+    _, other_workload = await instance_manager.get_endpoint_workload(1, 10)
+    assert other_workload.prefill_cost == 0
+    assert other_workload.active_tokens == 1
+    assert workload_writer.writes == [(2, 20)]
+
+
+def _smetric_allocate_dispatcher():
+    config = CoordinatorConfig()
+    config.scheduler_config.scheduler_type = SchedulerType.SMETRIC
+    config.scheduler_config.endpoint_instance_score_weight = 0.0
+    instance_manager = InstanceManager(config)
+    return config, instance_manager
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_smetric_low_ratio_picks_min_ledger_prefill_cost():
+    """First request with cost/isl <= 0.5 should pick the least remaining ledger prefill."""
+    config, instance_manager = _smetric_allocate_dispatcher()
+    inst_a = _make_prefill_instance(1, (10, 11))
+    inst_b = _make_prefill_instance(2, (20, 21))
+    await instance_manager.refresh_instances(EventType.ADD, [inst_a, inst_b])
+    # Token-idle 1-10 is busy on remaining prefill; 1-11 has none. Token LB would pick 1-10.
+    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=1, prefill_cost=80))
+    await instance_manager.update_instance_workload(1, 11, Workload(active_tokens=30, prefill_cost=0))
+    await instance_manager.update_instance_workload(2, 20, Workload(active_tokens=50, prefill_cost=40))
+    await instance_manager.update_instance_workload(2, 21, Workload(active_tokens=40, prefill_cost=20))
+
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    workload_writer = _DummyWorkloadWriter()
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager, scheduler, config, workload_writer=workload_writer
+    )
+    request = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-smetric-low-ratio",
+        data={
+            "instance_id": 2,
+            "endpoint_id": 20,  # cheapest cache for this request
+            "candidates": [
+                {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 40},
+                {"instance_id": 1, "endpoint_id": 11, "prefill_cost": 90},
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 20},
+                {"instance_id": 2, "endpoint_id": 21, "prefill_cost": 70},
+            ],
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-smetric-low-ratio",
+            "workload_sequence": workload_writer.sequence - 2,
+            "instance_version": workload_writer.instance_version,
+            "workload_active_tokens": 3.0,
+            "workload_active_kv_cache": 3.0,
+            "candidate_policy": CANDIDATE_POLICY_SMETRIC,
+            "isl": 100,  # 20/100 <= 0.5
+        },
+    )
+
+    response = await dispatcher.dispatch(request)
+
+    assert response.response_type == SchedulerResponseType.SUCCESS
+    assert response.data["fast_path"] is False
+    assert response.data["instance"]["id"] == 1
+    assert response.data["endpoint"]["id"] == 11
+    _, selected_workload = await instance_manager.get_endpoint_workload(1, 11)
+    assert selected_workload.active_tokens == 33.0
+    assert selected_workload.prefill_cost == 90  # stamped request cost, was ledger 0
+    _, skipped_idle = await instance_manager.get_endpoint_workload(1, 10)
+    assert skipped_idle.active_tokens == 1
+    assert skipped_idle.prefill_cost == 80
+    avg, count = dispatcher._smetric_prefill.snapshot()
+    assert count == 1
+    assert avg == 90  # allocated endpoint 1-11, not min candidate cost 20
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_smetric_average_is_shared_across_requests():
+    """Two ALLOCATE_ONLY calls (as from two Workers) share the Scheduler's running average."""
+    config, instance_manager = _smetric_allocate_dispatcher()
+    inst_a = _make_prefill_instance(1, (10, 11))
+    inst_b = _make_prefill_instance(2, (20, 21))
+    await instance_manager.refresh_instances(EventType.ADD, [inst_a, inst_b])
+    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=1))
+    await instance_manager.update_instance_workload(1, 11, Workload(active_tokens=30))
+    await instance_manager.update_instance_workload(2, 20, Workload(active_tokens=50))
+    await instance_manager.update_instance_workload(2, 21, Workload(active_tokens=40))
+
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    workload_writer = _DummyWorkloadWriter()
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager, scheduler, config, workload_writer=workload_writer
+    )
+
+    first = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-smetric-avg-1",
+        data={
+            "instance_id": 2,
+            "endpoint_id": 20,
+            "candidates": [
+                {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 90},
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 12},
+            ],
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-smetric-avg-1",
+            "workload_sequence": workload_writer.sequence - 2,
+            "instance_version": workload_writer.instance_version,
+            "workload_active_tokens": 3.0,
+            "workload_active_kv_cache": 3.0,
+            "candidate_policy": CANDIDATE_POLICY_SMETRIC,
+            "isl": 20,  # 12/20 > 0.5, no history → min-cost
+        },
+    )
+    first_resp = await dispatcher.dispatch(first)
+    assert first_resp.data["instance"]["id"] == 2
+    assert first_resp.data["endpoint"]["id"] == 20
+    assert dispatcher._smetric_prefill.snapshot() == (12.0, 1)
+
+    second = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-smetric-avg-2",
+        data={
+            "instance_id": 2,
+            "endpoint_id": 20,
+            "candidates": [
+                {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 90},
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 80},
+            ],
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-smetric-avg-2",
+            "workload_sequence": workload_writer.sequence - 2,
+            "instance_version": workload_writer.instance_version,
+            "workload_active_tokens": 3.0,
+            "workload_active_kv_cache": 3.0,
+            "candidate_policy": CANDIDATE_POLICY_SMETRIC,
+            "isl": 100,  # 80/100 > 0.5 but 80 > avg 12 → min ledger prefill_cost
+        },
+    )
+    second_resp = await dispatcher.dispatch(second)
+    assert second_resp.data["instance"]["id"] == 1
+    assert second_resp.data["endpoint"]["id"] == 10
+    avg, count = dispatcher._smetric_prefill.snapshot()
+    assert count == 2
+    assert avg == 51.0  # allocated costs (12 + 90) / 2, not min candidate 80
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_smetric_fast_path_honors_worker_min_cost_top1():
+    """Fresh worker view + SM gate commits the worker min-cost top-1; does not dump to min ledger."""
+    config, instance_manager = _smetric_allocate_dispatcher()
+    inst_a = _make_prefill_instance(1, (10, 11))
+    inst_b = _make_prefill_instance(2, (20, 21))
+    await instance_manager.refresh_instances(EventType.ADD, [inst_a, inst_b])
+    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=1))
+    await instance_manager.update_instance_workload(1, 11, Workload(active_tokens=1))
+    await instance_manager.update_instance_workload(2, 20, Workload(active_tokens=50))
+    await instance_manager.update_instance_workload(2, 21, Workload(active_tokens=1))
+
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    workload_writer = _DummyWorkloadWriter()
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager, scheduler, config, workload_writer=workload_writer
+    )
+    request = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-smetric-fast-sm",
+        data={
+            "instance_id": 2,
+            "endpoint_id": 20,  # worker min-cost top-1; busier than 1-10
+            "candidates": [
+                {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 100},
+                {"instance_id": 1, "endpoint_id": 11, "prefill_cost": 80},
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 12},
+                {"instance_id": 2, "endpoint_id": 21, "prefill_cost": 90},
+            ],
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-smetric-fast-sm",
+            "workload_sequence": workload_writer.sequence,
+            "instance_version": workload_writer.instance_version,
+            "workload_active_tokens": 3.0,
+            "workload_active_kv_cache": 3.0,
+            "candidate_policy": CANDIDATE_POLICY_SMETRIC,
+            "isl": 20,  # min cost 12 / 20 > 0.5, empty average → SM
+        },
+    )
+
+    response = await dispatcher.dispatch(request)
+
+    assert response.response_type == SchedulerResponseType.SUCCESS
+    assert response.data["fast_path"] is True
+    assert response.data["instance"]["id"] == 2
+    assert response.data["endpoint"]["id"] == 20
+    _, selected_workload = await instance_manager.get_endpoint_workload(2, 20)
+    assert selected_workload.prefill_cost == 12
+    _, idle_workload = await instance_manager.get_endpoint_workload(1, 10)
+    assert idle_workload.active_tokens == 1
+    assert idle_workload.prefill_cost == 0
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_smetric_matching_sequence_still_picks_min_ledger_when_gated():
+    """A fresh worker view does not skip the hybrid gate: cost/isl <= 0.5 still uses min ledger cost."""
+    config, instance_manager = _smetric_allocate_dispatcher()
+    inst_a = _make_prefill_instance(1, (10, 11))
+    inst_b = _make_prefill_instance(2, (20, 21))
+    await instance_manager.refresh_instances(EventType.ADD, [inst_a, inst_b])
+    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=1, prefill_cost=80))
+    await instance_manager.update_instance_workload(1, 11, Workload(active_tokens=30, prefill_cost=0))
+    await instance_manager.update_instance_workload(2, 20, Workload(active_tokens=50, prefill_cost=40))
+    await instance_manager.update_instance_workload(2, 21, Workload(active_tokens=40, prefill_cost=20))
+
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    workload_writer = _DummyWorkloadWriter()
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager, scheduler, config, workload_writer=workload_writer
+    )
+    request = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-smetric-fast-ledger",
+        data={
+            "instance_id": 2,
+            "endpoint_id": 20,  # cheapest cache; not the lowest ledger prefill
+            "candidates": [
+                {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 40},
+                {"instance_id": 1, "endpoint_id": 11, "prefill_cost": 90},
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 20},
+                {"instance_id": 2, "endpoint_id": 21, "prefill_cost": 70},
+            ],
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-smetric-fast-ledger",
+            "workload_sequence": workload_writer.sequence,
+            "instance_version": workload_writer.instance_version,
+            "workload_active_tokens": 3.0,
+            "workload_active_kv_cache": 3.0,
+            "candidate_policy": CANDIDATE_POLICY_SMETRIC,
+            "isl": 100,  # 20/100 <= 0.5 → min ledger despite matching sequence
+        },
+    )
+
+    response = await dispatcher.dispatch(request)
+
+    assert response.response_type == SchedulerResponseType.SUCCESS
+    assert response.data["fast_path"] is False
+    assert response.data["instance"]["id"] == 1
+    assert response.data["endpoint"]["id"] == 11
+    _, selected_workload = await instance_manager.get_endpoint_workload(1, 11)
+    assert selected_workload.active_tokens == 33.0
+    assert selected_workload.prefill_cost == 90
+    _, skipped = await instance_manager.get_endpoint_workload(2, 20)
+    assert skipped.active_tokens == 50
+    assert skipped.prefill_cost == 40
+

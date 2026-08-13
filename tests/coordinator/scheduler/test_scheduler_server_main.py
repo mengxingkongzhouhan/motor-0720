@@ -37,6 +37,7 @@ from motor.coordinator.scheduler.runtime.scheduler_server import (
 from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
     CANDIDATE_POLICY_LOAD_BALANCE,
+    CANDIDATE_POLICY_SMETRIC,
     SchedulerRequest,
     SchedulerRequestType,
     SchedulerResponseType,
@@ -899,6 +900,10 @@ class TestShouldScanGlobalLoadBalance:
     def test_kv_affinity_policy_returns_false(self):
         dispatcher, *_ = _make_dispatcher(scheduler_type=SchedulerType.LOAD_BALANCE)
         assert dispatcher._should_scan_global_load_balance(CANDIDATE_POLICY_KV_CACHE_AFFINITY) is False
+
+    def test_smetric_policy_returns_false(self):
+        dispatcher, *_ = _make_dispatcher(scheduler_type=SchedulerType.LOAD_BALANCE)
+        assert dispatcher._should_scan_global_load_balance(CANDIDATE_POLICY_SMETRIC) is False
 
     def test_none_policy_lb_scheduler_returns_true(self):
         """No candidate_policy specified → fall back to scheduler_type (LB → True)."""

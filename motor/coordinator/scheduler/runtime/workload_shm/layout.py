@@ -8,7 +8,7 @@
 
 """
 Shared memory layout for workload data.
-Header 64B + Entry 32B × N. Little-endian.
+Header 72B + Entry 32B × N. Little-endian.
 Sequence in header follows seqlock semantics: odd means writer in progress,
 even means readers may accept the snapshot after a matching second header read.
 Instance_version in header: bumped on instance list change (REFRESH_INSTANCES);
@@ -32,13 +32,14 @@ ROLE_DECODE = 1
 ROLE_HYBRID = 2
 ROLE_ENCODE = 3
 
-# Header: 64 bytes
+# Header: 72 bytes
 # magic 4B, schema 2B, padding 2B, sequence 8B (seqlock), entry_count 4B, max_entries 4B,
 # instance_version 8B (bumped when instance/endpoint set changes),
 # heartbeat_sequence 8B (Scheduler bumps ~1/s),
-# prefill_sequence 8B, decode_sequence 8B, hybrid_sequence 8B
-HEADER_SIZE = 64
-HEADER_FMT = "<I H H q I I Q Q Q Q Q"  # little-endian
+# prefill_sequence 8B, decode_sequence 8B, hybrid_sequence 8B,
+# avg_request_tokens 8B (cluster-wide running average of request token lengths)
+HEADER_SIZE = 72
+HEADER_FMT = "<I H H q I I Q Q Q Q Q d"  # little-endian
 HEARTBEAT_OFFSET = 32  # bytes 32-40: heartbeat_sequence (Q)
 HEARTBEAT_STALE_SEC = 5.0  # If heartbeat unchanged for this long, Infer treats shm as stale
 
@@ -64,7 +65,7 @@ class WorkloadShmEntry:
 
 @dataclass(frozen=True)
 class WorkloadShmHeader:
-    """Header fields for workload shared memory (64 bytes). Used by pack_header/unpack_header."""
+    """Header fields for workload shared memory (72 bytes). Used by pack_header/unpack_header."""
 
     magic: int
     schema_version: int
@@ -76,10 +77,11 @@ class WorkloadShmHeader:
     prefill_sequence: int = 0
     decode_sequence: int = 0
     hybrid_sequence: int = 0
+    avg_request_tokens: float = 0.0
 
 
 def pack_header(header: WorkloadShmHeader) -> bytes:
-    """Pack header into 64 bytes. Unsigned sequence fields are normalized to uint64."""
+    """Pack header into HEADER_SIZE bytes. Unsigned sequence fields are normalized to uint64."""
     instance_version = header.instance_version
     heartbeat_sequence = header.heartbeat_sequence
     prefill_sequence = header.prefill_sequence
@@ -108,11 +110,12 @@ def pack_header(header: WorkloadShmHeader) -> bytes:
         prefill_sequence,
         decode_sequence,
         hybrid_sequence,
+        header.avg_request_tokens,
     )
 
 
 def unpack_header(buf: memoryview) -> WorkloadShmHeader:
-    """Parse 64-byte header from buffer. Returns WorkloadShmHeader."""
+    """Parse HEADER_SIZE-byte header from buffer. Returns WorkloadShmHeader."""
     if len(buf) < HEADER_SIZE:
         raise ValueError(f"Buffer too small for header: {len(buf)} < {HEADER_SIZE}")
     t = struct.unpack(HEADER_FMT, buf[:HEADER_SIZE])
@@ -127,6 +130,7 @@ def unpack_header(buf: memoryview) -> WorkloadShmHeader:
         prefill_sequence=t[8],
         decode_sequence=t[9],
         hybrid_sequence=t[10],
+        avg_request_tokens=t[11],
     )
 
 

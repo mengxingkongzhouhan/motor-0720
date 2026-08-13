@@ -12,6 +12,7 @@ from abc import ABC, abstractmethod
 
 from motor.common.resources.instance import Instance, PDRole
 from motor.common.resources.endpoint import Endpoint, Workload, WorkloadAction
+from motor.common.resources.request_token_stats import avg_request_tokens
 from motor.coordinator.domain import InstanceProvider
 from motor.common.logger import get_logger
 
@@ -88,6 +89,17 @@ class BaseSchedulingPolicy(ABC):
 
     def __init__(self, instance_provider: InstanceProvider) -> None:
         self._instance_provider = instance_provider
+
+    @staticmethod
+    def get_avg_request_tokens() -> float:
+        """Cluster-wide running average of request token lengths.
+
+        Updated on each allocation as
+        ``new_avg = old_avg + (new_sample - old_avg) / (count + 1)``.
+        Use this when scoring in a scheduling policy; it is not mixed into
+        ``Workload.calculate_workload_score`` automatically.
+        """
+        return avg_request_tokens()
 
     @abstractmethod
     def _select_instance(self, role: PDRole = None) -> Instance | None:

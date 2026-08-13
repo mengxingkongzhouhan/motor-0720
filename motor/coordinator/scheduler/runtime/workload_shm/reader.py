@@ -15,6 +15,7 @@ from multiprocessing import shared_memory
 from typing import Any
 
 from motor.common.resources.instance import PDRole
+from motor.common.resources.request_token_stats import set_avg_request_tokens
 from motor.common.logger import get_logger
 from motor.coordinator.scheduler.runtime.workload_shm.layout import (
     MAGIC,
@@ -117,6 +118,7 @@ class WorkloadSharedMemoryReader:
                 return (None, False)
             header, entries = snapshot
 
+            set_avg_request_tokens(getattr(header, "avg_request_tokens", 0.0) or 0.0)
             heartbeat_stale = self._update_heartbeat_and_check_stale(header)
 
             if entries is not None:

@@ -24,6 +24,10 @@ class Workload(BaseModel):
 
     active_kv_cache: float = Field(default=0, description="Active KV cache size")
     active_tokens: float = Field(default=0, description="Number of active requests")
+    request_token_length: float = Field(
+        default=0,
+        description="Token length of this allocation's request; not an endpoint ledger field",
+    )
 
     def __iadd__(self, other):
         if not isinstance(other, Workload):

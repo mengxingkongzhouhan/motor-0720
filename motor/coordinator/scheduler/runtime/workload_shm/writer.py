@@ -15,6 +15,7 @@ import struct
 from multiprocessing import shared_memory
 
 from motor.common.resources.instance import PDRole
+from motor.common.resources.request_token_stats import avg_request_tokens
 from motor.common.logger import get_logger
 from motor.coordinator.domain.instance_manager import InstanceManager
 from motor.coordinator.scheduler.runtime.workload_shm.layout import (
@@ -289,6 +290,7 @@ class WorkloadSharedMemoryWriter:
                 prefill_sequence=self._role_sequences["prefill"],
                 decode_sequence=self._role_sequences["decode"],
                 hybrid_sequence=self._role_sequences["hybrid"],
+                avg_request_tokens=avg_request_tokens(),
             )
         )
         self._buf[:HEADER_SIZE] = header

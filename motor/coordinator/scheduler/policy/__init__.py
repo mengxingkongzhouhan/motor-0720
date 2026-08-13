@@ -14,9 +14,11 @@ __all__ = [
     "LoadBalancePolicy",
     "RoundRobinPolicy",
     "SchedulingPolicyFactory",
+    "avg_request_tokens",
 ]
 
 from motor.coordinator.scheduler.policy.base import BaseSchedulingPolicy
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.factory import SchedulingPolicyFactory
+from motor.common.resources.request_token_stats import avg_request_tokens

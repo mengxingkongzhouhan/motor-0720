@@ -645,7 +645,7 @@ class _SchedulerRequestDispatcher:
         )
         if candidate_policy == CANDIDATE_POLICY_SMETRIC:
             # Gate always runs here (shared average). If it keeps SMetric and the worker's view is
-            # fresh, honor that min-cost top-1 — that is the work the worker already did.
+            # fresh, honor that min-cost top-1. Otherwise pick min request-cost or min ledger cost.
             selected = self._select_smetric_hybrid(
                 selected_candidate,
                 affinity_candidates,
@@ -940,7 +940,7 @@ class _SchedulerRequestDispatcher:
         isl: int | None,
         fast_path: bool,
     ) -> tuple[Instance, Endpoint, float] | None:
-        """Gate on the shared average, then worker min-cost top-1, scheduler min-cost, or global LB."""
+        """Gate on the shared average, then worker min-cost, request min-cost, or min ledger cost."""
         if not smetric_candidates:
             return None
         req_cost = min(cost for _iid, _eid, cost in smetric_candidates)
@@ -951,7 +951,7 @@ class _SchedulerRequestDispatcher:
                 if picked is not None:
                     return picked
             return self._select_smetric_min_cost(smetric_candidates, role)
-        return self._select_global_load_balance_candidate(role)
+        return self._select_min_ledger_prefill_cost(role)
 
     def _select_smetric_min_cost(
         self,
@@ -982,6 +982,36 @@ class _SchedulerRequestDispatcher:
         if best is None:
             return None
         return (best[0], best[1], float(best[2]))
+
+    def _select_min_ledger_prefill_cost(
+        self,
+        role: PDRole,
+    ) -> tuple[Instance, Endpoint, float] | None:
+        """Pick the available endpoint whose current ``workload.prefill_cost`` is smallest.
+
+        This is the SMetric dump path: remaining prefill on the ledger, not token-based
+        load-balance and not this request's conductor cost. Ties break by (instance_id, endpoint_id).
+        """
+        best: tuple[Instance, Endpoint, int] | None = None
+        for instance in self._instance_manager.get_available_instances(role).values():
+            if self._is_instance_circuit_open(instance.id):
+                continue
+            for endpoint in instance.get_all_endpoints():
+                cost = self._endpoint_ledger_prefill_cost(endpoint)
+                if best is None or cost < best[2] or (
+                    cost == best[2] and (instance.id, endpoint.id) < (best[0].id, best[1].id)
+                ):
+                    best = (instance, endpoint, cost)
+        if best is None:
+            return None
+        return (best[0], best[1], float(best[2]))
+
+    @staticmethod
+    def _endpoint_ledger_prefill_cost(endpoint: Endpoint) -> int:
+        try:
+            return max(0, int(getattr(endpoint.workload, "prefill_cost", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
 
     def _select_lowest_load_among_candidates(
         self,

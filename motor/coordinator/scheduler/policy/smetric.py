@@ -32,7 +32,8 @@ logger = get_logger(__name__)
 # SMetric discounts a cached prefix 1:1 against prompt length. Not configurable; not shared with
 # kv_cache_affinity's overlap_credit knob.
 _SMETRIC_OVERLAP_CREDIT = 1
-# Remaining-prefill / prompt-length gate. Above this, min-cost ranking is worth it; otherwise LB.
+# Remaining-prefill / prompt-length gate. Above this, min-cost ranking is worth it; otherwise
+# pick the endpoint whose ledger ``workload.prefill_cost`` is currently smallest.
 _SMETRIC_COST_ISL_RATIO = 0.5
 
 
@@ -104,20 +105,20 @@ class SMetricPrefillCostTracker:
             avg = self._avg
         if count > 0 and req_cost > avg:
             logger.info(
-                "smetric: prefill_cost=%s > avg=%.3f (n=%d), using load_balance",
+                "smetric: prefill_cost=%s > avg=%.3f (n=%d), using min ledger prefill_cost",
                 req_cost,
                 avg,
                 count,
             )
             return False
         if isl <= 0:
-            logger.info("smetric: isl=%s, using load_balance", isl)
+            logger.info("smetric: isl=%s, using min ledger prefill_cost", isl)
             return False
         ratio = req_cost / isl
         if ratio > _SMETRIC_COST_ISL_RATIO:
             return True
         logger.info(
-            "smetric: prefill_cost/isl=%.3f <= %s (cost=%s isl=%s), using load_balance",
+            "smetric: prefill_cost/isl=%.3f <= %s (cost=%s isl=%s), using min ledger prefill_cost",
             ratio,
             _SMETRIC_COST_ISL_RATIO,
             req_cost,
@@ -133,8 +134,9 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
     ``prefill_cost = max(0, isl - matched_tokens)`` (overlap_credit is always 1). Workers compute
     and rank by these costs, then forward every endpoint cost plus the min-cost top-1 and ``isl``.
     The central Scheduler keeps a running average of the **allocated** endpoint's prefill_cost
-    and uses that, plus ``cost/isl``, to decide min-cost ranking vs load-balance. When the gate
-    keeps SMetric and the worker's workload view is fresh, the worker top-1 is committed as-is.
+    and uses that, plus ``cost/isl``, to decide min-cost ranking vs picking the endpoint with the
+    lowest current ``workload.prefill_cost``. When the gate keeps SMetric and the worker's
+    workload view is fresh, the worker top-1 is committed as-is.
 
     Conductor lookup and ``smetric_debug`` are owned here; KvCacheAffinityPolicy is not called.
     """

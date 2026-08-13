@@ -897,16 +897,17 @@ def _smetric_allocate_dispatcher():
 
 
 @pytest.mark.asyncio
-async def test_allocate_only_smetric_low_ratio_uses_load_balance():
-    """First request with cost/isl <= 0.5 should load-balance, not pick the cheapest cache."""
+async def test_allocate_only_smetric_low_ratio_picks_min_ledger_prefill_cost():
+    """First request with cost/isl <= 0.5 should pick the least remaining ledger prefill."""
     config, instance_manager = _smetric_allocate_dispatcher()
     inst_a = _make_prefill_instance(1, (10, 11))
     inst_b = _make_prefill_instance(2, (20, 21))
     await instance_manager.refresh_instances(EventType.ADD, [inst_a, inst_b])
-    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=1))
-    await instance_manager.update_instance_workload(1, 11, Workload(active_tokens=30))
-    await instance_manager.update_instance_workload(2, 20, Workload(active_tokens=50))
-    await instance_manager.update_instance_workload(2, 21, Workload(active_tokens=40))
+    # Token-idle 1-10 is busy on remaining prefill; 1-11 has none. Token LB would pick 1-10.
+    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=1, prefill_cost=80))
+    await instance_manager.update_instance_workload(1, 11, Workload(active_tokens=30, prefill_cost=0))
+    await instance_manager.update_instance_workload(2, 20, Workload(active_tokens=50, prefill_cost=40))
+    await instance_manager.update_instance_workload(2, 21, Workload(active_tokens=40, prefill_cost=20))
 
     scheduler = Scheduler(instance_provider=instance_manager, config=config)
     workload_writer = _DummyWorkloadWriter()
@@ -918,10 +919,12 @@ async def test_allocate_only_smetric_low_ratio_uses_load_balance():
         request_id="alloc-smetric-low-ratio",
         data={
             "instance_id": 2,
-            "endpoint_id": 20,  # cheapest cache
+            "endpoint_id": 20,  # cheapest cache for this request
             "candidates": [
                 {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 40},
+                {"instance_id": 1, "endpoint_id": 11, "prefill_cost": 90},
                 {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 20},
+                {"instance_id": 2, "endpoint_id": 21, "prefill_cost": 70},
             ],
             "role": PDRole.ROLE_P.value,
             "req_id": "req-smetric-low-ratio",
@@ -939,13 +942,16 @@ async def test_allocate_only_smetric_low_ratio_uses_load_balance():
     assert response.response_type == SchedulerResponseType.SUCCESS
     assert response.data["fast_path"] is False
     assert response.data["instance"]["id"] == 1
-    assert response.data["endpoint"]["id"] == 10
-    _, selected_workload = await instance_manager.get_endpoint_workload(1, 10)
-    assert selected_workload.active_tokens == 4.0
-    assert selected_workload.prefill_cost == 40
+    assert response.data["endpoint"]["id"] == 11
+    _, selected_workload = await instance_manager.get_endpoint_workload(1, 11)
+    assert selected_workload.active_tokens == 33.0
+    assert selected_workload.prefill_cost == 90  # stamped request cost, was ledger 0
+    _, skipped_idle = await instance_manager.get_endpoint_workload(1, 10)
+    assert skipped_idle.active_tokens == 1
+    assert skipped_idle.prefill_cost == 80
     avg, count = dispatcher._smetric_prefill.snapshot()
     assert count == 1
-    assert avg == 40  # allocated endpoint 1-10, not min candidate cost 20
+    assert avg == 90  # allocated endpoint 1-11, not min candidate cost 20
 
 
 @pytest.mark.asyncio
@@ -1008,7 +1014,7 @@ async def test_allocate_only_smetric_average_is_shared_across_requests():
             "workload_active_tokens": 3.0,
             "workload_active_kv_cache": 3.0,
             "candidate_policy": CANDIDATE_POLICY_SMETRIC,
-            "isl": 100,  # 80/100 > 0.5 but 80 > avg 12 → load-balance
+            "isl": 100,  # 80/100 > 0.5 but 80 > avg 12 → min ledger prefill_cost
         },
     )
     second_resp = await dispatcher.dispatch(second)
@@ -1021,7 +1027,7 @@ async def test_allocate_only_smetric_average_is_shared_across_requests():
 
 @pytest.mark.asyncio
 async def test_allocate_only_smetric_fast_path_honors_worker_min_cost_top1():
-    """Fresh worker view + SM gate commits the worker min-cost top-1; does not load-balance."""
+    """Fresh worker view + SM gate commits the worker min-cost top-1; does not dump to min ledger."""
     config, instance_manager = _smetric_allocate_dispatcher()
     inst_a = _make_prefill_instance(1, (10, 11))
     inst_b = _make_prefill_instance(2, (20, 21))
@@ -1073,16 +1079,16 @@ async def test_allocate_only_smetric_fast_path_honors_worker_min_cost_top1():
 
 
 @pytest.mark.asyncio
-async def test_allocate_only_smetric_matching_sequence_still_load_balances_when_gated():
-    """A fresh worker view does not skip the hybrid gate: cost/isl <= 0.5 still uses global LB."""
+async def test_allocate_only_smetric_matching_sequence_still_picks_min_ledger_when_gated():
+    """A fresh worker view does not skip the hybrid gate: cost/isl <= 0.5 still uses min ledger cost."""
     config, instance_manager = _smetric_allocate_dispatcher()
     inst_a = _make_prefill_instance(1, (10, 11))
     inst_b = _make_prefill_instance(2, (20, 21))
     await instance_manager.refresh_instances(EventType.ADD, [inst_a, inst_b])
-    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=1))
-    await instance_manager.update_instance_workload(1, 11, Workload(active_tokens=30))
-    await instance_manager.update_instance_workload(2, 20, Workload(active_tokens=50))
-    await instance_manager.update_instance_workload(2, 21, Workload(active_tokens=40))
+    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=1, prefill_cost=80))
+    await instance_manager.update_instance_workload(1, 11, Workload(active_tokens=30, prefill_cost=0))
+    await instance_manager.update_instance_workload(2, 20, Workload(active_tokens=50, prefill_cost=40))
+    await instance_manager.update_instance_workload(2, 21, Workload(active_tokens=40, prefill_cost=20))
 
     scheduler = Scheduler(instance_provider=instance_manager, config=config)
     workload_writer = _DummyWorkloadWriter()
@@ -1091,22 +1097,24 @@ async def test_allocate_only_smetric_matching_sequence_still_load_balances_when_
     )
     request = SchedulerRequest(
         request_type=SchedulerRequestType.ALLOCATE_ONLY,
-        request_id="alloc-smetric-fast-lb",
+        request_id="alloc-smetric-fast-ledger",
         data={
             "instance_id": 2,
-            "endpoint_id": 20,  # cheapest cache; not the lowest load
+            "endpoint_id": 20,  # cheapest cache; not the lowest ledger prefill
             "candidates": [
                 {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 40},
+                {"instance_id": 1, "endpoint_id": 11, "prefill_cost": 90},
                 {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 20},
+                {"instance_id": 2, "endpoint_id": 21, "prefill_cost": 70},
             ],
             "role": PDRole.ROLE_P.value,
-            "req_id": "req-smetric-fast-lb",
+            "req_id": "req-smetric-fast-ledger",
             "workload_sequence": workload_writer.sequence,
             "instance_version": workload_writer.instance_version,
             "workload_active_tokens": 3.0,
             "workload_active_kv_cache": 3.0,
             "candidate_policy": CANDIDATE_POLICY_SMETRIC,
-            "isl": 100,  # 20/100 <= 0.5 → LB despite matching sequence
+            "isl": 100,  # 20/100 <= 0.5 → min ledger despite matching sequence
         },
     )
 
@@ -1115,11 +1123,11 @@ async def test_allocate_only_smetric_matching_sequence_still_load_balances_when_
     assert response.response_type == SchedulerResponseType.SUCCESS
     assert response.data["fast_path"] is False
     assert response.data["instance"]["id"] == 1
-    assert response.data["endpoint"]["id"] == 10
-    _, selected_workload = await instance_manager.get_endpoint_workload(1, 10)
-    assert selected_workload.active_tokens == 4.0
-    assert selected_workload.prefill_cost == 40
+    assert response.data["endpoint"]["id"] == 11
+    _, selected_workload = await instance_manager.get_endpoint_workload(1, 11)
+    assert selected_workload.active_tokens == 33.0
+    assert selected_workload.prefill_cost == 90
     _, skipped = await instance_manager.get_endpoint_workload(2, 20)
     assert skipped.active_tokens == 50
-    assert skipped.prefill_cost == 0
+    assert skipped.prefill_cost == 40
 

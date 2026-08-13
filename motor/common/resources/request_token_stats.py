@@ -8,50 +8,61 @@
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
 
-"""Cluster-wide cumulative average of request token lengths (not per-endpoint)."""
+"""Cluster-wide running average of request token lengths (not per-endpoint).
+
+Policies read the current value with ``avg_request_tokens()`` or
+``BaseSchedulingPolicy.get_avg_request_tokens()``. The mean is updated
+incrementally on each allocation:
+
+    new_avg = old_avg + (new_sample - old_avg) / (count + 1)
+
+so only the mean and sample count are stored, not a cumulative token sum.
+"""
 
 from __future__ import annotations
 
 import threading
 
 _lock = threading.Lock()
-_total_tokens = 0.0
-_total_requests = 0
+_avg = 0.0
+_count = 0
 
 
 def record_request_token_length(token_length: float) -> None:
-    """Accumulate one allocated request's token length into the cluster-wide average."""
+    """Fold one allocated request's token length into the running average."""
     if token_length <= 0:
         return
-    global _total_tokens, _total_requests
+    global _avg, _count
+    sample = float(token_length)
     with _lock:
-        _total_tokens += float(token_length)
-        _total_requests += 1
+        _avg = _avg + (sample - _avg) / (_count + 1)
+        _count += 1
 
 
 def avg_request_tokens() -> float:
-    """Mean token length over all recorded requests; 0 when none have been recorded."""
+    """Cluster-wide running average of request token lengths; 0 when none recorded."""
     with _lock:
-        if _total_requests <= 0:
-            return 0.0
-        return _total_tokens / _total_requests
+        return _avg
+
+
+def request_token_sample_count() -> int:
+    """Number of requests already folded into ``avg_request_tokens()``."""
+    with _lock:
+        return _count
 
 
 def set_avg_request_tokens(avg: float) -> None:
-    """Replace the local snapshot (worker copies the scheduler's cluster-wide average from SHM)."""
-    global _total_tokens, _total_requests
+    """Replace the local snapshot (worker copies the scheduler average from SHM)."""
+    global _avg, _count
     with _lock:
-        if avg <= 0.0:
-            _total_tokens = 0.0
-            _total_requests = 0
-            return
-        _total_tokens = float(avg)
-        _total_requests = 1
+        _avg = max(0.0, float(avg))
+        if _avg <= 0.0:
+            _count = 0
 
 
 def reset_request_token_stats() -> None:
-    """Clear cumulative stats. For tests only."""
-    global _total_tokens, _total_requests
+    """Clear running average state. For tests only."""
+    global _avg, _count
     with _lock:
-        _total_tokens = 0.0
-        _total_requests = 0
+        _avg = 0.0
+        _count = 0

@@ -13,12 +13,8 @@ from enum import Enum
 from pydantic import BaseModel, Field
 
 from motor.common.logger import get_logger
-from motor.common.resources.request_token_stats import avg_request_tokens
 
 HEARTBEAT_TIMEOUT = 5  # 5 seconds
-
-# Weight of the cluster-wide mean request token length in calculate_workload_score.
-AVG_REQUEST_TOKENS_WEIGHT = 0.3
 
 logger = get_logger(__name__)
 
@@ -46,9 +42,6 @@ class Workload(BaseModel):
         """
         Calculate workload score based on role.
 
-        Uses the cluster-wide cumulative mean of all request token lengths
-        (``avg_request_tokens``), not a per-endpoint value.
-
         Args:
             role: PDRole enum or str ("prefill"/"decode"/"mix") indicating the role.
 
@@ -58,15 +51,14 @@ class Workload(BaseModel):
         if role is None:
             raise ValueError("role is required for calculate_workload_score")
         role_value = role.value if isinstance(role, Enum) else role
-        avg_term = avg_request_tokens() * AVG_REQUEST_TOKENS_WEIGHT
         if role_value == "prefill":
-            return self.active_tokens + self.active_kv_cache * 0.3 + avg_term
+            return self.active_tokens + self.active_kv_cache * 0.3
         elif role_value == "decode":
-            return self.active_tokens + avg_term
+            return self.active_tokens
         elif role_value == "encode":
-            return self.active_tokens + avg_term
+            return self.active_tokens
         elif role_value in ("union", "both"):
-            return self.active_tokens + self.active_kv_cache * 0.15 + avg_term
+            return self.active_tokens + self.active_kv_cache * 0.15
         else:
             raise ValueError(f"Invalid role value: {role_value}")
 

@@ -16,7 +16,7 @@ import httpx
 
 from motor.coordinator.scheduler.scheduler import Scheduler, SchedulerType
 from motor.coordinator.domain.instance_manager import InstanceManager
-from motor.common.resources.request_token_stats import avg_request_tokens, reset_request_token_stats
+from motor.common.resources.request_token_stats import reset_request_token_stats
 from motor.coordinator.domain.workload_calculator import calculate_demand_workload
 from motor.config.coordinator import CoordinatorConfig
 from motor.common.resources.instance import Instance, InsStatus, PDRole, ParallelConfig
@@ -377,11 +377,7 @@ async def test_workload_calculation_accuracy(scheduler_setup):
     assert result
 
     # calculate expected workload score
-    expected_score = (
-        selected_endpoint.workload.active_tokens
-        + selected_endpoint.workload.active_kv_cache * 0.3
-        + avg_request_tokens() * 0.3
-    )
+    expected_score = selected_endpoint.workload.active_tokens + selected_endpoint.workload.active_kv_cache * 0.3
 
     # get actual computed score
     actual_score = selected_endpoint.workload.calculate_workload_score(role=selected_instance.role)
@@ -398,9 +394,7 @@ async def test_workload_calculation_accuracy(scheduler_setup):
 
     # verify that the score after release matches the expected score
     expected_score_after_release = (
-        selected_endpoint.workload.active_tokens
-        + selected_endpoint.workload.active_kv_cache * 0.3
-        + avg_request_tokens() * 0.3
+        selected_endpoint.workload.active_tokens + selected_endpoint.workload.active_kv_cache * 0.3
     )
     actual_score_after_release = selected_endpoint.workload.calculate_workload_score(role=selected_instance.role)
     assert actual_score_after_release == expected_score_after_release

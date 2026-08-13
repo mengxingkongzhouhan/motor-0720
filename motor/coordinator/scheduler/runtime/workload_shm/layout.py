@@ -37,7 +37,7 @@ ROLE_ENCODE = 3
 # instance_version 8B (bumped when instance/endpoint set changes),
 # heartbeat_sequence 8B (Scheduler bumps ~1/s),
 # prefill_sequence 8B, decode_sequence 8B, hybrid_sequence 8B,
-# avg_request_tokens 8B (cluster-wide cumulative mean request token length)
+# avg_request_tokens 8B (cluster-wide running average of request token lengths)
 HEADER_SIZE = 72
 HEADER_FMT = "<I H H q I I Q Q Q Q Q d"  # little-endian
 HEARTBEAT_OFFSET = 32  # bytes 32-40: heartbeat_sequence (Q)

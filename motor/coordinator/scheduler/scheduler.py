@@ -28,7 +28,7 @@ from motor.coordinator.domain.scheduling_pin import (
     resolve_pinned_instance,
     select_endpoint_for_instance,
 )
-from motor.coordinator.domain.workload_calculator import calculate_demand_workload
+from motor.coordinator.domain.workload_calculator import affinity_prefill_cost, calculate_demand_workload
 from motor.config.coordinator import CoordinatorConfig, SchedulerType
 from motor.coordinator.domain import InstanceProvider
 from motor.coordinator.models.request import RequestInfo
@@ -162,6 +162,8 @@ class Scheduler:
             if not hasattr(self._scheduling_policy, "update_workload")
             else calculate_demand_workload(role, req_info)
         )
+        # KV affinity only: other policies leave kv_affinity_debug unset, so this stays 0.
+        workload.prefill_cost = affinity_prefill_cost(req_info, instance.id, endpoint.id)
         params = UpdateWorkloadParams(
             instance_id=instance.id,
             endpoint_id=endpoint.id,

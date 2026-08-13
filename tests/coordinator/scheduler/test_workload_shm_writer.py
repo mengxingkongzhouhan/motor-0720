@@ -30,6 +30,7 @@ from motor.coordinator.scheduler.runtime.workload_shm.layout import (
     HEARTBEAT_OFFSET,
     WorkloadShmEntry,
     pack_entry,
+    unpack_entry,
     unpack_header,
 )
 from motor.common.resources.instance import PDRole
@@ -79,12 +80,13 @@ class TestPdRoleToShmRole(unittest.TestCase):
 class TestCollectEntriesAndSlotMap(unittest.TestCase):
     """Test _collect_entries_and_slot_map helper."""
 
-    def _make_endpoint(self, eid, tokens, kv):
+    def _make_endpoint(self, eid, tokens, kv, prefill=0.0):
         ep = MagicMock()
         ep.id = eid
         ep.workload = MagicMock()
         ep.workload.active_tokens = tokens
         ep.workload.active_kv_cache = kv
+        ep.workload.prefill_cost = prefill
         return ep
 
     def _make_instance(self, iid, endpoints_dict):
@@ -99,7 +101,7 @@ class TestCollectEntriesAndSlotMap(unittest.TestCase):
         im = MagicMock()
 
         # ROLE_P instance with one endpoint
-        ep_p = self._make_endpoint(10, 100.0, 200.0)
+        ep_p = self._make_endpoint(10, 100.0, 200.0, prefill=12.0)
         inst_p = self._make_instance(1, {"g1": {10: ep_p}})
 
         # ROLE_D instance with one endpoint
@@ -133,15 +135,15 @@ class TestCollectEntriesAndSlotMap(unittest.TestCase):
 
         self.assertEqual(
             entries[0],
-            (1, 10, ROLE_PREFILL, 100.0, 200.0),
+            (1, 10, ROLE_PREFILL, 100.0, 200.0, 12.0),
         )
         self.assertEqual(
             entries[1],
-            (2, 20, ROLE_DECODE, 300.0, 400.0),
+            (2, 20, ROLE_DECODE, 300.0, 400.0, 0.0),
         )
         self.assertEqual(
             entries[2],
-            (3, 30, ROLE_HYBRID, 500.0, 600.0),
+            (3, 30, ROLE_HYBRID, 500.0, 600.0, 0.0),
         )
 
     # ---------------------------------------------------------------
@@ -305,6 +307,7 @@ class TestWorkloadSharedMemoryWriter(unittest.TestCase):
         mock_workload = MagicMock()
         mock_workload.active_tokens = 999.0
         mock_workload.active_kv_cache = 888.0
+        mock_workload.prefill_cost = 77.0
         im.get_endpoint_workload = AsyncMock(
             return_value=(PDRole.ROLE_P, mock_workload),
         )
@@ -326,6 +329,7 @@ class TestWorkloadSharedMemoryWriter(unittest.TestCase):
         self.assertEqual(entry_arg.role, ROLE_PREFILL)
         self.assertEqual(entry_arg.active_tokens, 999.0)
         self.assertEqual(entry_arg.active_kv_cache, 888.0)
+        self.assertEqual(entry_arg.prefill_cost, 77.0)
 
         # Header should be rewritten
         mock_wh.assert_called()
@@ -344,6 +348,7 @@ class TestWorkloadSharedMemoryWriter(unittest.TestCase):
         mock_workload = MagicMock()
         mock_workload.active_tokens = 10.0
         mock_workload.active_kv_cache = 20.0
+        mock_workload.prefill_cost = 0.0
         im.get_endpoint_workload = AsyncMock(return_value=(PDRole.ROLE_D, mock_workload))
 
         asyncio.run(writer.write_single_entry(2, 2))
@@ -426,3 +431,23 @@ class TestWorkloadSharedMemoryWriter(unittest.TestCase):
                 b"\x00" * ENTRY_SIZE,
                 msg=f"Slot {slot} should be untouched",
             )
+
+    # ---------------------------------------------------------------
+    def test_pack_unpack_round_trips_prefill_cost(self):
+        """Entry layout stores prefill_cost in the former 4-byte padding."""
+        entry = WorkloadShmEntry(
+            instance_id=1,
+            endpoint_id=2,
+            role=ROLE_PREFILL,
+            active_tokens=10.0,
+            active_kv_cache=20.0,
+            prefill_cost=42.5,
+        )
+        buf = bytearray(HEADER_SIZE + ENTRY_SIZE)
+        buf[HEADER_SIZE : HEADER_SIZE + ENTRY_SIZE] = pack_entry(entry)
+        unpacked = unpack_entry(memoryview(buf), 0)
+        self.assertEqual(unpacked.instance_id, 1)
+        self.assertEqual(unpacked.endpoint_id, 2)
+        self.assertEqual(unpacked.active_tokens, 10.0)
+        self.assertEqual(unpacked.active_kv_cache, 20.0)
+        self.assertAlmostEqual(unpacked.prefill_cost, 42.5, places=4)

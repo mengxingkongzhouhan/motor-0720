@@ -18,11 +18,14 @@ from motor.common.resources.instance import Instance, PDRole
 from motor.common.resources.endpoint import Endpoint, Workload, WorkloadAction
 
 
-def create_mock_workload(active_tokens: float = 0.0, active_kv_cache: float = 0.0) -> Mock:
+def create_mock_workload(
+    active_tokens: float = 0.0, active_kv_cache: float = 0.0, prefill_cost: float = 0.0
+) -> Mock:
     """Create a mock Workload with given values."""
     wl = Mock(spec=Workload)
     wl.active_tokens = active_tokens
     wl.active_kv_cache = active_kv_cache
+    wl.prefill_cost = prefill_cost
     wl.calculate_workload_score = Mock(return_value=active_tokens + active_kv_cache)
     return wl
 

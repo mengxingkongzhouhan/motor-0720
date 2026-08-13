@@ -43,9 +43,10 @@ HEARTBEAT_OFFSET = 32  # bytes 32-40: heartbeat_sequence (Q)
 HEARTBEAT_STALE_SEC = 5.0  # If heartbeat unchanged for this long, Infer treats shm as stale
 
 # Entry: 32 bytes
-# instance_id 4B, endpoint_id 4B, role 1B, padding 3B, active_tokens 8B, active_kv_cache 8B, padding 4B
+# instance_id 4B, endpoint_id 4B, role 1B, padding 3B, active_tokens 8B, active_kv_cache 8B,
+# prefill_cost 4B (float32; 0 for non KV-affinity policies)
 ENTRY_SIZE = 32
-ENTRY_FMT = "<i i B 3x d d 4x"
+ENTRY_FMT = "<i i B 3x d d f"
 
 # Max number of (instance, endpoint) workload entries in shared memory. Not user-configurable.
 DEFAULT_WORKLOAD_SHM_MAX_ENTRIES = 10240
@@ -60,6 +61,7 @@ class WorkloadShmEntry:
     role: int
     active_tokens: float
     active_kv_cache: float
+    prefill_cost: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -139,6 +141,7 @@ def pack_entry(entry: WorkloadShmEntry) -> bytes:
         entry.role,
         entry.active_tokens,
         entry.active_kv_cache,
+        entry.prefill_cost,
     )
 
 
@@ -154,6 +157,7 @@ def unpack_entry(buf: memoryview, slot: int) -> WorkloadShmEntry:
         role=t[2],
         active_tokens=t[3],
         active_kv_cache=t[4],
+        prefill_cost=t[5],
     )
 
 

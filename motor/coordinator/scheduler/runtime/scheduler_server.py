@@ -674,6 +674,10 @@ class _SchedulerRequestDispatcher:
                 data={_KEY_INSTANCE: None, _KEY_ENDPOINT: None},
             )
         instance, endpoint, selected_score = selected
+        # KV affinity stamps the committed endpoint's prefill_cost; other policies leave it 0.
+        workload.prefill_cost = self._lookup_candidate_prefill_cost(
+            affinity_candidates, instance.id, endpoint.id
+        )
         params = UpdateWorkloadParams(
             instance_id=instance.id,
             endpoint_id=endpoint.id,
@@ -737,9 +741,11 @@ class _SchedulerRequestDispatcher:
     @staticmethod
     def _extract_affinity_candidates(data: dict) -> list[tuple[int, int, float]]:
         """
-        Parse the worker's full kv_cache_affinity unified candidate set: every scored endpoint with
-        its affinity-discounted ``prefill_cost``. Empty when the field is absent (other policies, or
-        load_gated, which omit prefill_cost). Entries missing a numeric prefill_cost are skipped.
+        Parse worker-reported candidates that include an affinity-discounted ``prefill_cost``.
+
+        Unified mode forwards every scored endpoint; load_gated forwards its ranked set with the
+        same field so the committed endpoint's cost can be added to the workload ledger. Empty when
+        the field is absent (other policies). Entries missing a numeric prefill_cost are skipped.
         """
         raw = data.get(_KEY_CANDIDATES)
         result: list[tuple[int, int, float]] = []
@@ -758,6 +764,18 @@ class _SchedulerRequestDispatcher:
             except (TypeError, ValueError):
                 continue
         return result
+
+    @staticmethod
+    def _lookup_candidate_prefill_cost(
+        affinity_candidates: list[tuple[int, int, float]],
+        instance_id: int,
+        endpoint_id: int,
+    ) -> float:
+        """Return the committed endpoint's KV-affinity prefill_cost, or 0 when absent."""
+        for cand_instance_id, cand_endpoint_id, cost in affinity_candidates:
+            if cand_instance_id == instance_id and cand_endpoint_id == endpoint_id:
+                return max(0.0, cost)
+        return 0.0
 
     @staticmethod
     def _extract_allocate_candidate(data: dict) -> tuple[int, int] | None:
@@ -824,7 +842,10 @@ class _SchedulerRequestDispatcher:
             if selected is not None:
                 return selected
         if candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY:
-            if affinity_candidates:
+            # Unified sends prefill_load_scale so the scheduler can re-rank globally. load_gated
+            # may still attach per-candidate prefill_cost for workload accounting without
+            # relaxing its hard load bound into a unified score.
+            if affinity_candidates and prefill_load_scale is not None:
                 selected = self._select_affinity_global(affinity_candidates, role, prefill_load_scale, load_weight)
                 if selected is not None:
                     return selected

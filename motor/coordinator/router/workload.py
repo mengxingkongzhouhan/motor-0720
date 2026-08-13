@@ -20,7 +20,7 @@ from motor.common.resources.instance import PDRole
 from motor.common.logger import get_logger
 from motor.coordinator.domain.request_manager import RequestManager
 from motor.coordinator.domain import ScheduledResource
-from motor.coordinator.domain.workload_calculator import calculate_demand_workload
+from motor.coordinator.domain.workload_calculator import affinity_prefill_cost, calculate_demand_workload
 from motor.coordinator.models.request import RequestInfo
 
 logger = get_logger(__name__)
@@ -88,6 +88,9 @@ class WorkloadActionHandler:
 
         if action == WorkloadAction.ALLOCATION:
             allocate_workload = calculate_demand_workload(role, req_info)
+            allocate_workload.prefill_cost = affinity_prefill_cost(
+                req_info, resource.instance.id, resource.endpoint.id
+            )
             if attempt_seq is None:
                 added = await request_mgr.add_req_workload(req_id, role, allocate_workload)
             else:
@@ -110,8 +113,12 @@ class WorkloadActionHandler:
                     "Request %s attempt %s not allocated for role %s, KV release ignored", req_id, attempt_seq, role
                 )
                 return (None, None)
-            workload_change = Workload(active_kv_cache=-current_workload.active_kv_cache)
+            workload_change = Workload(
+                active_kv_cache=-current_workload.active_kv_cache,
+                prefill_cost=-current_workload.prefill_cost,
+            )
             current_workload.active_kv_cache = 0
+            current_workload.prefill_cost = 0
             if attempt_seq is None:
                 await request_mgr.update_req_workload(req_id, role, current_workload)
             else:
@@ -140,6 +147,9 @@ class WorkloadActionHandler:
             else:
                 await request_mgr.update_req_attempt_workload(req_id, attempt_seq, role, current_workload)
             if current_workload.active_kv_cache <= 0:
+                if current_workload.prefill_cost:
+                    workload_change.prefill_cost = -current_workload.prefill_cost
+                    current_workload.prefill_cost = 0
                 if attempt_seq is None:
                     await request_mgr.del_req_workload(req_id, role)
                 else:

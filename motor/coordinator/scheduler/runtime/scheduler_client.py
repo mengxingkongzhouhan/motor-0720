@@ -55,7 +55,7 @@ from motor.coordinator.fault_tolerance.precision.streak_result import (
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.kv_cache_affinity import KvCacheAffinityPolicy
-from motor.coordinator.domain.workload_calculator import calculate_demand_workload
+from motor.coordinator.domain.workload_calculator import affinity_prefill_cost, calculate_demand_workload
 from motor.coordinator.domain.scheduling_pin import (
     resolve_pinned_instance,
     select_endpoint_for_instance,
@@ -134,6 +134,27 @@ def _endpoint_from_dict(data: dict) -> Endpoint | None:
         return None
 
 
+def _candidate_endpoint_payload(
+    instance_id: int,
+    endpoint_id: int,
+    affinity_debug: dict | None,
+) -> dict:
+    """Build one ALLOCATE_ONLY candidate; include prefill_cost when KV affinity cached it."""
+    item: dict = {"instance_id": instance_id, "endpoint_id": endpoint_id}
+    if not isinstance(affinity_debug, dict):
+        return item
+    rec = affinity_debug.get((instance_id, endpoint_id))
+    if rec is None:
+        return item
+    try:
+        cost = rec[2]
+    except (IndexError, TypeError, KeyError):
+        return item
+    if cost is not None:
+        item["prefill_cost"] = cost
+    return item
+
+
 class _SchedulerInstanceCache:
     """
     Instance cache with lock-free reads, incremental role updates, and workload patch from shm.
@@ -170,6 +191,7 @@ class _SchedulerInstanceCache:
         role: PDRole,
         active_tokens: float,
         active_kv_cache: float,
+        prefill_cost: float = 0.0,
     ) -> None:
         """Patch single endpoint workload from shared memory. Skip if not in cache."""
         role_map = self._instance_map.get(role) or {}
@@ -183,11 +205,13 @@ class _SchedulerInstanceCache:
         cached_endpoint.workload = Workload(
             active_tokens=active_tokens,
             active_kv_cache=active_kv_cache,
+            prefill_cost=prefill_cost,
         )
         if cached_instance.gathered_workload is None:
             cached_instance.gathered_workload = Workload()
         cached_instance.gathered_workload.active_tokens += active_tokens - old_workload.active_tokens
         cached_instance.gathered_workload.active_kv_cache += active_kv_cache - old_workload.active_kv_cache
+        cached_instance.gathered_workload.prefill_cost += prefill_cost - getattr(old_workload, "prefill_cost", 0.0)
 
     def _apply_role_under_lock(self, role: PDRole, instances: list[Instance]) -> None:
         """Update cache and maps for one role. Must be called with _lock held."""
@@ -864,7 +888,13 @@ class AsyncSchedulerClient:
                 )
                 return None
             candidate_policy = self._scheduler_type or CANDIDATE_POLICY_ROUND_ROBIN
-            candidate_endpoints = [{"instance_id": instance.id, "endpoint_id": endpoint.id}]
+            candidate_endpoints = [
+                _candidate_endpoint_payload(
+                    instance.id,
+                    endpoint.id,
+                    getattr(req_info, "kv_affinity_debug", None),
+                )
+            ]
         else:
             # Unified affinity forwards EVERY endpoint (with prefill_cost) for the scheduler's global
             # re-rank, so the worker only needs its own top-1 locally. Only load_gated still proposes
@@ -891,8 +921,12 @@ class AsyncSchedulerClient:
             # global selection, no fixed top-k. Other policies/modes forward the worker's ranked
             # alternates (best-first) for the scheduler's existing re-pick.
             affinity_debug = getattr(req_info, "kv_affinity_debug", None)
+            # Unified forwards every endpoint for a global re-rank. load_gated still proposes a
+            # fixed ranked set (hard load bound) but includes per-endpoint prefill_cost so the
+            # scheduler can credit the committed endpoint's affinity cost on the workload ledger.
             global_affinity = (
                 candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY
+                and self._kv_affinity_mode == KV_AFFINITY_MODE_UNIFIED
                 and isinstance(affinity_debug, dict)
                 and any(rec[2] is not None for rec in affinity_debug.values())
             )
@@ -908,7 +942,7 @@ class AsyncSchedulerClient:
                 ]
             else:
                 candidate_endpoints = [
-                    {"instance_id": cand_instance.id, "endpoint_id": cand_endpoint.id}
+                    _candidate_endpoint_payload(cand_instance.id, cand_endpoint.id, affinity_debug)
                     for cand_instance, cand_endpoint, _score in candidates
                 ]
 
@@ -1006,6 +1040,9 @@ class AsyncSchedulerClient:
                     instance.id,
                     endpoint.id,
                 )
+                # Stamp the committed endpoint's affinity cost so RequestManager can release it.
+                # Other policies leave kv_affinity_debug unset, so this stays 0.
+                workload.prefill_cost = affinity_prefill_cost(req_info, out_instance.id, out_endpoint.id)
                 return (out_instance, out_endpoint, workload)
         return None
 

@@ -221,8 +221,10 @@ class TestInstanceManager:
 
         assert self.prefill_instance.gathered_workload.active_tokens == 10
         assert self.prefill_instance.gathered_workload.active_kv_cache == 20
+        assert self.prefill_instance.gathered_workload.prefill_cost == 0
         assert self.endpoint.workload.active_tokens == 10
         assert self.endpoint.workload.active_kv_cache == 20
+        assert self.endpoint.workload.prefill_cost == 0
 
     @pytest.mark.asyncio
     async def test_update_instance_workload_floors_negative_and_warns(self, caplog):
@@ -239,13 +241,15 @@ class TestInstanceManager:
         caplog.clear()
         # Over-release: subtract more than was allocated -> would go negative without the floor.
         await self.instance_manager.update_instance_workload(
-            1, self.endpoint.id, Workload(active_tokens=-30, active_kv_cache=-50)
+            1, self.endpoint.id, Workload(active_tokens=-30, active_kv_cache=-50, prefill_cost=-9)
         )
 
         assert self.endpoint.workload.active_tokens == 0
         assert self.endpoint.workload.active_kv_cache == 0
+        assert self.endpoint.workload.prefill_cost == 0
         assert self.prefill_instance.gathered_workload.active_tokens == 0
         assert self.prefill_instance.gathered_workload.active_kv_cache == 0
+        assert self.prefill_instance.gathered_workload.prefill_cost == 0
         assert "floor" in caplog.text.lower()
         assert "endpoint_id=1" in caplog.text
 

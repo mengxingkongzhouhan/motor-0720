@@ -24,6 +24,10 @@ class Workload(BaseModel):
 
     active_kv_cache: float = Field(default=0, description="Active KV cache size")
     active_tokens: float = Field(default=0, description="Number of active requests")
+    prefill_cost: float = Field(
+        default=0,
+        description="Outstanding KV-affinity prefill cost on this endpoint; 0 for other policies",
+    )
 
     def __iadd__(self, other):
         if not isinstance(other, Workload):
@@ -31,6 +35,7 @@ class Workload(BaseModel):
 
         self.active_kv_cache += other.active_kv_cache
         self.active_tokens += other.active_tokens
+        self.prefill_cost += other.prefill_cost
 
         return self
 

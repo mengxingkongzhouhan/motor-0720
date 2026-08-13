@@ -1574,7 +1574,7 @@ class AsyncSchedulerClient:
                 )
                 if ranked:
                     return ranked, CANDIDATE_POLICY_SMETRIC
-                logger.warning("smetric unavailable (no conductor match), falling back to load_balance")
+                logger.warning("smetric did not select an endpoint, falling back to load_balance")
             candidates = self._select_endpoint_candidates_by_load_balance(instances, role, top_k)
             if candidates:
                 return candidates, CANDIDATE_POLICY_LOAD_BALANCE

@@ -33,6 +33,13 @@ from motor.coordinator.domain.scheduling_pin import select_endpoint_for_instance
 from tests.coordinator.scheduler.conftest import MockInstanceProvider
 
 
+@pytest.fixture(autouse=True)
+def _reset_smetric_average():
+    SMetricPolicy.reset_prefill_cost_average()
+    yield
+    SMetricPolicy.reset_prefill_cost_average()
+
+
 def _endpoint(ep_id: int) -> Mock:
     """Endpoint stub with only ``id`` so load/workload access would fail if reused from KVA."""
     ep = Mock(spec=["id"])
@@ -79,16 +86,40 @@ class TestPrefillCostFormula:
         assert _prefill_cost(isl=0, matched_tokens=5) == 0
 
 
+class TestSMetricHybridGates:
+    def test_first_request_ranks_when_ratio_above_half(self):
+        assert SMetricPolicy._use_smetric_rank(req_cost=60, isl=100) is True
+
+    def test_first_request_uses_lb_when_ratio_at_most_half(self):
+        assert SMetricPolicy._use_smetric_rank(req_cost=50, isl=100) is False
+        assert SMetricPolicy._use_smetric_rank(req_cost=10, isl=100) is False
+
+    def test_zero_isl_uses_lb(self):
+        assert SMetricPolicy._use_smetric_rank(req_cost=0, isl=0) is False
+
+    def test_cost_above_average_uses_lb_even_if_ratio_high(self):
+        SMetricPolicy._record_prefill_cost(10)
+        SMetricPolicy._record_prefill_cost(10)
+        assert SMetricPolicy.prefill_cost_average()[0] == 10
+        assert SMetricPolicy._use_smetric_rank(req_cost=60, isl=100) is False
+
+    def test_cost_at_average_still_checks_ratio(self):
+        SMetricPolicy._record_prefill_cost(60)
+        assert SMetricPolicy._use_smetric_rank(req_cost=60, isl=100) is True
+        assert SMetricPolicy._use_smetric_rank(req_cost=40, isl=100) is False
+
+
 class TestSMetricPolicyRanking:
     @patch("motor.coordinator.scheduler.policy.smetric.ConductorApiClient.query_conductor")
     def test_lowest_prefill_cost_wins(self, mock_query):
         inst_a = _instance(1, (10, 11))
         inst_b = _instance(2, (20, 21))
         req_info = _req_info(100)
+        # Min cost 65 / isl 100 > 0.5 so SMetric ranking applies (empty average).
         mock_query.return_value = _conductor_tenant(
             inst_a,
             inst_b,
-            matched={(1, 10): 10, (1, 11): 90, (2, 20): 50, (2, 21): 0},
+            matched={(1, 10): 10, (1, 11): 35, (2, 20): 20, (2, 21): 0},
         )
 
         ranked = SMetricPolicy.select_endpoint_candidates_from_list(
@@ -97,8 +128,8 @@ class TestSMetricPolicyRanking:
 
         assert ranked is not None
         costs = [(inst.id, ep.id, int(cost)) for inst, ep, cost in ranked]
-        assert costs[0] == (1, 11, 10)  # isl 100 - matched 90
-        assert costs[1] == (2, 20, 50)
+        assert costs[0] == (1, 11, 65)  # isl 100 - matched 35
+        assert costs[1] == (2, 20, 80)
         assert costs[2] == (1, 10, 90)
         assert costs[3] == (2, 21, 100)
 
@@ -110,7 +141,7 @@ class TestSMetricPolicyRanking:
         mock_query.return_value = _conductor_tenant(
             light,
             cheap,
-            matched={(1, 10): 0, (2, 20): 70},
+            matched={(1, 10): 0, (2, 20): 20},
         )
 
         selected = SMetricPolicy.select_endpoint_from_list([light, cheap], req_info)
@@ -119,7 +150,7 @@ class TestSMetricPolicyRanking:
         instance, endpoint = selected
         assert instance.id == 2
         assert endpoint.id == 20
-        assert req_info.smetric_debug[(2, 20)] == 10
+        assert req_info.smetric_debug[(2, 20)] == 60
         assert req_info.smetric_debug[(1, 10)] == 80
 
     @patch("motor.coordinator.scheduler.policy.smetric.ConductorApiClient.query_conductor")
@@ -179,6 +210,71 @@ class TestSMetricPolicyRanking:
                 instances, role=PDRole.ROLE_D, req_info=req_info
             )
         mock_smetric.assert_not_called()
+        mock_lb.assert_called_once()
+        assert selected[0].id == 1
+
+    @patch("motor.coordinator.scheduler.policy.smetric.ConductorApiClient.query_conductor")
+    def test_low_cost_ratio_returns_none_for_load_balance(self, mock_query):
+        inst = _instance(1, (10,))
+        req_info = _req_info(100)
+        mock_query.return_value = _conductor_tenant(inst, matched={(1, 10): 80})  # cost=20, 20/100<=0.5
+
+        ranked = SMetricPolicy.select_endpoint_candidates_from_list([inst], req_info)
+
+        assert ranked is None
+        assert req_info.smetric_debug is None
+        avg, count = SMetricPolicy.prefill_cost_average()
+        assert count == 1
+        assert avg == 20
+
+    @patch("motor.coordinator.scheduler.policy.smetric.ConductorApiClient.query_conductor")
+    def test_cost_above_average_returns_none_for_load_balance(self, mock_query):
+        SMetricPolicy._record_prefill_cost(10)
+        inst_a = _instance(1, (10,))
+        inst_b = _instance(2, (20,))
+        req_info = _req_info(100)
+        mock_query.return_value = _conductor_tenant(
+            inst_a,
+            inst_b,
+            matched={(1, 10): 10, (2, 20): 40},  # min cost=60 > avg 10, ratio 0.6
+        )
+
+        ranked = SMetricPolicy.select_endpoint_candidates_from_list([inst_a, inst_b], req_info)
+
+        assert ranked is None
+        avg, count = SMetricPolicy.prefill_cost_average()
+        assert count == 2
+        assert avg == 35  # (10 + 60) / 2
+
+    @patch("motor.coordinator.scheduler.policy.smetric.ConductorApiClient.query_conductor")
+    def test_below_average_and_high_ratio_still_ranks(self, mock_query):
+        SMetricPolicy._record_prefill_cost(90)
+        inst = _instance(1, (10, 11))
+        req_info = _req_info(100)
+        mock_query.return_value = _conductor_tenant(
+            inst, matched={(1, 10): 10, (1, 11): 40}  # min cost=60 <= 90, 60/100>0.5
+        )
+
+        ranked = SMetricPolicy.select_endpoint_candidates_from_list([inst], req_info, top_k=2)
+
+        assert ranked is not None
+        assert ranked[0][1].id == 11
+        assert ranked[0][2] == 60.0
+
+    def test_in_process_low_ratio_falls_back_to_load_balance(self):
+        policy = SMetricPolicy(MockInstanceProvider())
+        instances = [_instance(1, (10,))]
+        req_info = _req_info(100)
+        with (
+            patch.object(SMetricPolicy, "select_endpoint_from_list", return_value=None),
+            patch(
+                "motor.coordinator.scheduler.policy.load_balance.LoadBalancePolicy.select_endpoint_from_list",
+                return_value=(instances[0], instances[0].get_all_endpoints()[0]),
+            ) as mock_lb,
+        ):
+            selected = policy.select_instance_and_endpoint_from_list(
+                instances, role=PDRole.ROLE_P, req_info=req_info
+            )
         mock_lb.assert_called_once()
         assert selected[0].id == 1
 
@@ -263,6 +359,34 @@ class TestSMetricClientDispatch:
         assert candidate_policy == "load_balance"
         mock_smetric.assert_not_called()
         mock_lb.assert_called_once_with([instance], PDRole.ROLE_D, 1)
+
+    def test_smetric_none_falls_back_to_load_balance(self):
+        client = _build_smetric_client()
+        instance = _instance(1, (10,))
+        endpoint = instance.get_all_endpoints()[0]
+        req_info = _req_info()
+        lb_candidates = [(instance, endpoint, 0.42)]
+
+        with (
+            patch.object(
+                SMetricPolicy,
+                "select_endpoint_candidates_from_list",
+                return_value=None,
+            ) as mock_smetric,
+            patch.object(
+                client,
+                "_select_endpoint_candidates_by_load_balance",
+                return_value=lb_candidates,
+            ) as mock_lb,
+        ):
+            candidates, candidate_policy = client._select_endpoint_candidates_from_list_with_policy(
+                [instance], PDRole.ROLE_P, req_info, top_k=1
+            )
+
+        assert candidates == lb_candidates
+        assert candidate_policy == "load_balance"
+        mock_smetric.assert_called_once()
+        mock_lb.assert_called_once_with([instance], PDRole.ROLE_P, 1)
 
     def test_candidate_payload_reads_smetric_debug_not_affinity_tuple(self):
         from motor.coordinator.scheduler.runtime.scheduler_client import _candidate_endpoint_payload

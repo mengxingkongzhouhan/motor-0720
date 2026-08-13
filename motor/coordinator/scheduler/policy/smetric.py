@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import threading
+
 from motor.common.logger import get_logger
 from motor.common.resources.endpoint import Endpoint
 from motor.common.resources.instance import Instance, PDRole
@@ -30,6 +32,8 @@ logger = get_logger(__name__)
 # SMetric discounts a cached prefix 1:1 against prompt length. Not configurable; not shared with
 # kv_cache_affinity's overlap_credit knob.
 _SMETRIC_OVERLAP_CREDIT = 1
+# Remaining-prefill / prompt-length gate. Above this, min-cost ranking is worth it; otherwise LB.
+_SMETRIC_COST_ISL_RATIO = 0.5
 
 
 def _prompt_token_ids(req_info: RequestInfo) -> list[int]:
@@ -67,16 +71,74 @@ def _prefill_cost(isl: int, matched_tokens: int) -> int:
 
 class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
     """
-    Rank every reported endpoint by SMetric prefill_cost; the lowest cost wins.
+    Hybrid SMetric / load-balance policy.
 
-    ``prefill_cost = max(0, isl - matched_tokens)`` (overlap_credit is always 1). Load is not part
-    of the score. Selection, conductor lookup, and the ``smetric_debug`` cache are owned by this
-    class and do not call KvCacheAffinityPolicy.
+    Each request's ``prefill_cost`` is the minimum remaining prefill among reported endpoints
+    (``max(0, isl - matched_tokens)``, overlap_credit always 1). A process-wide running average of
+    those per-request costs is kept. Then:
+
+    - if this request's cost is above the average → load-balance
+    - else if ``cost / isl > 0.5`` → pick the lowest-cost endpoint (original SMetric)
+    - else → load-balance
+
+    Conductor lookup and ``smetric_debug`` are owned here; KvCacheAffinityPolicy is not called.
     """
+
+    _prefill_cost_avg: float = 0.0
+    _prefill_cost_count: int = 0
+    _prefill_cost_lock = threading.Lock()
 
     def __init__(self, instance_provider: InstanceProvider):
         super().__init__(instance_provider=instance_provider)
         logger.info("SMetricPolicy started.")
+
+    @classmethod
+    def reset_prefill_cost_average(cls) -> None:
+        """Drop the running average. Tests use this to isolate cases."""
+        with cls._prefill_cost_lock:
+            cls._prefill_cost_avg = 0.0
+            cls._prefill_cost_count = 0
+
+    @classmethod
+    def prefill_cost_average(cls) -> tuple[float, int]:
+        """Return ``(average, sample_count)``. Average is 0.0 when no samples."""
+        with cls._prefill_cost_lock:
+            return cls._prefill_cost_avg, cls._prefill_cost_count
+
+    @classmethod
+    def _record_prefill_cost(cls, req_cost: int) -> None:
+        with cls._prefill_cost_lock:
+            cls._prefill_cost_count += 1
+            cls._prefill_cost_avg += (req_cost - cls._prefill_cost_avg) / cls._prefill_cost_count
+
+    @classmethod
+    def _use_smetric_rank(cls, req_cost: int, isl: int) -> bool:
+        """True when this request should pick the lowest-cost endpoint instead of load-balance."""
+        with cls._prefill_cost_lock:
+            count = cls._prefill_cost_count
+            avg = cls._prefill_cost_avg
+        if count > 0 and req_cost > avg:
+            logger.info(
+                "smetric: prefill_cost=%s > avg=%.3f (n=%d), using load_balance",
+                req_cost,
+                avg,
+                count,
+            )
+            return False
+        if isl <= 0:
+            logger.info("smetric: isl=%s, using load_balance", isl)
+            return False
+        ratio = req_cost / isl
+        if ratio > _SMETRIC_COST_ISL_RATIO:
+            return True
+        logger.info(
+            "smetric: prefill_cost/isl=%.3f <= %s (cost=%s isl=%s), using load_balance",
+            ratio,
+            _SMETRIC_COST_ISL_RATIO,
+            req_cost,
+            isl,
+        )
+        return False
 
     @staticmethod
     def select_endpoint_candidates_from_list(
@@ -87,8 +149,8 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         """
         Return up to ``top_k`` ``(instance, endpoint, prefill_cost)`` tuples, lowest cost first.
 
-        ``None`` means the caller should fall back (no conductor data). An empty-but-not-None list
-        is not used; no endpoints after a successful tenant match logs and returns None.
+        ``None`` means the caller should fall back to load-balance: no conductor data, or the
+        average / ``cost/isl`` gates chose load-balance for this request.
         """
         encoded_ids = _prompt_token_ids(req_info)
         isl = len(encoded_ids)
@@ -127,6 +189,11 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
             return None
 
         scored.sort(key=lambda item: (item[0], item[1], item[2]))
+        req_cost = scored[0][0]
+        use_smetric = SMetricPolicy._use_smetric_rank(req_cost, isl)
+        SMetricPolicy._record_prefill_cost(req_cost)
+        if not use_smetric:
+            return None
         SMetricPolicy._stash_debug(req_info, scored)
         ranked = scored[: max(1, top_k)]
         top_cost, _iid, _eid, top_inst, top_ep = ranked[0]

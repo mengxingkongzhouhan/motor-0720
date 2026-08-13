@@ -43,10 +43,9 @@ HEARTBEAT_OFFSET = 32  # bytes 32-40: heartbeat_sequence (Q)
 HEARTBEAT_STALE_SEC = 5.0  # If heartbeat unchanged for this long, Infer treats shm as stale
 
 # Entry: 32 bytes
-# instance_id 4B, endpoint_id 4B, role 1B, padding 3B, active_tokens 8B, active_kv_cache 8B,
-# num_requests 4B (uint32; uses the former padding slot)
+# instance_id 4B, endpoint_id 4B, role 1B, padding 3B, active_tokens 8B, active_kv_cache 8B, padding 4B
 ENTRY_SIZE = 32
-ENTRY_FMT = "<i i B 3x d d I"
+ENTRY_FMT = "<i i B 3x d d 4x"
 
 # Max number of (instance, endpoint) workload entries in shared memory. Not user-configurable.
 DEFAULT_WORKLOAD_SHM_MAX_ENTRIES = 10240
@@ -61,7 +60,6 @@ class WorkloadShmEntry:
     role: int
     active_tokens: float
     active_kv_cache: float
-    num_requests: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -132,13 +130,6 @@ def unpack_header(buf: memoryview) -> WorkloadShmHeader:
     )
 
 
-def _pack_num_requests(value: float) -> int:
-    """Clamp request count into the uint32 SHM slot."""
-    if value <= 0:
-        return 0
-    return min(int(value), 0xFFFFFFFF)
-
-
 def pack_entry(entry: WorkloadShmEntry) -> bytes:
     """Pack single entry into 32 bytes."""
     return struct.pack(
@@ -148,7 +139,6 @@ def pack_entry(entry: WorkloadShmEntry) -> bytes:
         entry.role,
         entry.active_tokens,
         entry.active_kv_cache,
-        _pack_num_requests(entry.num_requests),
     )
 
 
@@ -164,7 +154,6 @@ def unpack_entry(buf: memoryview, slot: int) -> WorkloadShmEntry:
         role=t[2],
         active_tokens=t[3],
         active_kv_cache=t[4],
-        num_requests=float(t[5]),
     )
 
 

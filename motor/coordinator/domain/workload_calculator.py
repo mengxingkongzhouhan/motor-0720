@@ -38,16 +38,16 @@ def calculate_demand_workload(role: PDRole, req_info: RequestInfo) -> Workload:
 
     if role == PDRole.ROLE_E:
         score = _calculate_encode_scores(req_info)
-        return Workload(active_tokens=score, num_requests=1)
+        return Workload(active_tokens=score)
     if role == PDRole.ROLE_P:
         score = _prefill_load_score(req_info)
-        return Workload(active_kv_cache=score, active_tokens=score, num_requests=1)
+        return Workload(active_kv_cache=score, active_tokens=score)
     if role == PDRole.ROLE_D:
         score = _calculate_decode_scores(req_info.req_len)
-        return Workload(active_tokens=score, num_requests=1)
+        return Workload(active_tokens=score)
     if role == PDRole.ROLE_U:
         score = _calculate_both_scores(req_info.req_len)
-        return Workload(active_kv_cache=score, active_tokens=score, num_requests=1)
+        return Workload(active_kv_cache=score, active_tokens=score)
     logger.warning("Unknown role %s for workload calculation", role)
     return Workload()
 

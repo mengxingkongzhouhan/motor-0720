@@ -235,16 +235,13 @@ class TestSchedulerInstanceCache:
             role=PDRole.ROLE_P,
             active_tokens=5.0,
             active_kv_cache=3.0,
-            num_requests=2.0,
         )
 
         workload = _endpoint_workload(ep)
         assert workload.active_tokens == 5.0
         assert workload.active_kv_cache == 3.0
-        assert workload.num_requests == 2.0
         assert inst.gathered_workload.active_tokens == 5.0
         assert inst.gathered_workload.active_kv_cache == 3.0
-        assert inst.gathered_workload.num_requests == 2.0
 
     def test_patch_workload_from_shm_unknown_instance_noop(self):
         """patch_workload_from_shm on unknown instance is a no-op (no raise)."""

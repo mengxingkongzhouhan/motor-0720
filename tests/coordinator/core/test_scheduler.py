@@ -373,21 +373,14 @@ async def test_workload_calculation_accuracy(scheduler_setup):
     )
     assert result
 
-    # calculate expected workload score (includes per-endpoint average request tokens)
-    expected_score = selected_endpoint.workload.calculate_workload_score(role=selected_instance.role)
-    assert selected_endpoint.workload.num_requests == 1
-    assert selected_endpoint.workload.avg_request_tokens == selected_endpoint.workload.active_tokens
+    # calculate expected workload score
+    expected_score = selected_endpoint.workload.active_tokens + selected_endpoint.workload.active_kv_cache * 0.3
 
     # get actual computed score
     actual_score = selected_endpoint.workload.calculate_workload_score(role=selected_instance.role)
 
     # verify that the computed score matches the expected score
     assert actual_score == expected_score
-    assert actual_score == (
-        selected_endpoint.workload.active_tokens
-        + selected_endpoint.workload.active_kv_cache * 0.3
-        + selected_endpoint.workload.avg_request_tokens * 0.3
-    )
 
     # release tokens
     release_tokens = Workload(active_tokens=-selected_endpoint.workload.active_tokens)

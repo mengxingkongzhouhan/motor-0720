@@ -62,27 +62,12 @@ def _pdrole_to_shm_role(role: PDRole) -> int:
     return ROLE_HYBRID
 
 
-def _num_requests_from_workload(workload) -> float:
-    """Read num_requests from a real Workload or a test double; default 0."""
-    value = getattr(workload, "num_requests", 0.0)
-    if isinstance(value, (int, float)):
-        return max(0.0, float(value))
-    return 0.0
-
-
-def _split_collected_entry(item: tuple) -> tuple[int, int, int, float, float, float]:
-    """Accept both legacy 5-tuples and current 6-tuples from snapshot collection."""
-    iid, eid, role, tokens, kv = item[0], item[1], item[2], item[3], item[4]
-    num_requests = item[5] if len(item) > 5 else 0.0
-    return iid, eid, role, tokens, kv, num_requests
-
-
 def _collect_entries_and_slot_map(instance_manager: InstanceManager, max_entries: int):
     """
     Collect (instance_id, endpoint_id, role, workload) from all pools and build slot_map.
     Returns (entries list, slot_map dict).
     """
-    entries: list[tuple[int, int, int, float, float, float]] = []
+    entries: list[tuple[int, int, int, float, float]] = []
     slot_map: dict[tuple[int, int], int] = {}
 
     for role in (PDRole.ROLE_E, PDRole.ROLE_P, PDRole.ROLE_D, PDRole.ROLE_U):
@@ -106,7 +91,6 @@ def _collect_entries_and_slot_map(instance_manager: InstanceManager, max_entries
                             shm_role,
                             ep.workload.active_tokens,
                             ep.workload.active_kv_cache,
-                            _num_requests_from_workload(ep.workload),
                         )
                     )
     return entries, slot_map
@@ -183,8 +167,7 @@ class WorkloadSharedMemoryWriter:
         entries, self._slot_map = _collect_entries_and_slot_map(self._im, self._max_entries)
         self._entry_count = len(entries)
         self._begin_write()
-        for slot, item in enumerate(entries):
-            iid, eid, role, tokens, kv, num_requests = _split_collected_entry(item)
+        for slot, (iid, eid, role, tokens, kv) in enumerate(entries):
             self._write_entry_at_slot(
                 slot,
                 WorkloadShmEntry(
@@ -193,7 +176,6 @@ class WorkloadSharedMemoryWriter:
                     role=role,
                     active_tokens=tokens,
                     active_kv_cache=kv,
-                    num_requests=num_requests,
                 ),
             )
         self._bump_changed_role_sequences(entries)
@@ -224,7 +206,6 @@ class WorkloadSharedMemoryWriter:
                 role=shm_role,
                 active_tokens=workload.active_tokens,
                 active_kv_cache=workload.active_kv_cache,
-                num_requests=_num_requests_from_workload(workload),
             ),
         )
         self._bump_role_sequence(role)
@@ -255,8 +236,7 @@ class WorkloadSharedMemoryWriter:
         roles to re-scan their (unchanged) entries.
         """
         new_members: dict[str, set[tuple[int, int]]] = {"prefill": set(), "decode": set(), "hybrid": set()}
-        for item in entries:
-            iid, eid, role = item[0], item[1], item[2]
+        for iid, eid, role, _tokens, _kv in entries:
             role_key = _SHM_ROLE_TO_SEQ_KEY.get(role)
             if role_key is not None:
                 new_members[role_key].add((iid, eid))

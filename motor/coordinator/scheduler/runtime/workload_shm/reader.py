@@ -227,5 +227,4 @@ class WorkloadSharedMemoryReader:
                 pdrole,
                 entry.active_tokens,
                 entry.active_kv_cache,
-                getattr(entry, "num_requests", 0.0),
             )

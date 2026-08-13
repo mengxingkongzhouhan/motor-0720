@@ -26,14 +26,6 @@ from motor.coordinator.models.request import RequestInfo
 logger = get_logger(__name__)
 
 
-def _attach_request_release(current_workload: Workload, workload_change: Workload) -> None:
-    """Drop the request count from the endpoint ledger when the request is fully released."""
-    if current_workload.active_tokens > 0 or current_workload.active_kv_cache > 0:
-        return
-    workload_change.num_requests = -current_workload.num_requests
-    current_workload.num_requests = 0
-
-
 class WorkloadActionHandler:
     """
     Compute workload_change by WorkloadAction and update RequestManager state.
@@ -120,7 +112,6 @@ class WorkloadActionHandler:
                 return (None, None)
             workload_change = Workload(active_kv_cache=-current_workload.active_kv_cache)
             current_workload.active_kv_cache = 0
-            _attach_request_release(current_workload, workload_change)
             if attempt_seq is None:
                 await request_mgr.update_req_workload(req_id, role, current_workload)
             else:
@@ -144,7 +135,6 @@ class WorkloadActionHandler:
                 return (None, None)
             workload_change = Workload(active_tokens=-current_workload.active_tokens)
             current_workload.active_tokens = 0
-            _attach_request_release(current_workload, workload_change)
             if attempt_seq is None:
                 await request_mgr.update_req_workload(req_id, role, current_workload)
             else:

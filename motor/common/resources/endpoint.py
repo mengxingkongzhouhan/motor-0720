@@ -16,11 +16,6 @@ from motor.common.logger import get_logger
 
 HEARTBEAT_TIMEOUT = 5  # 5 seconds
 
-# Weight of per-endpoint average request tokens in calculate_workload_score.
-# Distinguishes endpoints with the same total tokens but different request lengths:
-# a few long requests score higher than many short ones.
-AVG_REQUEST_TOKENS_WEIGHT = 0.3
-
 logger = get_logger(__name__)
 
 
@@ -28,8 +23,7 @@ class Workload(BaseModel):
     """Workload information for load balancing"""
 
     active_kv_cache: float = Field(default=0, description="Active KV cache size")
-    active_tokens: float = Field(default=0, description="Active token load")
-    num_requests: float = Field(default=0, description="Number of active requests on this endpoint")
+    active_tokens: float = Field(default=0, description="Number of active requests")
 
     def __iadd__(self, other):
         if not isinstance(other, Workload):
@@ -37,16 +31,8 @@ class Workload(BaseModel):
 
         self.active_kv_cache += other.active_kv_cache
         self.active_tokens += other.active_tokens
-        self.num_requests += other.num_requests
 
         return self
-
-    @property
-    def avg_request_tokens(self) -> float:
-        """Mean active-token load per request on this endpoint (0 when idle)."""
-        if self.num_requests <= 0:
-            return 0.0
-        return self.active_tokens / self.num_requests
 
     def calculate_workload_score(self, role: Enum | str | None) -> float:
         """
@@ -61,15 +47,14 @@ class Workload(BaseModel):
         if role is None:
             raise ValueError("role is required for calculate_workload_score")
         role_value = role.value if isinstance(role, Enum) else role
-        avg_tokens = self.avg_request_tokens * AVG_REQUEST_TOKENS_WEIGHT
         if role_value == "prefill":
-            return self.active_tokens + self.active_kv_cache * 0.3 + avg_tokens
+            return self.active_tokens + self.active_kv_cache * 0.3
         elif role_value == "decode":
-            return self.active_tokens + avg_tokens
+            return self.active_tokens
         elif role_value == "encode":
-            return self.active_tokens + avg_tokens
+            return self.active_tokens
         elif role_value in ("union", "both"):
-            return self.active_tokens + self.active_kv_cache * 0.15 + avg_tokens
+            return self.active_tokens + self.active_kv_cache * 0.15
         else:
             raise ValueError(f"Invalid role value: {role_value}")
 

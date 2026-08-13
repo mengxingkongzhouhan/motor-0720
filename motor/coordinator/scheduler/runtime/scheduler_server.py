@@ -110,6 +110,7 @@ _KEY_ROLE_WORKLOAD_SEQUENCE = "role_workload_sequence"
 # Allocation demand sent as two raw floats (keys must match the client literals in scheduler_client).
 _KEY_WORKLOAD_ACTIVE_TOKENS = "workload_active_tokens"
 _KEY_WORKLOAD_ACTIVE_KV_CACHE = "workload_active_kv_cache"
+_KEY_WORKLOAD_REQUEST_TOKEN_LENGTH = "workload_request_token_length"
 _KEY_INSTANCE_VERSION = "instance_version"
 _KEY_FAST_PATH = "fast_path"
 _KEY_CANDIDATE_POLICY = "candidate_policy"
@@ -577,6 +578,7 @@ class _SchedulerRequestDispatcher:
         workload_data = request.data.get("workload")
         workload_active_tokens = request.data.get(_KEY_WORKLOAD_ACTIVE_TOKENS)
         workload_active_kv_cache = request.data.get(_KEY_WORKLOAD_ACTIVE_KV_CACHE)
+        workload_request_token_length = request.data.get(_KEY_WORKLOAD_REQUEST_TOKEN_LENGTH)
         role_str = request.data.get("role")
         worker_workload_sequence = self._parse_optional_int(request.data.get(_KEY_WORKLOAD_SEQUENCE))
         worker_role_workload_sequence = self._parse_optional_int(request.data.get(_KEY_ROLE_WORKLOAD_SEQUENCE))
@@ -602,6 +604,7 @@ class _SchedulerRequestDispatcher:
                 workload = Workload(
                     active_tokens=float(workload_active_tokens or 0.0),
                     active_kv_cache=float(workload_active_kv_cache or 0.0),
+                    request_token_length=float(workload_request_token_length or 0.0),
                 )
             else:
                 # Legacy wire format: full Workload dict from an older client.

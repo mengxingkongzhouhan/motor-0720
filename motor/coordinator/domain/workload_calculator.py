@@ -23,6 +23,22 @@ from motor.common.utils.image_utils import get_mul_token
 logger = get_logger(__name__)
 
 
+def request_token_length(req_info: RequestInfo) -> float:
+    """Token length of one request for the cluster-wide cumulative average.
+
+    Prefers real prompt token ids when routing already tokenized the request;
+    otherwise falls back to the byte-length / 4 heuristic used by prefill load.
+    """
+    token_ids = getattr(req_info, "token_ids", None)
+    if isinstance(token_ids, list) and token_ids:
+        return float(len(token_ids))
+    prompt_token_ids = getattr(req_info, "prompt_token_ids", None)
+    if isinstance(prompt_token_ids, list) and prompt_token_ids:
+        return float(len(prompt_token_ids))
+    req_len = getattr(req_info, "req_len", 0) or 0
+    return float(req_len) / 4.0
+
+
 def calculate_demand_workload(role: PDRole, req_info: RequestInfo) -> Workload:
     """
     Compute demand workload for this allocation from role and request length.
@@ -36,18 +52,19 @@ def calculate_demand_workload(role: PDRole, req_info: RequestInfo) -> Workload:
         Workload: Load for ALLOCATION (used by select_and_allocate / add_req_workload)
     """
 
+    token_len = request_token_length(req_info)
     if role == PDRole.ROLE_E:
         score = _calculate_encode_scores(req_info)
-        return Workload(active_tokens=score)
+        return Workload(active_tokens=score, request_token_length=token_len)
     if role == PDRole.ROLE_P:
         score = _prefill_load_score(req_info)
-        return Workload(active_kv_cache=score, active_tokens=score)
+        return Workload(active_kv_cache=score, active_tokens=score, request_token_length=token_len)
     if role == PDRole.ROLE_D:
         score = _calculate_decode_scores(req_info.req_len)
-        return Workload(active_tokens=score)
+        return Workload(active_tokens=score, request_token_length=token_len)
     if role == PDRole.ROLE_U:
         score = _calculate_both_scores(req_info.req_len)
-        return Workload(active_kv_cache=score, active_tokens=score)
+        return Workload(active_kv_cache=score, active_tokens=score, request_token_length=token_len)
     logger.warning("Unknown role %s for workload calculation", role)
     return Workload()
 

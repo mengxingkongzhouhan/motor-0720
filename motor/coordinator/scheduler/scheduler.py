@@ -16,6 +16,7 @@ from motor.common.resources.dispatch import (
 )
 from motor.common.resources.instance import Instance, PDRole
 from motor.common.resources.endpoint import WorkloadAction, Workload
+from motor.common.resources.request_token_stats import record_request_token_length
 from motor.coordinator.domain import (
     InstanceReadiness,
     UpdateWorkloadParams,
@@ -28,7 +29,7 @@ from motor.coordinator.domain.scheduling_pin import (
     resolve_pinned_instance,
     select_endpoint_for_instance,
 )
-from motor.coordinator.domain.workload_calculator import calculate_demand_workload
+from motor.coordinator.domain.workload_calculator import calculate_demand_workload, request_token_length
 from motor.config.coordinator import CoordinatorConfig, SchedulerType
 from motor.coordinator.domain import InstanceProvider
 from motor.coordinator.models.request import RequestInfo
@@ -157,11 +158,10 @@ class Scheduler:
         req_info: RequestInfo,
     ):
         """Allocate workload for an already selected instance endpoint."""
-        workload = (
-            Workload()
-            if not hasattr(self._scheduling_policy, "update_workload")
-            else calculate_demand_workload(role, req_info)
-        )
+        if not hasattr(self._scheduling_policy, "update_workload"):
+            workload = Workload(request_token_length=request_token_length(req_info))
+        else:
+            workload = calculate_demand_workload(role, req_info)
         params = UpdateWorkloadParams(
             instance_id=instance.id,
             endpoint_id=endpoint.id,
@@ -190,11 +190,21 @@ class Scheduler:
                 params.workload_action,
                 params.workload_change,
             )
-            return (role is not None and workload is not None, role, workload)
+            success = role is not None and workload is not None
+            if success:
+                self._record_allocated_request_tokens(params)
+            return (success, role, workload)
         # Policy has no update_workload_sync (e.g. round-robin): the ledger is untouched, so we have
         # no absolute to return. Signal that with None -- returning workload_change would write a
         # delta into SHM as if it were the endpoint total.
+        self._record_allocated_request_tokens(params)
         return (True, params.role, None)
+
+    @staticmethod
+    def _record_allocated_request_tokens(params: UpdateWorkloadParams) -> None:
+        if params.workload_action != WorkloadAction.ALLOCATION:
+            return
+        record_request_token_length(getattr(params.workload_change, "request_token_length", 0.0) or 0.0)
 
     async def update_workload(self, params: UpdateWorkloadParams) -> bool:
         """

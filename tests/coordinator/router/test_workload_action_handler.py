@@ -34,6 +34,7 @@ class TestCalculateDemandWorkload:
         assert w.active_kv_cache > 0
         assert w.active_tokens > 0
         assert w.active_kv_cache == w.active_tokens
+        assert w.request_token_length == 1.0
 
     def test_prefill_role_uses_real_tokens_when_present(self):
         """ROLE_P: when req_info.token_ids is set, load is the real token count (not req_len)."""
@@ -43,6 +44,7 @@ class TestCalculateDemandWorkload:
         w = calculate_demand_workload(PDRole.ROLE_P, req_info)
         assert w.active_tokens == 5.0
         assert w.active_kv_cache == 5.0
+        assert w.request_token_length == 5.0
 
     def test_prefill_role_falls_back_when_token_ids_empty(self):
         """ROLE_P: empty/absent token_ids falls back to the legacy byte-length heuristic."""

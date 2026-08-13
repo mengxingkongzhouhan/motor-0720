@@ -55,7 +55,7 @@ from motor.coordinator.fault_tolerance.precision.streak_result import (
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.kv_cache_affinity import KvCacheAffinityPolicy
-from motor.coordinator.domain.workload_calculator import calculate_demand_workload
+from motor.coordinator.domain.workload_calculator import calculate_demand_workload, request_token_length
 from motor.coordinator.domain.scheduling_pin import (
     resolve_pinned_instance,
     select_endpoint_for_instance,
@@ -913,11 +913,11 @@ class AsyncSchedulerClient:
                 ]
 
         # Allocation workload: RR does not use load, so use zero; LB uses demand for accounting.
-        workload = (
-            Workload()
-            if (self._scheduler_type or "round_robin") == "round_robin"
-            else calculate_demand_workload(role, req_info)
-        )
+        # request_token_length is still sent so the scheduler can update the cluster-wide average.
+        if (self._scheduler_type or "round_robin") == "round_robin":
+            workload = Workload(request_token_length=request_token_length(req_info))
+        else:
+            workload = calculate_demand_workload(role, req_info)
 
         request_id = self._next_request_id()
         workload_sequence = self._workload_reader.last_sequence if self._workload_reader is not None else None
@@ -937,6 +937,7 @@ class AsyncSchedulerClient:
             # the scheduler. RR sends 0.0/0.0 (Workload() has no demand) rather than a dumped model.
             "workload_active_tokens": workload.active_tokens,
             "workload_active_kv_cache": workload.active_kv_cache,
+            "workload_request_token_length": workload.request_token_length,
             "candidate_policy": candidate_policy,
         }
         if global_affinity:

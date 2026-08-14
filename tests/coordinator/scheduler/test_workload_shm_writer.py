@@ -132,15 +132,15 @@ class TestCollectEntriesAndSlotMap(unittest.TestCase):
 
         self.assertEqual(
             entries[0],
-            (1, 10, ROLE_PREFILL, 100.0),
+            (1, 10, ROLE_PREFILL, 100.0, 0.0),
         )
         self.assertEqual(
             entries[1],
-            (2, 20, ROLE_DECODE, 300.0),
+            (2, 20, ROLE_DECODE, 300.0, 0.0),
         )
         self.assertEqual(
             entries[2],
-            (3, 30, ROLE_HYBRID, 500.0),
+            (3, 30, ROLE_HYBRID, 500.0, 0.0),
         )
 
     # ---------------------------------------------------------------

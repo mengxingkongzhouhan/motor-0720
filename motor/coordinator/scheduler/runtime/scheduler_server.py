@@ -38,6 +38,7 @@ from motor.coordinator.models.constants import DEFAULT_REQUEST_ID, REQUEST_ID_KE
 from motor.coordinator.domain.instance_manager import InstanceManager
 from motor.coordinator.scheduler.scheduler import Scheduler
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
+from motor.coordinator.scheduler.policy.smetric import SMetricPrefillCostTracker
 from motor.coordinator.scheduler.runtime.workload_shm import WorkloadSharedMemoryWriter
 from motor.coordinator.scheduler.runtime.workload_shm.layout import (
     DEFAULT_WORKLOAD_SHM_MAX_ENTRIES,
@@ -49,6 +50,7 @@ from motor.coordinator.scheduler.runtime.zmq_protocol import (
     SchedulerResponseType,
     CANDIDATE_POLICY_LOAD_BALANCE,
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+    CANDIDATE_POLICY_SMETRIC,
     KNOWN_CANDIDATE_POLICIES,
     INSTANCE_CHANGE_TOPIC,
     CIRCUIT_BREAKER_TOPIC,
@@ -212,6 +214,8 @@ class _SchedulerRequestDispatcher:
         )
         scheduler_type = getattr(config.scheduler_config, "scheduler_type", "")
         self._is_load_balance_scheduler = getattr(scheduler_type, "value", scheduler_type) == "load_balance"
+        # One running average for all Workers that ALLOCATE_ONLY into this Scheduler process.
+        self._smetric_prefill = SMetricPrefillCostTracker()
 
     async def dispatch(self, request: SchedulerRequest) -> SchedulerResponse:
         """Dispatch request to the appropriate handler (async handlers supported)."""
@@ -692,8 +696,7 @@ class _SchedulerRequestDispatcher:
         # Worker-proposed alternates (affinity-ranked, best-first); the authoritative path may
         # re-pick among them by fresh load. Falls back to the single top-1 for legacy callers.
         selected_candidates = self._extract_allocate_candidates(request.data) or [selected_candidate]
-        # kv_cache_affinity unified mode: every endpoint with its affinity-discounted prefill cost,
-        # for a global re-rank by the scheduler's fresh load. Empty for other policies/modes.
+        # Per-endpoint prefill_cost from the worker (kv_cache_affinity unified, or smetric).
         affinity_candidates = self._extract_affinity_candidates(request.data)
         matched_tokens_map = self._extract_candidate_matched_tokens(request.data)
         fast_path = self._can_use_worker_top1_fast_path(
@@ -702,30 +705,43 @@ class _SchedulerRequestDispatcher:
             worker_instance_version,
             role,
         )
-        selected = (
-            self._select_valid_candidate(selected_candidate, role)
-            if fast_path
-            else self._select_authoritative_allocate_candidate(
+        if candidate_policy == CANDIDATE_POLICY_SMETRIC:
+            # Gate always runs here (shared average). If it keeps SMetric and the worker's view is
+            # fresh, honor that min-cost top-1. Otherwise pick min request-cost or min ledger cost.
+            selected = self._select_smetric_hybrid(
                 selected_candidate,
-                selected_candidates,
-                role,
-                candidate_policy,
                 affinity_candidates,
-                worker_prefill_load_scale,
-                worker_load_weight,
-            )
-        )
-        if fast_path and selected is None:
-            selected = self._select_authoritative_allocate_candidate(
-                selected_candidate,
-                selected_candidates,
                 role,
-                candidate_policy,
-                affinity_candidates,
-                worker_prefill_load_scale,
-                worker_load_weight,
+                isl,
+                fast_path,
             )
-            fast_path = False
+            if selected is None or (selected[0].id, selected[1].id) != selected_candidate:
+                fast_path = False
+        else:
+            selected = (
+                self._select_valid_candidate(selected_candidate, role)
+                if fast_path
+                else self._select_authoritative_allocate_candidate(
+                    selected_candidate,
+                    selected_candidates,
+                    role,
+                    candidate_policy,
+                    affinity_candidates,
+                    worker_prefill_load_scale,
+                    worker_load_weight,
+                )
+            )
+            if fast_path and selected is None:
+                selected = self._select_authoritative_allocate_candidate(
+                    selected_candidate,
+                    selected_candidates,
+                    role,
+                    candidate_policy,
+                    affinity_candidates,
+                    worker_prefill_load_scale,
+                    worker_load_weight,
+                )
+                fast_path = False
         if selected is None:
             logger.warning(
                 "ALLOCATE_ONLY endpoint unavailable req_id=%s candidate=%s",
@@ -753,6 +769,10 @@ class _SchedulerRequestDispatcher:
             # Non-affinity path (and non-P/U roles, e.g. pinned decode allocation arriving with
             # the affinity policy attached): commit the worker-computed demand as-is.
             workload = worker_demand
+        # KV affinity / SMetric stamp the committed endpoint's prefill_cost; other policies leave 0.
+        workload.prefill_cost = self._lookup_candidate_prefill_cost(
+            affinity_candidates, instance.id, endpoint.id
+        )
         params = UpdateWorkloadParams(
             instance_id=instance.id,
             endpoint_id=endpoint.id,
@@ -764,6 +784,9 @@ class _SchedulerRequestDispatcher:
         success, updated_role, updated_workload = self._scheduler.update_workload_sync(params)
         if success:
             self._write_workload_entry(instance.id, endpoint.id, updated_role, updated_workload)
+            if candidate_policy == CANDIDATE_POLICY_SMETRIC:
+                # Average is of incurred remaining prefill, not the min among candidates.
+                self._smetric_prefill.record(workload.prefill_cost)
 
         if not success:
             return SchedulerResponse(
@@ -819,9 +842,11 @@ class _SchedulerRequestDispatcher:
     @staticmethod
     def _extract_affinity_candidates(data: dict) -> list[tuple[int, int, float]]:
         """
-        Parse the worker's full kv_cache_affinity unified candidate set: every scored endpoint with
-        its affinity-discounted ``prefill_cost``. Empty when the field is absent (other policies, or
-        load_gated, which omit prefill_cost). Entries missing a numeric prefill_cost are skipped.
+        Parse worker-reported candidates that include a numeric ``prefill_cost``.
+
+        kv_cache_affinity unified and smetric forward every scored endpoint; load_gated forwards
+        its ranked set so the committed endpoint's cost can be stamped on the workload ledger.
+        Empty when the field is absent. Entries missing a numeric prefill_cost are skipped.
         """
         raw = data.get(_KEY_CANDIDATES)
         result: list[tuple[int, int, float]] = []
@@ -836,7 +861,7 @@ class _SchedulerRequestDispatcher:
             if instance_id is None or endpoint_id is None or prefill_cost is None:
                 continue
             try:
-                result.append((int(instance_id), int(endpoint_id), float(prefill_cost)))
+                result.append((int(instance_id), int(endpoint_id), max(0.0, float(prefill_cost))))
             except (TypeError, ValueError):
                 continue
         return result
@@ -927,7 +952,10 @@ class _SchedulerRequestDispatcher:
             if selected is not None:
                 return selected
         if candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY:
-            if affinity_candidates:
+            # Unified sends prefill_load_scale so the scheduler can re-rank globally. load_gated
+            # may still attach per-candidate prefill_cost for workload accounting without
+            # relaxing its hard load bound into a unified score.
+            if affinity_candidates and prefill_load_scale is not None:
                 selected = self._select_affinity_global(affinity_candidates, role, prefill_load_scale, load_weight)
                 if selected is not None:
                     return selected
@@ -992,6 +1020,101 @@ class _SchedulerRequestDispatcher:
         if best is None:
             return None
         return (best[0], best[1], best[2])
+
+    @staticmethod
+    def _lookup_candidate_prefill_cost(
+        candidates: list[tuple[int, int, float]] | None,
+        instance_id: int,
+        endpoint_id: int,
+    ) -> float:
+        """Return the committed endpoint's prefill_cost, or 0 when absent."""
+        if not candidates:
+            return 0.0
+        for iid, eid, cost in candidates:
+            if iid == instance_id and eid == endpoint_id:
+                return max(0.0, float(cost))
+        return 0.0
+
+    def _select_smetric_hybrid(
+        self,
+        worker_candidate: tuple[int, int],
+        smetric_candidates: list[tuple[int, int, float]] | None,
+        role: PDRole,
+        isl: float | None,
+        fast_path: bool,
+    ) -> tuple[Instance, Endpoint, float] | None:
+        """Gate on the shared average, then worker min-cost, request min-cost, or min ledger cost."""
+        if not smetric_candidates:
+            return None
+        req_cost = min(cost for _iid, _eid, cost in smetric_candidates)
+        prompt_isl = isl if isl is not None else 0.0
+        if self._smetric_prefill.use_smetric_rank(req_cost, prompt_isl):
+            if fast_path:
+                picked = self._select_valid_candidate(worker_candidate, role)
+                if picked is not None:
+                    return picked
+            return self._select_smetric_min_cost(smetric_candidates, role)
+        return self._select_min_ledger_prefill_cost(role)
+
+    def _select_smetric_min_cost(
+        self,
+        smetric_candidates: list[tuple[int, int, float]] | None,
+        role: PDRole,
+    ) -> tuple[Instance, Endpoint, float] | None:
+        """Pick the available endpoint with the lowest SMetric prefill_cost. Load is ignored."""
+        if not smetric_candidates:
+            return None
+        best: tuple[Instance, Endpoint, float] | None = None
+        for instance_id, endpoint_id, prefill_cost in smetric_candidates:
+            if self._is_instance_circuit_open(instance_id):
+                continue
+            found = self._find_available_instance_endpoint(instance_id, endpoint_id)
+            if found is None:
+                continue
+            instance, endpoint = found
+            try:
+                instance_role = PDRole(instance.role)
+            except ValueError:
+                instance_role = PDRole.ROLE_U
+            if instance_role != role:
+                continue
+            if best is None or prefill_cost < best[2] or (
+                prefill_cost == best[2] and (instance.id, endpoint.id) < (best[0].id, best[1].id)
+            ):
+                best = (instance, endpoint, prefill_cost)
+        if best is None:
+            return None
+        return (best[0], best[1], best[2])
+
+    def _select_min_ledger_prefill_cost(
+        self,
+        role: PDRole,
+    ) -> tuple[Instance, Endpoint, float] | None:
+        """Pick the available endpoint whose current ``workload.prefill_cost`` is smallest.
+
+        This is the SMetric dump path: remaining prefill on the ledger, not token-based
+        load-balance and not this request's conductor cost. Ties break by (instance_id, endpoint_id).
+        """
+        best: tuple[Instance, Endpoint, float] | None = None
+        for instance in self._instance_manager.get_available_instances(role).values():
+            if self._is_instance_circuit_open(instance.id):
+                continue
+            for endpoint in instance.get_all_endpoints():
+                cost = self._endpoint_ledger_prefill_cost(endpoint)
+                if best is None or cost < best[2] or (
+                    cost == best[2] and (instance.id, endpoint.id) < (best[0].id, best[1].id)
+                ):
+                    best = (instance, endpoint, cost)
+        if best is None:
+            return None
+        return (best[0], best[1], best[2])
+
+    @staticmethod
+    def _endpoint_ledger_prefill_cost(endpoint: Endpoint) -> float:
+        try:
+            return max(0.0, float(getattr(endpoint.workload, "prefill_cost", 0) or 0))
+        except (TypeError, ValueError):
+            return 0.0
 
     def _select_lowest_load_among_candidates(
         self,

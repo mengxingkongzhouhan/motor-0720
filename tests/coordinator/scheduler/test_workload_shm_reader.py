@@ -221,6 +221,7 @@ class TestWorkloadSharedMemoryReader(unittest.TestCase):
             20,
             PDRole.ROLE_D,
             21.0,
+            0.0,
         )
         self.assertIsNone(self.reader.last_sequence_for_role(PDRole.ROLE_P))
         self.assertEqual(self.reader.last_sequence_for_role(PDRole.ROLE_D), 6)

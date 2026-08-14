@@ -40,6 +40,13 @@ class TestPolicyFactory(unittest.TestCase):
         policy = create(SchedulerType.LOAD_BALANCE, MockInstanceProvider())
         self.assertIsInstance(policy, LoadBalancePolicy)
 
+    def test_create_smetric(self):
+        """create returns an SMetricPolicy for SMETRIC type."""
+        from motor.coordinator.scheduler.policy.smetric import SMetricPolicy
+
+        policy = create(SchedulerType.SMETRIC, MockInstanceProvider())
+        self.assertIsInstance(policy, SMetricPolicy)
+
     def test_create_unknown_type_raises(self):
         """create raises ValueError for unregistered type."""
         with self.assertRaises(ValueError):

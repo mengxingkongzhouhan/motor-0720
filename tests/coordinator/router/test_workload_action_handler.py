@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock, MagicMock
 from motor.common.resources.endpoint import Workload, WorkloadAction
 from motor.common.resources.instance import PDRole, Instance, InsStatus, ParallelConfig
 from motor.coordinator.domain.workload_calculator import (
+    affinity_prefill_cost,
+    allocated_prefill_cost,
     calculate_committed_workload,
     calculate_demand_workload,
 )
@@ -142,8 +144,19 @@ class TestCalculateDemandWorkload:
         )
         assert w.active_tokens == 200.0
 
+    def test_allocated_prefill_cost_prefers_smetric_debug(self):
+        req_info = MagicMock()
+        req_info.smetric_debug = {(1, 10): 12.5}
+        req_info.kv_affinity_debug = {(1, 10): (8, 1.0, 99)}
+        assert allocated_prefill_cost(req_info, 1, 10) == 12.5
+        assert allocated_prefill_cost(req_info, 2, 20) == 0.0
 
-class TestWorkloadActionHandler:
+    def test_affinity_prefill_cost_reads_third_tuple_slot(self):
+        req_info = MagicMock()
+        req_info.kv_affinity_debug = {(2, 20): (8, 1.0, 42)}
+        req_info.smetric_debug = None
+        assert affinity_prefill_cost(req_info, 2, 20) == 42
+        assert allocated_prefill_cost(req_info, 2, 20) == 42
     """Tests for WorkloadActionHandler.compute_and_update."""
 
     @pytest.fixture
@@ -292,6 +305,38 @@ class TestWorkloadActionHandler:
 
         assert first == Workload(active_tokens=-100)
         assert second == Workload(active_tokens=-100)
+        mock_request_manager.del_req_workload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_release_tokens_includes_negative_prefill_cost(self, mock_request_manager):
+        """RELEASE_TOKENS returns -prefill_cost with the token delta so the ledger can unwind."""
+        instance = Instance(
+            job_name="test",
+            model_name="m",
+            id=1,
+            role=PDRole.ROLE_P,
+            status=InsStatus.ACTIVE,
+            parallel_config=ParallelConfig(dp_size=1),
+        )
+        endpoint = Endpoint(
+            id=1,
+            ip="127.0.0.1",
+            business_port="8080",
+            mgmt_port="8080",
+            status=EndpointStatus.NORMAL,
+        )
+        resource = ScheduledResource(instance=instance, endpoint=endpoint)
+        current = Workload(active_tokens=100, prefill_cost=12.5)
+        mock_request_manager.get_req_workload = AsyncMock(return_value=current)
+        handler = WorkloadActionHandler(mock_request_manager)
+        req_info = MagicMock()
+
+        workload_change, role = await handler.compute_and_update(
+            resource, "req-1", WorkloadAction.RELEASE_TOKENS, req_info=req_info
+        )
+
+        assert role == PDRole.ROLE_P
+        assert workload_change == Workload(active_tokens=-100, prefill_cost=-12.5)
         mock_request_manager.del_req_workload.assert_not_called()
 
     @pytest.mark.asyncio

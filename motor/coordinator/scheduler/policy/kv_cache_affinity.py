@@ -400,7 +400,7 @@ class KvCacheAffinityPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
     def _stash_affinity_debug(
         req_info: RequestInfo | None,
         raw: list[tuple[float, int, float, Instance, Endpoint]],
-        with_prefill: bool = False,
+        with_prefill: bool = True,
     ) -> None:
         """
         Cache per-endpoint ``(matched_tokens, load_cost, prefill_cost)`` on ``req_info``.
@@ -409,20 +409,21 @@ class KvCacheAffinityPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         * the worker's final allocation log, which reports the KV-affinity prefix hit and load of
           the endpoint the scheduler actually committed (may differ from the worker's top-1 after
           the scheduler's fresh-ledger re-pick);
-        * unified-mode :meth:`AsyncSchedulerClient.select_and_allocate`, which forwards every
-          endpoint's affinity-discounted ``prefill_cost`` to the scheduler so it can re-rank all of
-          them by its own fresh load (``prefill_load_scale * prefill_cost + load_weight * load``) --
-          a global selection with no fixed top-k.
+        * ALLOCATE_ONLY, which stamps the committed endpoint's ``prefill_cost`` on the ledger.
+          Unified mode additionally forwards every endpoint cost plus ``prefill_load_scale`` /
+          ``load_weight`` so the scheduler can re-rank globally. load_gated forwards only its
+          ranked set (with prefill_cost for accounting) and omits those scalars so the hard load
+          bound is kept.
 
-        ``prefill_cost`` is stored only when ``with_prefill`` is set; it is None otherwise (e.g.
-        load_gated, whose hard load bound must not be relaxed into a soft unified score on the
-        scheduler). Best-effort: never fail selection over a debug cache.
+        ``with_prefill`` is accepted for call-site compatibility; prefill_cost is always stored.
+        Best-effort: never fail selection over a debug cache.
         """
+        del with_prefill
         if req_info is None:
             return
         try:
             req_info.kv_affinity_debug = {
-                (instance.id, ep.id): (matched_tokens, load_cost, prefill_cost if with_prefill else None)
+                (instance.id, ep.id): (matched_tokens, load_cost, prefill_cost)
                 for (load_cost, matched_tokens, prefill_cost, instance, ep) in raw
             }
         except Exception as e:  # pragma: no cover - req_info may be immutable in some callers

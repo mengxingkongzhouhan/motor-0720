@@ -56,7 +56,7 @@ async def test_workload_shm_snapshot_includes_encode_role():
     entries, slot_map = _collect_entries_and_slot_map(instance_manager, max_entries=10)
 
     assert slot_map == {(1, 10): 0}
-    assert entries == [(1, 10, ROLE_ENCODE, 7)]
+    assert entries == [(1, 10, ROLE_ENCODE, 7, 0.0)]
 
 
 def test_workload_shm_round_trips_encode_role():

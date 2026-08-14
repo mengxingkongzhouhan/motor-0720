@@ -146,6 +146,7 @@ class TestSMetricPolicyRanking:
         with caplog.at_level(logging.INFO):
             SMetricPolicy.select_endpoint_candidates_from_list([inst_a, inst_b], req_info)
 
+        assert "smetric: req_id=req-match-log conductor_rsp=" in caplog.text
         assert "smetric: req_id=req-match-log isl=100 endpoint_matches=[" in caplog.text
         assert "1-10:10" in caplog.text
         assert "1-11:90" in caplog.text

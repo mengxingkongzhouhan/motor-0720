@@ -577,7 +577,7 @@ async def test_vllm_handoff_prefill_response_without_kv_transfer_params_yields_e
 
 
 @pytest.mark.asyncio
-async def test_vllm_handoff_prefill_to_decode_round_trip_preserves_bootstrap():
+async def test_vllm_handoff_prefill_to_decode_round_trip_preserves_bootstrap(caplog):
     """End-to-end: a realistic prefill response threaded into the decode leg must
     surface the KV bootstrap at the top level of ``kv_transfer_params`` (the shape
     the engine connector reads), not nested one level too deep.
@@ -604,8 +604,12 @@ async def test_vllm_handoff_prefill_to_decode_round_trip_preserves_bootstrap():
             },
         }
     )
-    normalized = await prefill_adapter.normalize_response(engine_response, _context(prefill_dispatch))
+    with caplog.at_level("INFO"):
+        normalized = await prefill_adapter.normalize_response(engine_response, _context(prefill_dispatch))
     prefill_result = json.loads(normalized.body.decode("utf-8"))
+
+    assert "vllm_cache_hit: req_id=req engine_req_id=req#a1" in caplog.text
+    assert "cached=16 prompt=2" in caplog.text
 
     # Usage (and its prompt_tokens_details) must survive separately from payload so
     # the coordinator can still report cached tokens after handoff.

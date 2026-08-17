@@ -21,7 +21,12 @@ from motor.config.coordinator import SchedulerType
 from motor.coordinator.api_client.conductor_api_client import TENANT_ID, conductor_instance_id
 from motor.coordinator.scheduler.policy.factory import create
 from motor.coordinator.scheduler.policy.kv_cache_affinity import KvCacheAffinityPolicy
-from motor.coordinator.scheduler.policy.smetric import SMetricPolicy, SMetricPrefillCostTracker, _prefill_cost
+from motor.coordinator.scheduler.policy.smetric import (
+    SMetricPolicy,
+    SMetricPrefillCostTracker,
+    _matched_hit_lengths,
+    _prefill_cost,
+)
 from motor.coordinator.scheduler.runtime.scheduler_client import (
     AsyncSchedulerClient,
     SchedulerClientConfig,
@@ -148,10 +153,49 @@ class TestSMetricPolicyRanking:
 
         assert "smetric: req_id=req-match-log conductor_rsp=" in caplog.text
         assert "smetric: req_id=req-match-log isl=100 endpoint_matches=[" in caplog.text
-        assert "1-10:10" in caplog.text
-        assert "1-11:90" in caplog.text
-        assert "2-20:50" in caplog.text
-        assert "2-21:0" in caplog.text
+        assert "1-10:matched=10/local=-/remote=-" in caplog.text
+        assert "1-11:matched=90/local=-/remote=-" in caplog.text
+        assert "2-20:matched=50/local=-/remote=-" in caplog.text
+        assert "2-21:matched=0/local=-/remote=-" in caplog.text
+
+    def test_matched_hit_lengths_splits_npu_and_offload(self):
+        matched, local_hit, remote_hit = _matched_hit_lengths(
+            {"npu_blocks": 2, "cpu_blocks": 1, "disk_blocks": 1, "matched_tokens": 512},
+            isl=400,
+            block_size=128,
+        )
+        assert matched == 400
+        assert local_hit == 256
+        assert remote_hit == 256
+
+    def test_matched_hit_lengths_scalar_has_no_split(self):
+        assert _matched_hit_lengths(90, isl=100, block_size=128) == (90, None, None)
+
+    @patch("motor.coordinator.scheduler.policy.smetric._conductor_block_size", return_value=128)
+    @patch("motor.coordinator.scheduler.policy.smetric.ConductorApiClient.query_conductor")
+    def test_logs_local_and_remote_hits_from_dp_blocks(self, mock_query, _mock_bs, caplog):
+        inst = _instance(1, (10,))
+        req_info = _req_info(400)
+        req_info.req_id = "req-tier-hits"
+        mock_query.return_value = _conductor_tenant(
+            inst,
+            matched={
+                (1, 10): {
+                    "npu_blocks": 2,
+                    "cpu_blocks": 1,
+                    "disk_blocks": 0,
+                    "matched_tokens": 384,
+                }
+            },
+        )
+
+        with caplog.at_level(logging.INFO):
+            ranked = SMetricPolicy.select_endpoint_candidates_from_list([inst], req_info)
+
+        assert ranked is not None
+        assert ranked[0][2] == 16  # isl 400 - matched 384
+        assert "smetric: req_id=req-tier-hits isl=400 endpoint_matches=[" in caplog.text
+        assert "1-10:matched=384/local=256/remote=128" in caplog.text
 
     @patch("motor.coordinator.scheduler.policy.smetric.ConductorApiClient.query_conductor")
     def test_ignores_load_when_cheaper_endpoint_is_busier(self, mock_query):

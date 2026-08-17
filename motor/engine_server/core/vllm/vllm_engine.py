@@ -20,6 +20,7 @@ from motor.common.logger import get_logger
 from motor.common.logger import attach_to_vllm_logger
 from motor.engine_server.core.config import IConfig
 from motor.engine_server.core.engine import Engine
+from motor.engine_server.core.vllm.cache_hit_logger import install_vllm_cache_hit_logger
 from motor.engine_server.core.vllm.vllm_openai_compat import cli_env_setup
 
 logger = get_logger(__name__)
@@ -100,6 +101,7 @@ class VLLMEngine(Engine):
             validation_msg += f"hybrid_dp_lb={use_hybrid_load_balancing}, dp_rank={dp_rank_value}"
             raise ValueError(validation_msg)
 
+        install_vllm_cache_hit_logger()
         self.async_llm = AsyncLLM.from_vllm_config(
             vllm_config=vllm_endpoint_config,
             usage_context=endpoint_usage_context,

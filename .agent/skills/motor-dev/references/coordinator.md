@@ -82,20 +82,20 @@ CoordinatorDaemon (parent process, async main loop)
 ``` text
 Offset  Size   Field
 0       4B     magic              = 0x574B4C44 ("WKLD")
-4       2B     schema_version     — fixed SCHEMA_VERSION=2 (layout compatibility)
+4       2B     schema_version     — SCHEMA_VERSION=3 (layout compatibility)
 6       2B     (padding)
 8       8B     sequence           — seqlock write counter, bumped on every write
 16      4B     entry_count        — number of valid entries
 20      4B     max_entries        — slot capacity (default 10240)
 24      8B     instance_version   — bumped on REFRESH_INSTANCES (instance set change)
-32      8B     heartbeat_sequence — Scheduler bumps ~1/s
+32      8B     heartbeat_sequence — Scheduler bumps ~1s
 40      8B     prefill_sequence   — per-role workload change counter
 48      8B     decode_sequence    — per-role workload change counter
 56      8B     hybrid_sequence    — per-role workload change counter
-64      N×32B  entries            — per-endpoint workload slots (max 10240)
+64      N×24B  entries            — per-endpoint workload slots (max 10240)
 ```
 
-Header is 64B, each entry 32B (`instance_id 4B, endpoint_id 4B, role 1B, padding 3B, active_tokens 8B, active_kv_cache 8B, padding 4B`), and entries start at offset 64. `sequence` follows seqlock semantics: odd = writer in progress, even = readers may accept the snapshot after a matching second header read. Readers additionally verify the three per-role sequences are unchanged across the read for consistency.
+Header is 64B, each entry 24B (`instance_id 4B, endpoint_id 4B, role 1B, padding 3B, active_tokens 8B, prefill_cost 4B float32`). `prefill_cost` is stamped by SMetric / KV affinity after allocate and released with tokens; RR/LB leave it 0. `sequence` follows seqlock semantics: odd = writer in progress, even = readers may accept the snapshot after a matching second header read. Readers additionally verify the three per-role sequences are unchanged across the read for consistency.
 
 **SHM name:** `mindie_workload_<scheduler_pid>` — includes PID for uniqueness and orphan detection.
 
@@ -125,6 +125,7 @@ Located in `scheduler/policy/`, each policy implements `BaseSchedulingPolicy`:
 | `RoundRobinPolicy` | Simple atomic counter, mod endpoint count | Uniform workload, no KV cache locality |
 | `LoadBalancePolicy` | Reads workload SHM, picks endpoint with minimum active tokens | Heterogeneous workloads, varying request lengths |
 | `KvCacheAffinityPolicy` | Queries KV Conductor (via `ConductorApiClient`) for prefix match; prefers endpoints with cached blocks | High prefix reuse, PD disaggregation |
+| `SMetricPolicy` | Queries Conductor; ranks P/U by remaining prefill `max(0, isl - matched)`. Decode falls back to load-balance. Central Scheduler hybrid-gates min-cost vs min ledger `prefill_cost`. | Compare / steer by remaining prefill only (`scheduler_type=smetric`) |
 
 **Conductor `/query` wire encoding** (`ConductorApiClient.query_conductor`):
 `kv_conductor_config.query_encoding` (default `"msgpack"`) selects the wire
@@ -136,7 +137,7 @@ kv-conductor binaries.<br>
 
 **Factory registration** (`factory.py`): `SchedulingPolicyFactory` maps policy name → class. New policies register here.
 
-The policy is selected by `SchedulerType` (`config/coordinator.py`): `LOAD_BALANCE` / `ROUND_ROBIN` / `KV_CACHE_AFFINITY` (default). For `scheduler_type=kv_cache_affinity`, a sub-mode is chosen by `kv_affinity.mode`:
+The policy is selected by `SchedulerType` (`config/coordinator.py`): `LOAD_BALANCE` (default) / `ROUND_ROBIN` / `KV_CACHE_AFFINITY` / `SMETRIC`. For `scheduler_type=kv_cache_affinity`, a sub-mode is chosen by `kv_affinity.mode`:
 
 - `unified` (default) — single score fusing affinity and live load; pick the minimum
 - `load_gated` — keep the N least-loaded endpoints, then pick the longest cached prefix
@@ -184,6 +185,7 @@ Hot-reload is driven by a `ConfigWatcher` in the **Mgmt process** (not the daemo
 | `motor/coordinator/process/inference_manager.py` | | `InferenceProcessManager` + shared socket + `run_inference_worker_proc` |
 | `motor/coordinator/process/constants.py` | | Process keys, start/stop order |
 | `motor/coordinator/scheduler/scheduler.py` | | `Scheduler` facade over scheduling policies |
+| `motor/coordinator/scheduler/policy/smetric.py` | | SMetric remaining-prefill ranking + conductor local/remote hit log |
 | `motor/coordinator/scheduler/policy/factory.py` | | `SchedulingPolicyFactory` registry |
 | `motor/coordinator/scheduler/runtime/scheduler_server.py` | | `AsyncSchedulerServer`: ZMQ ROUTER, instance pool, workload SHM writer |
 | `motor/coordinator/scheduler/runtime/scheduler_client.py` | | `AsyncSchedulerClient`: ZMQ DEALER + instance cache + SHM reader |

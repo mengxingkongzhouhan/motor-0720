@@ -34,6 +34,10 @@ from motor.engine_server.core.dispatch_adapter.normalization import (
     normalize_nonstream_body,
     normalize_stream_chunk,
 )
+from motor.engine_server.core.vllm.cache_hit_logger import (
+    log_from_openai_body,
+    maybe_log_from_stream_chunk,
+)
 from motor.engine_server.core.vllm.prefill_context_validation import (
     PrefillContextCheck,
 )
@@ -225,6 +229,7 @@ class VLLMDispatchAdapter(DispatchAdapter):
             return response
         if not isinstance(body, dict):
             return response
+        self._log_vllm_cache_hit(body, context)
         if context.dispatch is not None and context.dispatch.role == "prefill" and self._uses_handoff(context.dispatch):
             # Only successful prefill responses are valid handoff results.
             # Preserve validation and serving errors with their original HTTP
@@ -280,12 +285,29 @@ class VLLMDispatchAdapter(DispatchAdapter):
     ) -> bytes | str | None:
         if context.dispatch is None:
             return chunk
+        maybe_log_from_stream_chunk(
+            chunk,
+            root_req_id=context.dispatch.root_request_id,
+            engine_req_id=context.dispatch.engine_request_id,
+            state=state,
+        )
         return normalize_stream_chunk(
             chunk,
             client_expects_chat_shape=context.client_expects_chat_shape,
             req_id=context.dispatch.root_request_id,
             stream_state=state,
             client_return_token_ids=context.client_return_token_ids,
+        )
+
+    @staticmethod
+    def _log_vllm_cache_hit(body: dict[str, Any], context: DispatchResponseContext) -> None:
+        dispatch = context.dispatch
+        if dispatch is None:
+            return
+        log_from_openai_body(
+            body,
+            root_req_id=dispatch.root_request_id,
+            engine_req_id=dispatch.engine_request_id,
         )
 
     @staticmethod

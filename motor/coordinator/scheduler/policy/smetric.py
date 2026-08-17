@@ -70,6 +70,64 @@ def _prefill_cost(isl: int, matched_tokens: int) -> float:
     return float(max(0, isl - _SMETRIC_OVERLAP_CREDIT * matched))
 
 
+def _conductor_block_size() -> int:
+    """KV block size used to turn conductor ``*_blocks`` into token counts. 0 if unknown."""
+    try:
+        bs = int(ConductorApiClient.coordinator_config.scheduler_config.kv_conductor_config.block_size)
+        return bs if bs > 0 else 0
+    except Exception as e:  # pragma: no cover - config shape guard
+        logger.debug("Could not read conductor block_size: %s", e)
+        return 0
+
+
+def _as_nonneg_int(value: object) -> int:
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def _matched_hit_lengths(
+    matched_raw: object,
+    isl: int,
+    block_size: int,
+) -> tuple[int, int | None, int | None]:
+    """
+    Parse one conductor DP match into ``(matched, local_hit, remote_hit)``.
+
+    * ``local_hit`` is NPU/HBM prefix tokens (``npu_blocks * block_size``).
+    * ``remote_hit`` is CPU+Disk tokens (external KV store).
+    * Scalar / ``matched_tokens``-only replies leave local/remote as None.
+    """
+    local_hit: int | None = None
+    remote_hit: int | None = None
+    matched = 0
+    if isinstance(matched_raw, dict):
+        has_blocks = any(key in matched_raw for key in ("npu_blocks", "cpu_blocks", "disk_blocks"))
+        if has_blocks and block_size > 0:
+            local_hit = _as_nonneg_int(matched_raw.get("npu_blocks")) * block_size
+            remote_hit = (
+                _as_nonneg_int(matched_raw.get("cpu_blocks")) + _as_nonneg_int(matched_raw.get("disk_blocks"))
+            ) * block_size
+            matched = _as_nonneg_int(matched_raw.get("matched_tokens")) or (local_hit + remote_hit)
+        else:
+            matched = _as_nonneg_int(matched_raw.get("matched_tokens"))
+    else:
+        matched = _as_nonneg_int(matched_raw)
+    if isl > 0:
+        matched = min(matched, isl)
+        if local_hit is not None:
+            local_hit = min(local_hit, isl)
+        if remote_hit is not None:
+            remote_hit = min(remote_hit, isl)
+    return matched, local_hit, remote_hit
+
+
+def _format_hit(value: int | None) -> str:
+    return "-" if value is None else str(value)
+
+
 class SMetricPrefillCostTracker:
     """
     Running average of the prefill_cost actually committed on each allocation.
@@ -175,8 +233,9 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
             return None
 
         scored: list[tuple[float, int, int, Instance, Endpoint]] = []
-        matches: list[tuple[int, int, int]] = []
+        matches: list[tuple[int, int, int, int | None, int | None]] = []
         any_instance = False
+        block_size = _conductor_block_size()
         for instance in instances:
             instance_data = tenant.get(conductor_instance_id(instance), None)
             if instance_data is None:
@@ -184,13 +243,13 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
             any_instance = True
             dp_map = instance_data.get("DP", {}) if isinstance(instance_data, dict) else {}
             for ep in instance.get_all_endpoints():
-                matched = dp_map.get(f"{ep.id}", 0)
-                try:
-                    matched_tokens = int(matched)
-                except (TypeError, ValueError):
-                    matched_tokens = 0
+                matched_tokens, local_hit, remote_hit = _matched_hit_lengths(
+                    dp_map.get(f"{ep.id}", 0),
+                    isl,
+                    block_size,
+                )
                 cost = _prefill_cost(isl, matched_tokens)
-                matches.append((instance.id, ep.id, matched_tokens))
+                matches.append((instance.id, ep.id, matched_tokens, local_hit, remote_hit))
                 scored.append((cost, instance.id, ep.id, instance, ep))
 
         if not any_instance:
@@ -201,11 +260,15 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
             return None
 
         matches.sort()
+        req_id = getattr(req_info, "req_id", None) or DEFAULT_REQUEST_ID
         logger.info(
             "smetric: req_id=%s isl=%s endpoint_matches=[%s]",
-            getattr(req_info, "req_id", None) or DEFAULT_REQUEST_ID,
+            req_id,
             isl,
-            ", ".join(f"{iid}-{eid}:{matched}" for iid, eid, matched in matches),
+            ", ".join(
+                f"{iid}-{eid}:matched={matched}/local={_format_hit(local_hit)}/remote={_format_hit(remote_hit)}"
+                for iid, eid, matched, local_hit, remote_hit in matches
+            ),
         )
 
         scored.sort(key=lambda item: (item[0], item[1], item[2]))

@@ -577,7 +577,7 @@ async def test_vllm_handoff_prefill_response_without_kv_transfer_params_yields_e
 
 
 @pytest.mark.asyncio
-async def test_vllm_handoff_prefill_to_decode_round_trip_preserves_bootstrap(caplog):
+async def test_vllm_handoff_prefill_to_decode_round_trip_preserves_bootstrap():
     """End-to-end: a realistic prefill response threaded into the decode leg must
     surface the KV bootstrap at the top level of ``kv_transfer_params`` (the shape
     the engine connector reads), not nested one level too deep.
@@ -604,12 +604,8 @@ async def test_vllm_handoff_prefill_to_decode_round_trip_preserves_bootstrap(cap
             },
         }
     )
-    with caplog.at_level("INFO"):
-        normalized = await prefill_adapter.normalize_response(engine_response, _context(prefill_dispatch))
+    normalized = await prefill_adapter.normalize_response(engine_response, _context(prefill_dispatch))
     prefill_result = json.loads(normalized.body.decode("utf-8"))
-
-    assert "vllm_cache_hit: req_id=req engine_req_id=req#a1" in caplog.text
-    assert "cached=16 prompt=2" in caplog.text
 
     # Usage (and its prompt_tokens_details) must survive separately from payload so
     # the coordinator can still report cached tokens after handoff.
@@ -629,6 +625,31 @@ async def test_vllm_handoff_prefill_to_decode_round_trip_preserves_bootstrap(cap
     assert "kv_transfer_params" not in kv
     assert "choices" not in kv
     assert "usage" not in kv
+
+
+@pytest.mark.asyncio
+async def test_vllm_normalize_response_logs_cache_hit_with_motor_req_id(caplog):
+    """Adapter line uses Motor root_request_id so it can be grepped against SMetric logs."""
+    from motor.engine_server.core.vllm.cache_hit_logger import reset_cache_hit_logger_state
+
+    reset_cache_hit_logger_state()
+    adapter = VLLMDispatchAdapter(_Config(role="prefill", engine_config=_handoff_config()))
+    _, dispatch = await adapter.adapt_request_body(_body("prefill"))
+    response = JSONResponse(
+        {
+            "usage": {
+                "prompt_tokens": 80,
+                "prompt_tokens_details": {"cached_tokens": 24},
+            },
+            "kv_transfer_params": {"do_remote_decode": True},
+        }
+    )
+    with caplog.at_level("INFO"):
+        await adapter.normalize_response(response, _context(dispatch))
+    assert (
+        "vllm_cache_hit: req_id=req engine_req_id=req#a1 local_hit=- remote_hit=- cached=24 prompt=80"
+        in caplog.text
+    )
 
 
 @pytest.mark.asyncio

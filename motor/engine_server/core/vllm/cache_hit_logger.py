@@ -10,11 +10,21 @@
 
 """Per-request vLLM local/remote prefix-cache hit logging for Motor correlation.
 
+Targets **vLLM 0.23.0** (Motor's pinned engine; also vLLM-Ascend ``releases/v0.23.0``).
+Does not patch vLLM source: wraps ``OutputProcessor.process_outputs`` in-process.
+
 SMetric logs conductor match lengths keyed by ``req_id``. This module prints the
 same request's vLLM hits so the two can be grepped together:
 
 * ``local_hit`` — GPU/NPU prefix cache (``PrefillStats.num_local_cached_tokens``)
 * ``remote_hit`` — external KV connector (``PrefillStats.num_external_cached_tokens``)
+
+v0.23.0 contract used here:
+
+* ``OutputProcessor.process_outputs(self, engine_core_outputs: list[EngineCoreOutput], ...)``
+* ``EngineCoreOutput.prefill_stats: PrefillStats | None``
+* ``PrefillStats`` fields ``num_local_cached_tokens`` / ``num_external_cached_tokens`` /
+  ``num_cached_tokens`` / ``num_prompt_tokens`` (ints, default 0)
 
 The OpenAI ``usage.prompt_tokens_details.cached_tokens`` field is only a total, so
 the EngineCore ``prefill_stats`` path is preferred. The dispatch adapter then
@@ -138,7 +148,11 @@ def hits_from_usage(usage: Any) -> CacheHitRecord | None:
 
 
 def log_from_engine_core_outputs(engine_core_outputs: Any) -> None:
-    """Store+log PrefillStats from an EngineCore output batch (frontend process)."""
+    """Store+log PrefillStats from an EngineCore output batch (frontend process).
+
+    vLLM 0.23.0 passes ``list[EngineCoreOutput]`` as ``process_outputs``' first
+    argument. ``EngineCoreOutputs`` (``.outputs`` list) is also accepted.
+    """
     for output in _iter_engine_core_outputs(engine_core_outputs):
         record = hits_from_prefill_stats(getattr(output, "prefill_stats", None))
         if record is None:
@@ -191,7 +205,7 @@ def maybe_log_from_stream_chunk(
 
 
 def install_vllm_cache_hit_logger() -> bool:
-    """Wrap vLLM OutputProcessor so PrefillStats is captured in the API process."""
+    """Wrap vLLM 0.23.0 ``OutputProcessor.process_outputs`` to capture PrefillStats."""
     global _INSTALLED
     if _INSTALLED:
         return True
@@ -248,6 +262,7 @@ def _usage_from_body(body: dict[str, Any] | None) -> Any:
 
 
 def _iter_engine_core_outputs(engine_core_outputs: Any) -> list[Any]:
+    """Yield EngineCoreOutput items from a v0.23.0 list or an ``.outputs`` wrapper."""
     if engine_core_outputs is None:
         return []
     outputs = getattr(engine_core_outputs, "outputs", engine_core_outputs)

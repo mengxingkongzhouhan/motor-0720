@@ -71,12 +71,44 @@ def test_log_from_engine_core_outputs_remembers_and_logs(caplog):
         ),
     )
     with caplog.at_level("INFO"):
+        # vLLM 0.23.0 OutputProcessor.process_outputs first arg is list[EngineCoreOutput]
         log_from_engine_core_outputs([output])
     stored = lookup_engine_hits("req#a1")
     assert stored is not None
     assert stored.local_hit == 16
     assert stored.remote_hit == 8
     assert "vllm_cache_hit: req_id=- engine_req_id=req#a1 local_hit=16 remote_hit=8 cached=24 prompt=80" in caplog.text
+
+
+def test_log_from_engine_core_outputs_accepts_outputs_container(caplog):
+    output = SimpleNamespace(
+        request_id="req#a1",
+        prefill_stats=SimpleNamespace(
+            num_local_cached_tokens=4,
+            num_external_cached_tokens=2,
+            num_cached_tokens=6,
+            num_prompt_tokens=10,
+        ),
+    )
+    with caplog.at_level("INFO"):
+        log_from_engine_core_outputs(SimpleNamespace(outputs=[output]))
+    stored = lookup_engine_hits("req#a1")
+    assert stored is not None
+    assert stored.local_hit == 4
+    assert stored.remote_hit == 2
+    assert "local_hit=4 remote_hit=2 cached=6 prompt=10" in caplog.text
+
+
+def test_hits_from_prefill_stats_zero_defaults_are_hits_not_missing():
+    """vLLM 0.23.0 PrefillStats fields default to int 0, not None."""
+    stats = SimpleNamespace(
+        num_local_cached_tokens=0,
+        num_external_cached_tokens=0,
+        num_cached_tokens=0,
+        num_prompt_tokens=32,
+    )
+    record = hits_from_prefill_stats(stats)
+    assert record == CacheHitRecord(local_hit=0, remote_hit=0, cached=0, prompt=32)
 
 
 def test_log_from_openai_body_correlates_motor_req_id(caplog):

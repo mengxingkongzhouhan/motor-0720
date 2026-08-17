@@ -121,11 +121,11 @@ Responsibilities:
 - **Dispatch attach**: wraps the request with `MotorDispatch` (prefill→decode handoff, request-body rewrite for the target role)
 - **Stop propagation**: `POST /v1/dispatch/stop` (`handle_stop`) stops a dispatch; peers are stopped with HTTP 499, in-flight requests are aborted and stream chunks normalized
 - **Response normalization**: `normalization.py` adapts engine responses/stream chunks to the unified OpenAI schema (e.g. completions-style bodies/chunks lifted to chat format, token_id stripping, request-id synthesis)
-- **Per-request KV hits (vLLM)**: `VLLMDispatchAdapter` logs `vllm_cache_hit: req_id=... local_hit=... remote_hit=...` after each response. `local_hit` / `remote_hit` come from vLLM `PrefillStats` (GPU prefix cache vs external KV connector) when the OutputProcessor hook is installed; otherwise `cached` is the OpenAI usage total and the split is `-`. Pair with Coordinator `smetric: req_id=... endpoint_matches=[inst-ep:matched=/local=/remote=]` to compare Motor conductor coverage vs engine hits.
+- **Per-request KV hits (vLLM 0.23.0)**: `VLLMDispatchAdapter` logs `vllm_cache_hit: req_id=... local_hit=... remote_hit=...` after each response. `local_hit` / `remote_hit` come from vLLM 0.23.0 `PrefillStats` (`num_local_cached_tokens` = GPU/NPU prefix cache, `num_external_cached_tokens` = KV connector) via wrapping `OutputProcessor.process_outputs(self, list[EngineCoreOutput], ...)`. OpenAI `usage.prompt_tokens_details.cached_tokens` is total-only, so the split is `-` if `prefill_stats` was missing. Pair with Coordinator `smetric: req_id=... endpoint_matches=[inst-ep:matched=/local=/remote=]` to compare Motor conductor coverage vs engine hits.
 - **Error mapping**: engine exceptions are mapped to serving HTTP errors (and vice versa) via registered error handlers
 - **KV-aware metaserver**: `POST /v1/metaserver` requests go through `prepare_metaserver_request` (engine_body + dispatch + KV params validation)
 
-Files: `base.py` (534, `DispatchAdapter` + `DispatchAttemptRegistry` + stop client), `vllm_adapter.py` (340, `VLLMDispatchAdapter`), `sglang_adapter.py` (49, `SGLangDispatchAdapter`), `normalization.py` (220), `factory.py` (23, `create_dispatch_adapter`).
+Files: `base.py` (534, `DispatchAdapter` + `DispatchAttemptRegistry` + stop client), `vllm_adapter.py` (362, `VLLMDispatchAdapter`), `sglang_adapter.py` (49, `SGLangDispatchAdapter`), `normalization.py` (220), `factory.py` (23, `create_dispatch_adapter`).
 
 ## Health Monitoring Stack (4 Layers)
 
@@ -185,7 +185,7 @@ Layer 4: SimInference (proactive health)
 | `motor/engine_server/core/health_collector.py` | Async HTTP health polling (calls InferEndpoint `/health`) |
 | `motor/engine_server/core/sim_inference.py` | Virtual inference requests + `npu-smi` AICore monitoring |
 | `motor/engine_server/core/dispatch_adapter/` | Dispatch adapter subsystem: `base.py`, `vllm_adapter.py`, `normalization.py`, `sglang_adapter.py`, `factory.py` |
-| `motor/engine_server/core/vllm/cache_hit_logger.py` | Per-request vLLM local/remote prefix-cache hit log + OutputProcessor hook |
+| `motor/engine_server/core/vllm/cache_hit_logger.py` | Per-request vLLM 0.23.0 local/remote prefix-cache hit log + OutputProcessor wrap |
 | `motor/engine_server/core/snapshot_sentinel.py` | `SnapshotSentinel` thread: checkpoint wait + suspend/resume driving |
 | `motor/engine_server/core/snapshot_monitor.py` | `SnapshotMonitor`: suspend/unlock/resume completion states |
 | `motor/engine_server/core/vllm/vllm_config.py` | `VLLMConfig`: field mapping, DP address, KV transfer, D2D config |

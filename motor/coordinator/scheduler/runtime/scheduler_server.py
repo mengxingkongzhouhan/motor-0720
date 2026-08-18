@@ -794,9 +794,7 @@ class _SchedulerRequestDispatcher:
             # the affinity policy attached): commit the worker-computed demand as-is.
             workload = worker_demand
         # KV affinity / SMetric stamp the committed endpoint's prefill_cost; other policies leave 0.
-        workload.prefill_cost = self._lookup_candidate_prefill_cost(
-            affinity_candidates, instance.id, endpoint.id
-        )
+        workload.prefill_cost = self._lookup_candidate_prefill_cost(affinity_candidates, instance.id, endpoint.id)
         params = UpdateWorkloadParams(
             instance_id=instance.id,
             endpoint_id=endpoint.id,
@@ -1114,9 +1112,10 @@ class _SchedulerRequestDispatcher:
                 instance_role = PDRole.ROLE_U
             if instance_role != role:
                 continue
-            if best is None or prefill_cost < best[2] or (
-                prefill_cost == best[2] and (instance.id, endpoint.id) < (best[0].id, best[1].id)
-            ):
+            if best is None:
+                best = (instance, endpoint, prefill_cost)
+                continue
+            if (prefill_cost, instance.id, endpoint.id) < (best[2], best[0].id, best[1].id):
                 best = (instance, endpoint, prefill_cost)
         if best is None:
             return None
@@ -1144,9 +1143,10 @@ class _SchedulerRequestDispatcher:
                 if (instance.id, endpoint.id) not in scored_endpoints:
                     continue
                 cost = self._endpoint_ledger_prefill_cost(endpoint)
-                if best is None or cost < best[2] or (
-                    cost == best[2] and (instance.id, endpoint.id) < (best[0].id, best[1].id)
-                ):
+                if best is None:
+                    best = (instance, endpoint, cost)
+                    continue
+                if (cost, instance.id, endpoint.id) < (best[2], best[0].id, best[1].id):
                     best = (instance, endpoint, cost)
         if best is None:
             return None

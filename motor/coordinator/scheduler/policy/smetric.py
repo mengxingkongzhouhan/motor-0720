@@ -250,9 +250,7 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         if req_info is None:
             return
         try:
-            req_info.smetric_debug = {
-                (instance.id, ep.id): cost for (cost, _iid, _eid, instance, ep) in scored
-            }
+            req_info.smetric_debug = {(instance.id, ep.id): cost for (cost, _iid, _eid, instance, ep) in scored}
         except Exception as e:  # pragma: no cover
             logger.debug("Could not cache smetric_debug on req_info: %s", e)
 

@@ -385,6 +385,10 @@ class _SchedulerRequestDispatcher:
         async with self._workload_commit_lock:
             changed = await self._instance_manager.refresh_instances(event_type, instances)
             if event_type == EventType.SET:
+                if changed:
+                    # The running cost average describes the old topology and must not gate
+                    # allocations after the authoritative instance set is replaced.
+                    self._smetric_prefill.reset()
                 # Snapshot open instances before clearing so workers can be notified.
                 previously_open_ids = self._cb_manager.get_open_instance_ids()
                 self._cb_manager.clear_all()
@@ -1066,7 +1070,11 @@ class _SchedulerRequestDispatcher:
     ) -> tuple[Instance, Endpoint, float] | None:
         """Gate on the shared average, then worker min-cost, request min-cost, or min ledger cost."""
         if not smetric_candidates:
-            return None
+            logger.warning(
+                "smetric: no endpoint costs in ALLOCATE_ONLY; validating worker candidate %s",
+                worker_candidate,
+            )
+            return self._select_valid_candidate(worker_candidate, role, required_engine_type)
         req_cost = min(cost for _iid, _eid, cost in smetric_candidates)
         prompt_isl = isl if isl is not None else 0.0
         if self._smetric_prefill.use_smetric_rank(req_cost, prompt_isl):
@@ -1075,7 +1083,7 @@ class _SchedulerRequestDispatcher:
                 if picked is not None:
                     return picked
             return self._select_smetric_min_cost(smetric_candidates, role, required_engine_type)
-        return self._select_min_ledger_prefill_cost(role, required_engine_type)
+        return self._select_min_ledger_prefill_cost(role, smetric_candidates, required_engine_type)
 
     def _select_smetric_min_cost(
         self,
@@ -1113,6 +1121,7 @@ class _SchedulerRequestDispatcher:
     def _select_min_ledger_prefill_cost(
         self,
         role: PDRole,
+        smetric_candidates: list[tuple[int, int, float]],
         required_engine_type: str | None = None,
     ) -> tuple[Instance, Endpoint, float] | None:
         """Pick the available endpoint whose current ``workload.prefill_cost`` is smallest.
@@ -1120,6 +1129,7 @@ class _SchedulerRequestDispatcher:
         This is the SMetric dump path: remaining prefill on the ledger, not token-based
         load-balance and not this request's conductor cost. Ties break by (instance_id, endpoint_id).
         """
+        scored_endpoints = {(instance_id, endpoint_id) for instance_id, endpoint_id, _cost in smetric_candidates}
         best: tuple[Instance, Endpoint, float] | None = None
         for instance in self._instance_manager.get_available_instances(role).values():
             if self._is_instance_circuit_open(instance.id):
@@ -1127,6 +1137,8 @@ class _SchedulerRequestDispatcher:
             if not self._matches_engine_type(instance, required_engine_type):
                 continue
             for endpoint in instance.get_all_endpoints():
+                if (instance.id, endpoint.id) not in scored_endpoints:
+                    continue
                 cost = self._endpoint_ledger_prefill_cost(endpoint)
                 if best is None or cost < best[2] or (
                     cost == best[2] and (instance.id, endpoint.id) < (best[0].id, best[1].id)

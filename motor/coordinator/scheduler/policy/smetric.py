@@ -40,7 +40,7 @@ _SMETRIC_COST_ISL_RATIO = 0.5
 def _prompt_token_ids(req_info: RequestInfo) -> list[int]:
     """Tokenize the prompt for the conductor query and isl. Independent of KV-affinity helpers."""
     cached = getattr(req_info, "token_ids", None)
-    if isinstance(cached, list):
+    if isinstance(cached, list) and cached:
         return cached
     encoded_ids: list[int] = []
     req_data = getattr(req_info, "req_data", None) or {}
@@ -66,8 +66,18 @@ def _prompt_token_ids(req_info: RequestInfo) -> list[int]:
 
 def _prefill_cost(isl: int, matched_tokens: int) -> float:
     """Remaining prefill tokens with overlap_credit fixed at 1: max(0, isl - matched)."""
-    matched = min(matched_tokens, isl) if isl > 0 else 0
+    matched = max(0, min(matched_tokens, isl)) if isl > 0 else 0
     return float(max(0, isl - _SMETRIC_OVERLAP_CREDIT * matched))
+
+
+def _matched_tokens(matched: object) -> int:
+    """Read both legacy integer and DpBlocks conductor match formats."""
+    if isinstance(matched, dict):
+        matched = matched.get("matched_tokens", 0)
+    try:
+        return max(0, int(matched or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 class SMetricPrefillCostTracker:
@@ -185,10 +195,7 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
             dp_map = instance_data.get("DP", {}) if isinstance(instance_data, dict) else {}
             for ep in instance.get_all_endpoints():
                 matched = dp_map.get(f"{ep.id}", 0)
-                try:
-                    matched_tokens = int(matched)
-                except (TypeError, ValueError):
-                    matched_tokens = 0
+                matched_tokens = _matched_tokens(matched)
                 cost = _prefill_cost(isl, matched_tokens)
                 matches.append((instance.id, ep.id, matched_tokens))
                 scored.append((cost, instance.id, ep.id, instance, ep))

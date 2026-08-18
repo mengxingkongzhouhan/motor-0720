@@ -612,6 +612,23 @@ class TestHandleRefreshInstances:
         assert writer.snapshots >= 1
 
     @pytest.mark.asyncio
+    async def test_changed_set_resets_smetric_average(self):
+        """A replacement topology must not inherit the old cluster's SMetric gate history."""
+        dispatcher, instance_manager, *_ = _make_dispatcher()
+        dispatcher._smetric_prefill.record(42)
+        instance_manager.refresh_instances = AsyncMock(return_value=True)
+        request = SchedulerRequest(
+            request_type=SchedulerRequestType.REFRESH_INSTANCES,
+            request_id="req-reset-smetric",
+            data={"event_type": EventType.SET.value, "instances": []},
+        )
+
+        response = await dispatcher.dispatch(request)
+
+        assert response.response_type == SchedulerResponseType.SUCCESS
+        assert dispatcher._smetric_prefill.snapshot() == (0.0, 0)
+
+    @pytest.mark.asyncio
     async def test_changed_calls_sync_callback(self):
         received = []
 

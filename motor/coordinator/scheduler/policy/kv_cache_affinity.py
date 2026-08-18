@@ -22,7 +22,7 @@ from motor.config.coordinator import (
     KV_AFFINITY_MODE_UNIFIED,
 )
 from motor.common.logger import get_logger
-from motor.coordinator.models.constants import OpenAIField
+from motor.coordinator.models.constants import DEFAULT_REQUEST_ID, OpenAIField
 from motor.coordinator.models.request import RequestInfo
 from motor.coordinator.api_client.conductor_api_client import (
     ConductorApiClient,
@@ -111,9 +111,10 @@ class KvCacheAffinityPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         :returns: best-first ``[(instance, endpoint, score), ...]`` or ``None`` to fall back.
         """
         encoded_ids = KvCacheAffinityPolicy._ensure_token_ids(req_info)
+        isl = len(encoded_ids)
 
         block_size = KvCacheAffinityPolicy._conductor_block_size()
-        if block_size > 0 and len(encoded_ids) < block_size:
+        if block_size > 0 and isl < block_size:
             # Sub-block prompt: the indexer hashes only whole blocks, so a query can only ever
             # report a zero match. Skip the blocking HTTP round-trip and rank against an all-zero
             # match map -- identical to what the conductor would return for this prompt, but
@@ -121,6 +122,15 @@ class KvCacheAffinityPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
             tenant = {conductor_instance_id(inst): {"DP": {}} for inst in instances}
         else:
             rsp = ConductorApiClient.query_conductor(instances, encoded_ids)
+            req_id = getattr(req_info, "req_id", None)
+            if not isinstance(req_id, str) or not req_id:
+                req_id = DEFAULT_REQUEST_ID
+            logger.info(
+                "smetric: req_id=%s isl=%s conductor_rsp=%s",
+                req_id,
+                isl,
+                rsp,
+            )
             tenant = rsp.get(TENANT_ID, None)
             if tenant is None:
                 logger.warning(
@@ -324,7 +334,7 @@ class KvCacheAffinityPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
     def _stash_affinity_debug(
         req_info: RequestInfo | None,
         raw: list[tuple[float, int, float, Instance, Endpoint]],
-        with_prefill: bool = False,
+        with_prefill: bool = True,
     ) -> None:
         """
         Cache per-endpoint ``(matched_tokens, load_cost, prefill_cost)`` on ``req_info``.
@@ -333,20 +343,21 @@ class KvCacheAffinityPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         * the worker's final allocation log, which reports the KV-affinity prefix hit and load of
           the endpoint the scheduler actually committed (may differ from the worker's top-1 after
           the scheduler's fresh-ledger re-pick);
-        * unified-mode :meth:`AsyncSchedulerClient.select_and_allocate`, which forwards every
-          endpoint's affinity-discounted ``prefill_cost`` to the scheduler so it can re-rank all of
-          them by its own fresh load (``prefill_load_scale * prefill_cost + load_weight * load``) --
-          a global selection with no fixed top-k.
+        * ALLOCATE_ONLY, which stamps the committed endpoint's ``prefill_cost`` on the ledger.
+          Unified mode additionally forwards every endpoint cost plus ``prefill_load_scale`` /
+          ``load_weight`` so the scheduler can re-rank globally. load_gated forwards only its
+          ranked set (with prefill_cost for accounting) and omits those scalars so the hard load
+          bound is kept.
 
-        ``prefill_cost`` is stored only when ``with_prefill`` is set; it is None otherwise (e.g.
-        load_gated, whose hard load bound must not be relaxed into a soft unified score on the
-        scheduler). Best-effort: never fail selection over a debug cache.
+        ``with_prefill`` is accepted for call-site compatibility; prefill_cost is always stored.
+        Best-effort: never fail selection over a debug cache.
         """
+        del with_prefill
         if req_info is None:
             return
         try:
             req_info.kv_affinity_debug = {
-                (instance.id, ep.id): (matched_tokens, load_cost, prefill_cost if with_prefill else None)
+                (instance.id, ep.id): (matched_tokens, load_cost, prefill_cost)
                 for (load_cost, matched_tokens, prefill_cost, instance, ep) in raw
             }
         except Exception as e:  # pragma: no cover - req_info may be immutable in some callers

@@ -150,15 +150,13 @@ class TestWorkloadSharedMemoryReader(unittest.TestCase):
         self.assertEqual(self.reader.last_sequence_for_role(PDRole.ROLE_D), 6)
         self.assertEqual(self.reader.last_sequence_for_role(PDRole.ROLE_U), 2)
 
-    def test_schema_version_mismatch_rejected(self):
-        """Mismatched schema headers are rejected: entry layout differs across schemas, so
-        reading would slice entries at the wrong stride. The reader must refuse the read
-        instead of exposing role sequences from incompatible layout bytes.
-        """
+    def test_v3_schema_rejected_after_prefill_cost_replaces_padding(self):
+        """Schema v3 used trailing padding where v4 stores float32 prefill_cost."""
+        self.assertEqual(SCHEMA_VERSION, 4)
         buf = self._make_buf(0)
         header = WorkloadShmHeader(
             magic=MAGIC,
-            schema_version=SCHEMA_VERSION - 1,
+            schema_version=3,
             sequence=8,
             entry_count=0,
             max_entries=10,
@@ -221,6 +219,7 @@ class TestWorkloadSharedMemoryReader(unittest.TestCase):
             20,
             PDRole.ROLE_D,
             21.0,
+            0.0,
         )
         self.assertIsNone(self.reader.last_sequence_for_role(PDRole.ROLE_P))
         self.assertEqual(self.reader.last_sequence_for_role(PDRole.ROLE_D), 6)

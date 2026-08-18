@@ -628,6 +628,28 @@ async def test_vllm_handoff_prefill_to_decode_round_trip_preserves_bootstrap():
 
 
 @pytest.mark.asyncio
+async def test_vllm_normalize_response_logs_cache_hit_with_motor_req_id(caplog):
+    """Adapter line uses Motor root_request_id so it can be grepped against SMetric logs."""
+    from motor.engine_server.core.vllm.cache_hit_logger import reset_cache_hit_logger_state
+
+    reset_cache_hit_logger_state()
+    adapter = VLLMDispatchAdapter(_Config(role="prefill", engine_config=_handoff_config()))
+    _, dispatch = await adapter.adapt_request_body(_body("prefill"))
+    response = JSONResponse(
+        {
+            "usage": {
+                "prompt_tokens": 80,
+                "prompt_tokens_details": {"cached_tokens": 24},
+            },
+            "kv_transfer_params": {"do_remote_decode": True},
+        }
+    )
+    with caplog.at_level("INFO"):
+        await adapter.normalize_response(response, _context(dispatch))
+    assert "vllm_cache_hit: req_id=req engine_req_id=req#a1 local_hit=- remote_hit=- cached=24 prompt=80" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_vllm_handoff_profile_ignores_legacy_dispatch_mode_for_prefill_result():
     adapter = VLLMDispatchAdapter(_Config(role="prefill", engine_config=_handoff_config()))
     _, dispatch = await adapter.adapt_request_body(_body("prefill"))

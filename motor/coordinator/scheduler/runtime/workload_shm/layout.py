@@ -23,8 +23,9 @@ from dataclasses import dataclass
 # Readers check this to ensure the buffer is our workload shm layout, not other data or corruption.
 MAGIC = 0x574B4C44
 
-# Schema version for layout compatibility
-SCHEMA_VERSION = 3
+# Schema version for layout compatibility.
+# v4 replaces the trailing 4-byte padding in the v3 entry with float32 prefill_cost.
+SCHEMA_VERSION = 4
 
 # Role mapping: prefill=0, decode=1, hybrid=2, encode=3
 ROLE_PREFILL = 0
@@ -43,9 +44,9 @@ HEARTBEAT_OFFSET = 32  # bytes 32-40: heartbeat_sequence (Q)
 HEARTBEAT_STALE_SEC = 5.0  # If heartbeat unchanged for this long, Infer treats shm as stale
 
 # Entry: 24 bytes
-# instance_id 4B, endpoint_id 4B, role 1B, padding 3B, active_tokens 8B, padding 4B
+# instance_id 4B, endpoint_id 4B, role 1B, padding 3B, active_tokens 8B, prefill_cost 4B (float32)
 ENTRY_SIZE = 24
-ENTRY_FMT = "<i i B 3x d 4x"
+ENTRY_FMT = "<i i B 3x d f"
 
 # Max number of (instance, endpoint) workload entries in shared memory. Not user-configurable.
 DEFAULT_WORKLOAD_SHM_MAX_ENTRIES = 10240
@@ -59,6 +60,7 @@ class WorkloadShmEntry:
     endpoint_id: int
     role: int
     active_tokens: float
+    prefill_cost: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -137,6 +139,7 @@ def pack_entry(entry: WorkloadShmEntry) -> bytes:
         entry.endpoint_id,
         entry.role,
         entry.active_tokens,
+        entry.prefill_cost,
     )
 
 
@@ -151,6 +154,7 @@ def unpack_entry(buf: memoryview, slot: int) -> WorkloadShmEntry:
         endpoint_id=t[1],
         role=t[2],
         active_tokens=t[3],
+        prefill_cost=t[4],
     )
 
 

@@ -1101,6 +1101,7 @@ class AsyncSchedulerClient:
                     endpoint.id,
                 )
                 committed_data = data.get("committed_workload")
+                server_reported_prefill_cost = isinstance(committed_data, dict) and "prefill_cost" in committed_data
                 if isinstance(committed_data, dict):
                     try:
                         committed_workload = Workload.model_validate(committed_data)
@@ -1110,7 +1111,7 @@ class AsyncSchedulerClient:
                     committed_workload = workload
                 # Stamp from the worker cache when the response omitted it (in-process / legacy).
                 stamped = allocated_prefill_cost(req_info, out_instance.id, out_endpoint.id)
-                if stamped:
+                if not server_reported_prefill_cost and stamped:
                     committed_workload.prefill_cost = stamped
                 logger.info(
                     "scheduled role=%s req_id=%s instance=%s endpoint=%s policy=%s matched=%s "

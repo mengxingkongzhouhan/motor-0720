@@ -39,6 +39,11 @@ def _create_kv_cache_affinity(instance_provider: InstanceProvider) -> BaseSchedu
     return KvCacheAffinityPolicy(instance_provider=instance_provider)
 
 
+def _create_smetric(instance_provider: InstanceProvider) -> BaseSchedulingPolicy:
+    from motor.coordinator.scheduler.policy.smetric import SMetricPolicy
+    return SMetricPolicy(instance_provider=instance_provider)
+
+
 _REGISTRY: dict[SchedulerType, PolicyFactory] = {}
 
 
@@ -74,5 +79,6 @@ def _register_builtin() -> None:
     register(SchedulerType.ROUND_ROBIN, _create_round_robin)
     register(SchedulerType.LOAD_BALANCE, _create_load_balance)
     register(SchedulerType.KV_CACHE_AFFINITY, _create_kv_cache_affinity)
+    register(SchedulerType.SMETRIC, _create_smetric)
 
 _register_builtin()

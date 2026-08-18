@@ -394,3 +394,48 @@ class TestSMetricClientDispatch:
         costs = {(c["instance_id"], c["endpoint_id"]): c["prefill_cost"] for c in data["candidates"]}
         assert costs == {(1, 10): 3, (2, 20): 1}
         assert data["isl"] == 3
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("scheduler_type", ["smetric", "load_balance"])
+    async def test_pinned_allocation_does_not_request_global_reranking(self, scheduler_type):
+        """A scheduler policy must not move an allocation away from its pinned instance."""
+        client = AsyncSchedulerClient(SchedulerClientConfig(scheduler_type=scheduler_type))
+        inst = Mock()
+        inst.id = 7
+        ep = Mock()
+        ep.id = 70
+        req_info = SimpleNamespace(
+            req_id="req-pinned",
+            req_data={},
+            req_len=10,
+            token_ids=[1, 2, 3],
+            smetric_debug=None,
+            kv_affinity_debug=None,
+        )
+        captured: dict = {}
+
+        async def fake_send(request):
+            captured["data"] = request.data
+            return SchedulerResponse(
+                request_id=request.request_id,
+                response_type=SchedulerResponseType.SUCCESS,
+                data={"instance": None, "endpoint": None},
+            )
+
+        client.get_available_instances = AsyncMock(return_value={inst.id: inst})
+        client._transport.send_request = fake_send
+        with (
+            patch(
+                "motor.coordinator.scheduler.runtime.scheduler_client.resolve_pinned_instance",
+                return_value=inst,
+            ),
+            patch(
+                "motor.coordinator.scheduler.runtime.scheduler_client.select_endpoint_for_instance",
+                return_value=ep,
+            ),
+        ):
+            await client.select_and_allocate(PDRole.ROLE_P, req_info, target_instance_id=inst.id)
+
+        assert captured["data"]["instance_id"] == inst.id
+        assert captured["data"]["endpoint_id"] == ep.id
+        assert captured["data"]["candidate_policy"] == "round_robin"

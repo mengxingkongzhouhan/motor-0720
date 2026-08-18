@@ -82,7 +82,7 @@ CoordinatorDaemon (parent process, async main loop)
 ``` text
 Offset  Size   Field
 0       4B     magic              = 0x574B4C44 ("WKLD")
-4       2B     schema_version     — SCHEMA_VERSION=3 (layout compatibility)
+4       2B     schema_version     — SCHEMA_VERSION=4 (v4 uses the former v3 tail padding for prefill_cost)
 6       2B     (padding)
 8       8B     sequence           — seqlock write counter, bumped on every write
 16      4B     entry_count        — number of valid entries

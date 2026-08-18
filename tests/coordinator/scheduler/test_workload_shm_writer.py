@@ -30,6 +30,7 @@ from motor.coordinator.scheduler.runtime.workload_shm.layout import (
     HEARTBEAT_OFFSET,
     WorkloadShmEntry,
     pack_entry,
+    unpack_entry,
     unpack_header,
 )
 from motor.common.resources.instance import PDRole
@@ -404,6 +405,7 @@ class TestWorkloadSharedMemoryWriter(unittest.TestCase):
             endpoint_id=200,
             role=ROLE_PREFILL,
             active_tokens=12.5,
+            prefill_cost=7.25,
         )
         expected_data = pack_entry(entry)
 
@@ -412,6 +414,7 @@ class TestWorkloadSharedMemoryWriter(unittest.TestCase):
         offset = HEADER_SIZE + 3 * ENTRY_SIZE
         actual = bytes(writer._buf[offset : offset + ENTRY_SIZE])
         self.assertEqual(actual, expected_data)
+        self.assertEqual(unpack_entry(writer._buf, 3).prefill_cost, 7.25)
 
         # Other slots remain zeroed
         for slot in (0, 1, 2, 4):

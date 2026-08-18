@@ -47,5 +47,4 @@
 
 | 日期 | 模块 | 案例 | 文件 | 关键词 |
 |------|------|------|------|--------|
-
-（暂无案例——第一个修复完成后按「新增案例流程」在此追加一行并创建案例文件）
+| 2026-08-18 | coordinator | Workload SHM entry 变更未升级 schema | `coordinator/workload-shm-schema-layout-drift.md` | workload-shm, schema-version, prefill-cost, binary-layout |

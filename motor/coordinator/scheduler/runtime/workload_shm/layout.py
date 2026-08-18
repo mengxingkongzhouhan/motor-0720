@@ -23,8 +23,9 @@ from dataclasses import dataclass
 # Readers check this to ensure the buffer is our workload shm layout, not other data or corruption.
 MAGIC = 0x574B4C44
 
-# Schema version for layout compatibility
-SCHEMA_VERSION = 3
+# Schema version for layout compatibility.
+# v4 replaces the trailing 4-byte padding in the v3 entry with float32 prefill_cost.
+SCHEMA_VERSION = 4
 
 # Role mapping: prefill=0, decode=1, hybrid=2, encode=3
 ROLE_PREFILL = 0

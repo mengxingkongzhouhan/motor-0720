@@ -125,9 +125,7 @@ class TestSMetricPolicyRanking:
             matched={(1, 10): 10, (1, 11): 90, (2, 20): 50, (2, 21): 0},
         )
 
-        ranked = SMetricPolicy.select_endpoint_candidates_from_list(
-            [inst_a, inst_b], req_info, top_k=4
-        )
+        ranked = SMetricPolicy.select_endpoint_candidates_from_list([inst_a, inst_b], req_info, top_k=4)
 
         assert ranked is not None
         costs = [(inst.id, ep.id, int(cost)) for inst, ep, cost in ranked]
@@ -228,7 +226,9 @@ class TestSMetricPolicyRanking:
         assert req_info.smetric_debug == {(3, 7): 15}
         assert req_info.kv_affinity_debug is None
 
-    @patch("motor.coordinator.scheduler.policy.kv_cache_affinity.KvCacheAffinityPolicy.select_endpoint_candidates_from_list")
+    @patch(
+        "motor.coordinator.scheduler.policy.kv_cache_affinity.KvCacheAffinityPolicy.select_endpoint_candidates_from_list"
+    )
     @patch("motor.coordinator.scheduler.policy.kv_cache_affinity.KvCacheAffinityPolicy.select_endpoint_from_list")
     @patch("motor.coordinator.scheduler.policy.kv_cache_affinity.KvCacheAffinityPolicy._collect_load_candidates")
     @patch("motor.coordinator.scheduler.policy.kv_cache_affinity.KvCacheAffinityPolicy._stash_affinity_debug")
@@ -270,9 +270,7 @@ class TestSMetricPolicyRanking:
                 return_value=(instances[0], instances[0].get_all_endpoints()[0]),
             ) as mock_lb,
         ):
-            selected = policy.select_instance_and_endpoint_from_list(
-                instances, role=PDRole.ROLE_D, req_info=req_info
-            )
+            selected = policy.select_instance_and_endpoint_from_list(instances, role=PDRole.ROLE_D, req_info=req_info)
         mock_smetric.assert_not_called()
         mock_lb.assert_called_once()
         assert selected[0].id == 1

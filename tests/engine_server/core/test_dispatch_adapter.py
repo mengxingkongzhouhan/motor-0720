@@ -646,10 +646,7 @@ async def test_vllm_normalize_response_logs_cache_hit_with_motor_req_id(caplog):
     )
     with caplog.at_level("INFO"):
         await adapter.normalize_response(response, _context(dispatch))
-    assert (
-        "vllm_cache_hit: req_id=req engine_req_id=req#a1 local_hit=- remote_hit=- cached=24 prompt=80"
-        in caplog.text
-    )
+    assert "vllm_cache_hit: req_id=req engine_req_id=req#a1 local_hit=- remote_hit=- cached=24 prompt=80" in caplog.text
 
 
 @pytest.mark.asyncio

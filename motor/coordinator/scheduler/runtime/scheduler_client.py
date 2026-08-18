@@ -967,16 +967,12 @@ class AsyncSchedulerClient:
             elif candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY and isinstance(affinity_debug, dict):
                 # load_gated: ranked set with matched_tokens and prefill_cost for ledger stamp.
                 candidate_endpoints = [
-                    _candidate_endpoint_payload(
-                        cand_instance.id, cand_endpoint.id, affinity_debug, smetric_debug
-                    )
+                    _candidate_endpoint_payload(cand_instance.id, cand_endpoint.id, affinity_debug, smetric_debug)
                     for cand_instance, cand_endpoint, _score in candidates
                 ]
             else:
                 candidate_endpoints = [
-                    _candidate_endpoint_payload(
-                        cand_instance.id, cand_endpoint.id, affinity_debug, smetric_debug
-                    )
+                    _candidate_endpoint_payload(cand_instance.id, cand_endpoint.id, affinity_debug, smetric_debug)
                     for cand_instance, cand_endpoint, _score in candidates
                 ]
 

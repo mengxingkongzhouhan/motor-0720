@@ -157,7 +157,6 @@ class TestCalculateDemandWorkload:
         req_info.smetric_debug = None
         assert affinity_prefill_cost(req_info, 2, 20) == 42
         assert allocated_prefill_cost(req_info, 2, 20) == 42
-    """Tests for WorkloadActionHandler.compute_and_update."""
 
     @pytest.fixture
     def mock_request_manager(self):

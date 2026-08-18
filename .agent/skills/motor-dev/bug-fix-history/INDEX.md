@@ -48,3 +48,4 @@
 | 日期 | 模块 | 案例 | 文件 | 关键词 |
 |------|------|------|------|--------|
 | 2026-08-18 | coordinator | Workload SHM entry 变更未升级 schema | `coordinator/workload-shm-schema-layout-drift.md` | workload-shm, schema-version, prefill-cost, binary-layout |
+| 2026-08-18 | engine-server | vLLM 随机内部 ID 导致命中拆分无法关联 | `engine-server/vllm-randomized-request-id-correlation.md` | vllm-0.23.0, request-id-randomization, PrefillStats, correlation |

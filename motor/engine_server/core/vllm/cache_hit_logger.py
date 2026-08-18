@@ -23,6 +23,8 @@ v0.23.0 contract used here:
 
 * ``OutputProcessor.process_outputs(self, engine_core_outputs: list[EngineCoreOutput], ...)``
 * ``EngineCoreOutput.prefill_stats: PrefillStats | None``
+* ``EngineCoreOutput.request_id`` is internal/randomized; the external ID is read from
+  ``OutputProcessor.request_states[request_id].external_req_id``
 * ``PrefillStats`` fields ``num_local_cached_tokens`` / ``num_external_cached_tokens`` /
   ``num_cached_tokens`` / ``num_prompt_tokens`` (ints, default 0)
 
@@ -147,7 +149,11 @@ def hits_from_usage(usage: Any) -> CacheHitRecord | None:
     return CacheHitRecord(cached=cached, prompt=prompt)
 
 
-def log_from_engine_core_outputs(engine_core_outputs: Any) -> None:
+def log_from_engine_core_outputs(
+    engine_core_outputs: Any,
+    *,
+    output_processor: Any = None,
+) -> None:
     """Store+log PrefillStats from an EngineCore output batch (frontend process).
 
     vLLM 0.23.0 passes ``list[EngineCoreOutput]`` as ``process_outputs``' first
@@ -157,7 +163,10 @@ def log_from_engine_core_outputs(engine_core_outputs: Any) -> None:
         record = hits_from_prefill_stats(getattr(output, "prefill_stats", None))
         if record is None:
             continue
-        engine_req_id = _output_request_id(output)
+        internal_req_id = _output_request_id(output)
+        engine_req_id = _external_request_id(output_processor, internal_req_id)
+        if engine_req_id is None:
+            engine_req_id = _output_external_request_id(output) or internal_req_id
         if engine_req_id:
             remember_engine_hits(engine_req_id, record)
         log_vllm_cache_hit(req_id=None, engine_req_id=engine_req_id, record=record)
@@ -220,9 +229,10 @@ def install_vllm_cache_hit_logger() -> bool:
         return True
 
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
-        if args:
+        engine_core_outputs = args[0] if args else kwargs.get("engine_core_outputs")
+        if engine_core_outputs is not None:
             try:
-                log_from_engine_core_outputs(args[0])
+                log_from_engine_core_outputs(engine_core_outputs, output_processor=self)
             except Exception as exc:  # pragma: no cover - never fail serving over a debug log
                 logger.debug("vllm cache hit log failed: %s", exc)
         return original(self, *args, **kwargs)
@@ -277,10 +287,34 @@ def _iter_engine_core_outputs(engine_core_outputs: Any) -> list[Any]:
 
 
 def _output_request_id(output: Any) -> str | None:
-    for attr in ("external_req_id", "request_id"):
-        value = getattr(output, attr, None)
-        if isinstance(value, str) and value:
-            return value
+    value = getattr(output, "request_id", None)
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _output_external_request_id(output: Any) -> str | None:
+    """Compatibility fallback for output types that expose the external ID directly."""
+    value = getattr(output, "external_req_id", None)
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _external_request_id(output_processor: Any, internal_req_id: str | None) -> str | None:
+    """Resolve vLLM 0.23.0's randomized internal ID through OutputProcessor state."""
+    if output_processor is None or not internal_req_id:
+        return None
+    request_states = getattr(output_processor, "request_states", None)
+    if request_states is None:
+        return None
+    try:
+        request_state = request_states.get(internal_req_id)
+    except (AttributeError, TypeError):
+        return None
+    value = getattr(request_state, "external_req_id", None)
+    if isinstance(value, str) and value:
+        return value
     return None
 
 

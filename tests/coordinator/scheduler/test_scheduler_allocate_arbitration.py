@@ -1118,4 +1118,3 @@ async def test_allocate_only_smetric_matching_sequence_still_picks_min_ledger_wh
     _, skipped = await instance_manager.get_endpoint_workload(2, 20)
     assert skipped.active_tokens == 50
     assert skipped.prefill_cost == 40
-

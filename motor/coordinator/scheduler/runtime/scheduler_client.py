@@ -923,7 +923,11 @@ class AsyncSchedulerClient:
                     req_info.req_id,
                 )
                 return None
-            candidate_policy = self._scheduler_type or CANDIDATE_POLICY_ROUND_ROBIN
+            # A scheduling pin is authoritative: the endpoint was selected within the requested
+            # instance above. Mark it as a single-candidate allocation so SchedulerServer validates
+            # it without globally re-ranking (load_balance would break the pin; smetric has no
+            # conductor cost cache on this path and would otherwise reject the allocation).
+            candidate_policy = CANDIDATE_POLICY_ROUND_ROBIN
             candidate_endpoints = [
                 _candidate_endpoint_payload(
                     instance.id,

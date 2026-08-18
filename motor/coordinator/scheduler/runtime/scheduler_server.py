@@ -1105,9 +1105,7 @@ class _SchedulerRequestDispatcher:
                 if best is None:
                     best = (instance, endpoint, cost)
                     continue
-                if cost < best[2] or (
-                    cost == best[2] and (instance.id, endpoint.id) < (best[0].id, best[1].id)
-                ):
+                if cost < best[2] or (cost == best[2] and (instance.id, endpoint.id) < (best[0].id, best[1].id)):
                     best = (instance, endpoint, cost)
         if best is None:
             return None

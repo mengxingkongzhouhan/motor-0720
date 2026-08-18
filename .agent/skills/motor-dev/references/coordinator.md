@@ -144,6 +144,8 @@ The policy is selected by `SchedulerType` (`config/coordinator.py`): `LOAD_BALAN
 
 Tunables live under `CoordinatorConfig.scheduler_config.kv_affinity`: `mode`, `load_weight`, `overlap_credit`, `prefill_load_scale`, `load_gate_topn`, `w_npu`, `w_cpu`, `w_disk`.
 
+After a real `/query` (prompts shorter than one `block_size` skip the HTTP call), both `KvCacheAffinityPolicy` and `SMetricPolicy` log `smetric: req_id=... isl=... conductor_rsp=...` (`isl` = prompt token count). Pair with EngineServer `vllm_cache_hit:` on the same `req_id`.
+
 ### Router Strategies (dynamic, by live topology)
 
 There is **no DeployMode → router class map**. `select_router_class()` (`router/dispatch.py`) decides the router per request from the live instance topology (roles currently online + dispatch compatibility):

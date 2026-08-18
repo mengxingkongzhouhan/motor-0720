@@ -13,6 +13,7 @@
 import unittest
 from unittest.mock import Mock, patch
 import json
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -833,6 +834,7 @@ class TestTokenizerManagerDsv4(unittest.TestCase):
 
         mock_req_info = Mock()
         mock_req_info.req_data = {"prompt": "hi"}
+        mock_req_info.req_id = "req-kva-log"
         mock_tokenizer = Mock()
         mock_tokenizer.encode.return_value = list(range(32))  # 32 tokens >= block_size (16)
         mock_tokenizer_manager.return_value = mock_tokenizer
@@ -844,6 +846,33 @@ class TestTokenizerManagerDsv4(unittest.TestCase):
         mock_query_conductor.assert_called_once()
         self.assertIsNotNone(result)
         self.assertEqual(result[1].id, 0)
+
+    @patch.object(KvCacheAffinityPolicy, '_conductor_block_size', return_value=16)
+    @patch('motor.coordinator.scheduler.policy.kv_cache_affinity.ConductorApiClient.query_conductor')
+    @patch('motor.coordinator.scheduler.policy.kv_cache_affinity.TokenizerManager')
+    def test_full_block_prompt_logs_conductor_rsp_with_isl(
+        self, mock_tokenizer_manager, mock_query_conductor, _mock_block_size
+    ):
+        """Queried conductor responses are logged with prompt token length (isl)."""
+        ep = _make_endpoint(0, active_tokens=100.0)
+        mock_instance = Mock()
+        mock_instance.id = "inst"
+        mock_instance.endpoints = {"group": {0: ep}}
+        mock_instance.get_all_endpoints.return_value = (ep,)
+        mock_req_info = Mock()
+        mock_req_info.req_data = {"prompt": "hi"}
+        mock_req_info.req_id = "req-kva-log"
+        mock_tokenizer = Mock()
+        mock_tokenizer.encode.return_value = list(range(32))
+        mock_tokenizer_manager.return_value = mock_tokenizer
+        mock_query_conductor.return_value = {TENANT_ID: {"vllm-prefill-inst": {"DP": {"0": 16}}}}
+
+        with self.assertLogs("scheduler", level=logging.INFO) as captured:
+            KvCacheAffinityPolicy.select_endpoint_from_list([mock_instance], mock_req_info)
+
+        self.assertTrue(
+            any("smetric: req_id=req-kva-log isl=32 conductor_rsp=" in line for line in captured.output)
+        )
 
     @staticmethod
     def _three_endpoint_instance():

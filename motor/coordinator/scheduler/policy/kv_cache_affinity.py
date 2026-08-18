@@ -22,7 +22,7 @@ from motor.config.coordinator import (
     KV_AFFINITY_MODE_UNIFIED,
 )
 from motor.common.logger import get_logger
-from motor.coordinator.models.constants import OpenAIField
+from motor.coordinator.models.constants import DEFAULT_REQUEST_ID, OpenAIField
 from motor.coordinator.models.request import RequestInfo
 from motor.coordinator.api_client.conductor_api_client import (
     ConductorApiClient,
@@ -111,9 +111,10 @@ class KvCacheAffinityPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         :returns: best-first ``[(instance, endpoint, score), ...]`` or ``None`` to fall back.
         """
         encoded_ids = KvCacheAffinityPolicy._ensure_token_ids(req_info)
+        isl = len(encoded_ids)
 
         block_size = KvCacheAffinityPolicy._conductor_block_size()
-        if block_size > 0 and len(encoded_ids) < block_size:
+        if block_size > 0 and isl < block_size:
             # Sub-block prompt: the indexer hashes only whole blocks, so a query can only ever
             # report a zero match. Skip the blocking HTTP round-trip and rank against an all-zero
             # match map -- identical to what the conductor would return for this prompt, but
@@ -121,6 +122,15 @@ class KvCacheAffinityPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
             tenant = {conductor_instance_id(inst): {"DP": {}} for inst in instances}
         else:
             rsp = ConductorApiClient.query_conductor(instances, encoded_ids)
+            req_id = getattr(req_info, "req_id", None)
+            if not isinstance(req_id, str) or not req_id:
+                req_id = DEFAULT_REQUEST_ID
+            logger.info(
+                "smetric: req_id=%s isl=%s conductor_rsp=%s",
+                req_id,
+                isl,
+                rsp,
+            )
             tenant = rsp.get(TENANT_ID, None)
             if tenant is None:
                 logger.warning(

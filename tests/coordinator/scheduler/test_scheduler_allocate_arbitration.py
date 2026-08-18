@@ -905,9 +905,7 @@ async def test_allocate_only_smetric_low_ratio_picks_min_ledger_prefill_cost():
 
     scheduler = Scheduler(instance_provider=instance_manager, config=config)
     workload_writer = _DummyWorkloadWriter()
-    dispatcher = _SchedulerRequestDispatcher(
-        instance_manager, scheduler, config, workload_writer=workload_writer
-    )
+    dispatcher = _SchedulerRequestDispatcher(instance_manager, scheduler, config, workload_writer=workload_writer)
     request = SchedulerRequest(
         request_type=SchedulerRequestType.ALLOCATE_ONLY,
         request_id="alloc-smetric-low-ratio",
@@ -961,9 +959,7 @@ async def test_allocate_only_smetric_average_is_shared_across_requests():
 
     scheduler = Scheduler(instance_provider=instance_manager, config=config)
     workload_writer = _DummyWorkloadWriter()
-    dispatcher = _SchedulerRequestDispatcher(
-        instance_manager, scheduler, config, workload_writer=workload_writer
-    )
+    dispatcher = _SchedulerRequestDispatcher(instance_manager, scheduler, config, workload_writer=workload_writer)
 
     first = SchedulerRequest(
         request_type=SchedulerRequestType.ALLOCATE_ONLY,
@@ -1030,9 +1026,7 @@ async def test_allocate_only_smetric_fast_path_honors_worker_min_cost_top1():
 
     scheduler = Scheduler(instance_provider=instance_manager, config=config)
     workload_writer = _DummyWorkloadWriter()
-    dispatcher = _SchedulerRequestDispatcher(
-        instance_manager, scheduler, config, workload_writer=workload_writer
-    )
+    dispatcher = _SchedulerRequestDispatcher(instance_manager, scheduler, config, workload_writer=workload_writer)
     request = SchedulerRequest(
         request_type=SchedulerRequestType.ALLOCATE_ONLY,
         request_id="alloc-smetric-fast-sm",
@@ -1082,9 +1076,7 @@ async def test_allocate_only_smetric_matching_sequence_still_picks_min_ledger_wh
 
     scheduler = Scheduler(instance_provider=instance_manager, config=config)
     workload_writer = _DummyWorkloadWriter()
-    dispatcher = _SchedulerRequestDispatcher(
-        instance_manager, scheduler, config, workload_writer=workload_writer
-    )
+    dispatcher = _SchedulerRequestDispatcher(instance_manager, scheduler, config, workload_writer=workload_writer)
     request = SchedulerRequest(
         request_type=SchedulerRequestType.ALLOCATE_ONLY,
         request_id="alloc-smetric-fast-ledger",
@@ -1119,4 +1111,3 @@ async def test_allocate_only_smetric_matching_sequence_still_picks_min_ledger_wh
     _, skipped = await instance_manager.get_endpoint_workload(2, 20)
     assert skipped.active_tokens == 50
     assert skipped.prefill_cost == 40
-

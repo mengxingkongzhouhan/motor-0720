@@ -10,15 +10,16 @@
 
 """Tests for KvCacheAffinity"""
 
-import unittest
-from unittest.mock import Mock, patch
 import json
 import logging
 import os
 import tempfile
-from pathlib import Path
-import pytest
+import unittest
 from copy import deepcopy
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+import pytest
 
 from motor.common.resources.instance import PDRole
 from motor.coordinator.scheduler.policy.kv_cache_affinity import KvCacheAffinityPolicy, TokenizerManager
@@ -870,9 +871,7 @@ class TestTokenizerManagerDsv4(unittest.TestCase):
         with self.assertLogs("scheduler", level=logging.INFO) as captured:
             KvCacheAffinityPolicy.select_endpoint_from_list([mock_instance], mock_req_info)
 
-        self.assertTrue(
-            any("smetric: req_id=req-kva-log isl=32 conductor_rsp=" in line for line in captured.output)
-        )
+        self.assertTrue(any("smetric: req_id=req-kva-log isl=32 conductor_rsp=" in line for line in captured.output))
 
     @staticmethod
     def _three_endpoint_instance():

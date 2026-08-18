@@ -219,8 +219,9 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         isl = len(encoded_ids)
         rsp = ConductorApiClient.query_conductor(instances, encoded_ids)
         logger.info(
-            "smetric: req_id=%s conductor_rsp=%s",
+            "smetric: req_id=%s isl=%s conductor_rsp=%s",
             getattr(req_info, "req_id", None) or DEFAULT_REQUEST_ID,
+            isl,
             rsp,
         )
         tenant = rsp.get(TENANT_ID, None) if isinstance(rsp, dict) else None

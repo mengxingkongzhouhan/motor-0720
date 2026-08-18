@@ -82,7 +82,7 @@ CoordinatorDaemon (parent process, async main loop)
 ``` text
 Offset  Size   Field
 0       4B     magic              = 0x574B4C44 ("WKLD")
-4       2B     schema_version     — fixed SCHEMA_VERSION=3 (layout compatibility)
+4       2B     schema_version     — fixed SCHEMA_VERSION=4 (layout compatibility)
 6       2B     (padding)
 8       8B     sequence           — seqlock write counter, bumped on every write
 16      4B     entry_count        — number of valid entries
@@ -125,7 +125,7 @@ Located in `scheduler/policy/`, each policy implements `BaseSchedulingPolicy`:
 | `RoundRobinPolicy` | Simple atomic counter, mod endpoint count | Uniform workload, no KV cache locality |
 | `LoadBalancePolicy` | Reads workload SHM, picks endpoint with minimum active tokens | Heterogeneous workloads, varying request lengths |
 | `KvCacheAffinityPolicy` | Queries KV Conductor (via `ConductorApiClient`) for prefix match; prefers endpoints with cached blocks | High prefix reuse, PD disaggregation |
-| `SMetricPolicy` | Queries KV Conductor and ranks by remaining prefill cost; the central Scheduler gates request-cost ranking against its shared running average and endpoint ledger | Prefill routing driven by uncached prompt cost |
+| `SMetricPolicy` | Queries KV Conductor and ranks by remaining prefill cost; the central Scheduler gates request-cost ranking against its shared running average and the scored endpoints' ledgers | Prefill routing driven by uncached prompt cost |
 
 **Conductor `/query` wire encoding** (`ConductorApiClient.query_conductor`):
 `kv_conductor_config.query_encoding` (default `"msgpack"`) selects the wire

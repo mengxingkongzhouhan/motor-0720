@@ -24,7 +24,7 @@ from dataclasses import dataclass
 MAGIC = 0x574B4C44
 
 # Schema version for layout compatibility
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Role mapping: prefill=0, decode=1, hybrid=2, encode=3
 ROLE_PREFILL = 0

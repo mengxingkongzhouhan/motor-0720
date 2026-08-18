@@ -1110,3 +1110,78 @@ async def test_allocate_only_smetric_matching_sequence_still_picks_min_ledger_wh
     _, skipped = await instance_manager.get_endpoint_workload(2, 20)
     assert skipped.active_tokens == 50
     assert skipped.prefill_cost == 40
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_smetric_missing_costs_validates_worker_candidate():
+    """Malformed/legacy SMetric candidates must degrade instead of failing allocation."""
+    config, instance_manager = _smetric_allocate_dispatcher()
+    instance = _make_prefill_instance(1, (10, 11))
+    await instance_manager.refresh_instances(EventType.ADD, [instance])
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager,
+        Scheduler(instance_provider=instance_manager, config=config),
+        config,
+        workload_writer=_DummyWorkloadWriter(),
+    )
+    request = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-smetric-missing-costs",
+        data={
+            "instance_id": 1,
+            "endpoint_id": 10,
+            "candidates": [{"instance_id": 1, "endpoint_id": 10}],
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-smetric-missing-costs",
+            "workload_active_tokens": 3.0,
+            "candidate_policy": CANDIDATE_POLICY_SMETRIC,
+            "isl": 100,
+        },
+    )
+
+    response = await dispatcher.dispatch(request)
+
+    assert response.response_type == SchedulerResponseType.SUCCESS
+    assert response.data["instance"]["id"] == 1
+    assert response.data["endpoint"]["id"] == 10
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_smetric_dump_ignores_unscored_endpoints():
+    """The dump path cannot assign an unknown request cost to a newly discovered endpoint."""
+    config, instance_manager = _smetric_allocate_dispatcher()
+    unscored = _make_prefill_instance(1, (10, 11))
+    scored = _make_prefill_instance(2, (20, 21))
+    await instance_manager.refresh_instances(EventType.ADD, [unscored, scored])
+    await instance_manager.update_instance_workload(2, 20, Workload(prefill_cost=10))
+    await instance_manager.update_instance_workload(2, 21, Workload(prefill_cost=30))
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager,
+        Scheduler(instance_provider=instance_manager, config=config),
+        config,
+        workload_writer=_DummyWorkloadWriter(),
+    )
+    request = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-smetric-scored-only",
+        data={
+            "instance_id": 2,
+            "endpoint_id": 20,
+            "candidates": [
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 20},
+                {"instance_id": 2, "endpoint_id": 21, "prefill_cost": 40},
+            ],
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-smetric-scored-only",
+            "workload_active_tokens": 3.0,
+            "candidate_policy": CANDIDATE_POLICY_SMETRIC,
+            "isl": 100,
+        },
+    )
+
+    response = await dispatcher.dispatch(request)
+
+    assert response.data["instance"]["id"] == 2
+    assert response.data["endpoint"]["id"] == 20
+    _, untouched = await instance_manager.get_endpoint_workload(1, 10)
+    assert untouched.prefill_cost == 0

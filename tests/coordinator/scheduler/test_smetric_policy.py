@@ -21,7 +21,13 @@ from motor.config.coordinator import SchedulerType
 from motor.coordinator.api_client.conductor_api_client import TENANT_ID, conductor_instance_id
 from motor.coordinator.scheduler.policy.factory import create
 from motor.coordinator.scheduler.policy.kv_cache_affinity import KvCacheAffinityPolicy
-from motor.coordinator.scheduler.policy.smetric import SMetricPolicy, SMetricPrefillCostTracker, _prefill_cost
+from motor.coordinator.scheduler.policy.smetric import (
+    SMetricPolicy,
+    SMetricPrefillCostTracker,
+    _matched_tokens,
+    _prefill_cost,
+    _prompt_token_ids,
+)
 from motor.coordinator.scheduler.runtime.scheduler_client import (
     AsyncSchedulerClient,
     SchedulerClientConfig,
@@ -78,6 +84,20 @@ class TestPrefillCostFormula:
 
     def test_zero_isl(self):
         assert _prefill_cost(isl=0, matched_tokens=5) == 0
+
+    def test_negative_match_is_clamped(self):
+        assert _prefill_cost(isl=100, matched_tokens=-10) == 100
+
+    def test_dp_blocks_format_reads_matched_tokens(self):
+        assert _matched_tokens({"npu_blocks": 2, "matched_tokens": 64}) == 64
+
+    @patch("motor.coordinator.scheduler.policy.kv_cache_affinity.TokenizerManager")
+    def test_empty_cached_tokens_are_retokenized(self, mock_tokenizer_manager):
+        req_info = SimpleNamespace(token_ids=[], req_data={"prompt": "hello"})
+        mock_tokenizer_manager.return_value.encode.return_value = [1, 2, 3]
+
+        assert _prompt_token_ids(req_info) == [1, 2, 3]
+        assert req_info.token_ids == [1, 2, 3]
 
 
 class TestSMetricPrefillCostTracker:
@@ -181,6 +201,26 @@ class TestSMetricPolicyRanking:
 
         assert req_info.smetric_debug == {(3, 7): 15}
         assert req_info.kv_affinity_debug is None
+
+    @patch("motor.coordinator.scheduler.policy.smetric.ConductorApiClient.query_conductor")
+    def test_ranks_dp_blocks_conductor_response(self, mock_query):
+        inst = _instance(3, (7, 8))
+        req_info = _req_info(100)
+        mock_query.return_value = {
+            TENANT_ID: {
+                conductor_instance_id(inst): {
+                    "DP": {
+                        "7": {"npu_blocks": 2, "matched_tokens": 80},
+                        "8": {"npu_blocks": 1, "matched_tokens": 20},
+                    }
+                }
+            }
+        }
+
+        ranked = SMetricPolicy.select_endpoint_candidates_from_list([inst], req_info, top_k=2)
+
+        assert ranked is not None
+        assert [(ep.id, cost) for _instance, ep, cost in ranked] == [(7, 20.0), (8, 80.0)]
 
     @patch(
         "motor.coordinator.scheduler.policy.kv_cache_affinity.KvCacheAffinityPolicy.select_endpoint_candidates_from_list"

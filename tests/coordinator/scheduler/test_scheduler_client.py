@@ -453,6 +453,41 @@ class TestAsyncSchedulerClient:
         assert result is None or (isinstance(result, tuple) and len(result) == 3)
 
     @pytest.mark.asyncio
+    async def test_select_and_allocate_preserves_server_committed_prefill_cost(self):
+        """Release accounting must use the SchedulerServer's authoritative committed cost."""
+        endpoint = _make_endpoint(endpoint_id=10)
+        instance = _make_instance(
+            instance_id=1,
+            role="prefill",
+            endpoints={"pod1": {endpoint.id: endpoint}},
+        )
+        req_info = Mock(spec=RequestInfo)
+        req_info.req_id = "req-server-cost"
+        req_info.req_len = 100
+        req_info.req_data = {}
+        req_info.token_ids = list(range(100))
+        req_info.smetric_debug = None
+        req_info.kv_affinity_debug = {(instance.id, endpoint.id): (80, 0.0, 20.0)}
+        self._mock_send_request(
+            SchedulerResponseType.SUCCESS,
+            {
+                "instance": instance.model_dump(mode="json"),
+                "endpoint": endpoint.model_dump(mode="json"),
+                "committed_workload": Workload(active_tokens=20, prefill_cost=7).model_dump(mode="json"),
+            },
+        )
+
+        with patch.object(
+            self.client,
+            "_select_endpoint_candidates_with_policy",
+            return_value=([(instance, endpoint, 20.0)], "kv_cache_affinity"),
+        ):
+            result = await self.client.select_and_allocate(PDRole.ROLE_P, req_info)
+
+        assert result is not None
+        assert result[2].prefill_cost == 7
+
+    @pytest.mark.asyncio
     async def test_select_and_allocate_no_selection(self):
         """select_and_allocate returns None when no instance/endpoint available."""
         # Setup no instances in cache and transport returns empty

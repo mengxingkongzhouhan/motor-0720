@@ -48,3 +48,4 @@
 | 日期 | 模块 | 案例 | 文件 | 关键词 |
 |------|------|------|------|--------|
 | 2026-08-18 | coordinator | 固定实例分配被全局策略重选或拒绝 | `coordinator/pinned-allocation-reranked.md` | scheduling pin, target_instance_id, smetric, load_balance |
+| 2026-08-18 | coordinator | SMetric 协议不兼容导致错误路由或空分配 | `coordinator/smetric-protocol-guards.md` | smetric, DpBlocks, prefill_cost, shared memory schema, topology SET |

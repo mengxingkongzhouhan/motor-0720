@@ -984,7 +984,7 @@ class AsyncSchedulerClient:
                     )
                 }
                 if normalized_engine_type
-                else None
+                else set()
             )
             if candidate_policy == CANDIDATE_POLICY_SMETRIC and isinstance(smetric_debug, dict):
                 candidate_endpoints = [
@@ -994,7 +994,7 @@ class AsyncSchedulerClient:
                         "prefill_cost": cost,
                     }
                     for (ins_id, ep_id), cost in smetric_debug.items()
-                    if allowed_instance_ids is None or ins_id in allowed_instance_ids
+                    if not normalized_engine_type or ins_id in allowed_instance_ids
                 ]
             elif global_affinity:
                 candidate_endpoints = [
@@ -1005,7 +1005,7 @@ class AsyncSchedulerClient:
                         "prefill_cost": rec[2],
                     }
                     for (ins_id, ep_id), rec in affinity_debug.items()
-                    if rec[2] is not None and (allowed_instance_ids is None or ins_id in allowed_instance_ids)
+                    if rec[2] is not None and (not normalized_engine_type or ins_id in allowed_instance_ids)
                 ]
             elif candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY and isinstance(affinity_debug, dict):
                 # load_gated: ranked set with matched_tokens and prefill_cost for ledger stamp.

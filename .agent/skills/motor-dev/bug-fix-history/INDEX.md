@@ -49,3 +49,4 @@
 |------|------|------|------|--------|
 | 2026-08-18 | coordinator | 固定实例分配被全局策略重选或拒绝 | `coordinator/pinned-allocation-reranked.md` | scheduling pin, target_instance_id, smetric, load_balance |
 | 2026-08-18 | coordinator | SMetric 协议不兼容导致错误路由或空分配 | `coordinator/smetric-protocol-guards.md` | smetric, DpBlocks, prefill_cost, shared memory schema, topology SET |
+| 2026-08-21 | coordinator | load_gated 候选被误当作 unified 全局重排 | `coordinator/load-gated-global-rerank.md` | kv_cache_affinity, load_gated, prefill_cost, global rerank |

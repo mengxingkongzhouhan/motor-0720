@@ -972,7 +972,7 @@ class _SchedulerRequestDispatcher:
             if selected is not None:
                 return selected
         if candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY:
-            if affinity_candidates:
+            if affinity_candidates and prefill_load_scale is not None:
                 selected = self._select_affinity_global(
                     affinity_candidates, role, prefill_load_scale, load_weight, required_engine_type
                 )

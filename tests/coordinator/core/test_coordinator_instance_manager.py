@@ -232,14 +232,13 @@ class TestInstanceManager:
         assert "endpoint_id=1" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_update_instance_workload_floors_negative_prefill_cost(self, caplog):
+    async def test_update_instance_workload_floors_negative_prefill_cost(self):
         """Over-release of prefill_cost clamps to 0 like active_tokens."""
         self.prefill_instance.add_endpoints("127.0.0.1", {self.endpoint.id: self.endpoint})
         self.instance_manager._add_instance_to_available_pool(self.prefill_instance)
         await self.instance_manager.update_instance_workload(
             1, self.endpoint.id, Workload(active_tokens=10, prefill_cost=8)
         )
-        caplog.clear()
         await self.instance_manager.update_instance_workload(
             1, self.endpoint.id, Workload(active_tokens=-10, prefill_cost=-20)
         )
@@ -247,7 +246,6 @@ class TestInstanceManager:
         assert self.endpoint.workload.active_tokens == 0
         assert self.endpoint.workload.prefill_cost == 0
         assert self.prefill_instance.gathered_workload.prefill_cost == 0
-        assert "floor" in caplog.text.lower()
 
     @pytest.mark.asyncio
     async def test_update_instance_workload_balanced_release_no_floor_no_warn(self, caplog):

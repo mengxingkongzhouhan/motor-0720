@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 # MindIE is licensed under Mulan PSL v2.
 # You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -18,7 +17,6 @@ from motor.coordinator.scheduler.policy.factory import (
     create,
     register,
     SchedulingPolicyFactory,
-    _REGISTRY,
 )
 from motor.config.coordinator import SchedulerType
 from motor.coordinator.scheduler.policy.base import BaseSchedulingPolicy
@@ -54,9 +52,7 @@ class TestPolicyFactory(unittest.TestCase):
 
     def test_scheduling_policy_factory_create(self):
         """SchedulingPolicyFactory.create delegates to the module-level create()."""
-        policy = SchedulingPolicyFactory.create(
-            SchedulerType.ROUND_ROBIN, MockInstanceProvider()
-        )
+        policy = SchedulingPolicyFactory.create(SchedulerType.ROUND_ROBIN, MockInstanceProvider())
         self.assertIsInstance(policy, RoundRobinPolicy)
 
     def test_register_custom_policy(self):

@@ -65,6 +65,13 @@ class RequestInfo(BaseModel):
         "scheduler's global fresh-load re-rank and logs matched/load for the committed endpoint. "
         "Keyed by (instance_id, endpoint_id) tuples, so excluded from serialization.",
     )
+    smetric_debug: dict | None = Field(
+        default=None,
+        exclude=True,
+        description="Per-endpoint prefill_cost cached by the smetric policy at selection; the "
+        "worker forwards every scored endpoint cost plus isl so the central Scheduler can "
+        "gate min-cost ranking vs min ledger prefill_cost. Keyed by (instance_id, endpoint_id).",
+    )
     api: str = Field(..., description="API need to be forwarded")
     entry_api: str = Field(
         default="",

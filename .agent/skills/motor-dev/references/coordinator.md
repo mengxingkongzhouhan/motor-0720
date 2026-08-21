@@ -82,7 +82,7 @@ CoordinatorDaemon (parent process, async main loop)
 ``` text
 Offset  Size   Field
 0       4B     magic              = 0x574B4C44 ("WKLD")
-4       2B     schema_version     — fixed SCHEMA_VERSION=2 (layout compatibility)
+4       2B     schema_version     — fixed SCHEMA_VERSION=4 (layout compatibility)
 6       2B     (padding)
 8       8B     sequence           — seqlock write counter, bumped on every write
 16      4B     entry_count        — number of valid entries
@@ -92,10 +92,10 @@ Offset  Size   Field
 40      8B     prefill_sequence   — per-role workload change counter
 48      8B     decode_sequence    — per-role workload change counter
 56      8B     hybrid_sequence    — per-role workload change counter
-64      N×32B  entries            — per-endpoint workload slots (max 10240)
+64      N×24B  entries            — per-endpoint workload slots (max 10240)
 ```
 
-Header is 64B, each entry 32B (`instance_id 4B, endpoint_id 4B, role 1B, padding 3B, active_tokens 8B, active_kv_cache 8B, padding 4B`), and entries start at offset 64. `sequence` follows seqlock semantics: odd = writer in progress, even = readers may accept the snapshot after a matching second header read. Readers additionally verify the three per-role sequences are unchanged across the read for consistency.
+Header is 64B, each entry is 24B (`instance_id 4B, endpoint_id 4B, role 1B, padding 3B, active_tokens 8B, prefill_cost 4B`), and entries start at offset 64. `sequence` follows seqlock semantics: odd = writer in progress, even = readers may accept the snapshot after a matching second header read. Readers additionally verify the three per-role sequences are unchanged across the read for consistency.
 
 **SHM name:** `mindie_workload_<scheduler_pid>` — includes PID for uniqueness and orphan detection.
 
@@ -125,6 +125,7 @@ Located in `scheduler/policy/`, each policy implements `BaseSchedulingPolicy`:
 | `RoundRobinPolicy` | Simple atomic counter, mod endpoint count | Uniform workload, no KV cache locality |
 | `LoadBalancePolicy` | Reads workload SHM, picks endpoint with minimum active tokens | Heterogeneous workloads, varying request lengths |
 | `KvCacheAffinityPolicy` | Queries KV Conductor (via `ConductorApiClient`) for prefix match; prefers endpoints with cached blocks | High prefix reuse, PD disaggregation |
+| `SMetricPolicy` | Queries KV Conductor and ranks by remaining prefill cost; the central Scheduler gates request-cost ranking against its shared running average and the scored endpoints' ledgers | Prefill routing driven by uncached prompt cost |
 
 **Conductor `/query` wire encoding** (`ConductorApiClient.query_conductor`):
 `kv_conductor_config.query_encoding` (default `"msgpack"`) selects the wire
@@ -136,7 +137,7 @@ kv-conductor binaries.<br>
 
 **Factory registration** (`factory.py`): `SchedulingPolicyFactory` maps policy name → class. New policies register here.
 
-The policy is selected by `SchedulerType` (`config/coordinator.py`): `LOAD_BALANCE` / `ROUND_ROBIN` / `KV_CACHE_AFFINITY` (default). For `scheduler_type=kv_cache_affinity`, a sub-mode is chosen by `kv_affinity.mode`:
+The policy is selected by `SchedulerType` (`config/coordinator.py`): `LOAD_BALANCE` / `ROUND_ROBIN` / `KV_CACHE_AFFINITY` (default) / `SMETRIC`. For `scheduler_type=kv_cache_affinity`, a sub-mode is chosen by `kv_affinity.mode`:
 
 - `unified` (default) — single score fusing affinity and live load; pick the minimum
 - `load_gated` — keep the N least-loaded endpoints, then pick the longest cached prefix

@@ -20,6 +20,7 @@ def create_mock_workload(active_tokens: float = 0.0) -> Mock:
     """Create a mock Workload with given values."""
     wl = Mock(spec=Workload)
     wl.active_tokens = active_tokens
+    wl.prefill_cost = 0.0
     wl.calculate_workload_score = Mock(return_value=active_tokens)
     return wl
 

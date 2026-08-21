@@ -58,6 +58,7 @@ def _make_prefill_instance(
     instance_id: int,
     endpoint_ids: tuple[int, int],
     role: PDRole = PDRole.ROLE_P,
+    engine_type: str | None = None,
 ) -> Instance:
     inst = Instance(
         job_name=f"{role.value}-{instance_id}",
@@ -66,6 +67,7 @@ def _make_prefill_instance(
         role=role,
         status=InsStatus.ACTIVE,
         parallel_config=ParallelConfig(dp_size=2),
+        engine_type=engine_type,
     )
     inst.add_endpoints(
         f"pod-{instance_id}",
@@ -879,6 +881,55 @@ async def test_allocate_only_smetric_picks_lowest_cost_ignoring_load():
     assert other_workload.prefill_cost == 0
     assert other_workload.active_tokens == 1
     assert workload_writer.writes == [(2, 20)]
+
+
+@pytest.mark.parametrize(
+    ("isl", "expected_endpoint_id"),
+    [
+        (20, 20),
+        (100, 20),
+    ],
+)
+@pytest.mark.asyncio
+async def test_allocate_only_smetric_respects_required_engine_type(isl, expected_endpoint_id):
+    """Both SMetric ranking and ledger fallback must exclude candidates from another engine."""
+    config, instance_manager = _smetric_allocate_dispatcher()
+    vllm = _make_prefill_instance(1, (10, 11), engine_type="vllm")
+    sglang = _make_prefill_instance(2, (20, 21), engine_type="sglang")
+    await instance_manager.refresh_instances(EventType.ADD, [vllm, sglang])
+    await instance_manager.update_instance_workload(1, 10, Workload(prefill_cost=0))
+    await instance_manager.update_instance_workload(2, 20, Workload(prefill_cost=10))
+
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager,
+        scheduler,
+        config,
+        workload_writer=_DummyWorkloadWriter(),
+    )
+    request = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id=f"alloc-smetric-engine-{isl}",
+        data={
+            "instance_id": 2,
+            "endpoint_id": 20,
+            "candidates": [
+                {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 12},
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 80},
+            ],
+            "role": PDRole.ROLE_P.value,
+            "required_engine_type": "sglang",
+            "workload_active_tokens": 3.0,
+            "candidate_policy": CANDIDATE_POLICY_SMETRIC,
+            "isl": isl,
+        },
+    )
+
+    response = await dispatcher.dispatch(request)
+
+    assert response.response_type == SchedulerResponseType.SUCCESS
+    assert response.data["instance"]["id"] == 2
+    assert response.data["endpoint"]["id"] == expected_endpoint_id
 
 
 def _smetric_allocate_dispatcher():

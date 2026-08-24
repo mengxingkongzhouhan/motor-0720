@@ -7,7 +7,7 @@
 # EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
-"""vLLM pod startup progress monitoring.
+"""Engine pod startup progress monitoring.
 
 Supports two output modes:
 
@@ -36,10 +36,7 @@ def _detect_cmd(name: str, fallback: str) -> str:
     return found if found else fallback
 
 
-ENCODE_TYPE = "utf-8"
 CMD_KUBECTL = _detect_cmd("kubectl", "/usr/bin/kubectl")
-CMD_AWK = _detect_cmd("awk", "/usr/bin/awk")
-CMD_GREP = _detect_cmd("grep", "/usr/bin/grep")
 
 PROGRESS_TOTAL = 100
 SAFETENSORS_WEIGHT = 2
@@ -48,10 +45,30 @@ DESCRIPTION_UPDATE_INTERVAL = 1.0
 SAFETENSORS_UPDATE_INTERVAL = 0.3
 PROCESS_TERMINATE_TIMEOUT = 5
 SEPARATOR_WIDTH = 80
+KUBECTL_QUERY_TIMEOUT = 30
+POD_STATUS_RUNNING = "Running"
+# How long to wait before printing a diagnostic instead of spinning silently
+POD_WAIT_DIAGNOSE_AFTER = 60.0
+# How often to repeat that diagnostic while still waiting
+POD_WAIT_DIAGNOSE_INTERVAL = 120.0
+
+# Engine pods are matched by their *role*, never by engine name: the workload
+# is named after ``engine_type`` (vllm / sglang / mindie-server) in
+# multi_deployment mode and after the InferServiceSet in CRD mode, so any
+# name-based match silently breaks for every engine but vLLM.
+#
+# multi_deployment: Deployment "{engine}-p0" → pod "{engine}-p0-{rs}-{pod}"
+ENGINE_DEPLOYMENT_POD_RE = re.compile(r"-[epdu]\d+-[0-9a-z]+-[0-9a-z]+$")
+# infer_service_set: the CRD embeds the role name in every child workload
+ENGINE_CRD_POD_RE = re.compile(r"(?:^|-)(?:prefill|decode|union|encode)(?:-|$)")
+# Control-plane roles that share the engine naming scheme in CRD mode
+CONTROL_PLANE_POD_RE = re.compile(r"(?:^|-)(?:controller|coordinator|kv-store|kv-conductor|mf-store)(?:-|$)")
 
 KEY_STEPS = {
     'NodeManagerAPI server is ready': 10,
+    # NodeManager launches "vllm serve" or "python3 -m sglang.launch_server"
     'vllm serve': 20,
+    'sglang.launch_server': 20,
     'Loading safetensors': 30,
     'Loading model weights': 80,
     'Graph capturing finished': 90,
@@ -170,7 +187,7 @@ class VLLMProgressMonitor:
         if self._use_tqdm:
             pbar = tqdm(
                 total=PROGRESS_TOTAL,
-                desc="vLLM start step",
+                desc="Engine start step",
                 unit="%",
                 bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
             )
@@ -285,47 +302,106 @@ class VLLMProgressMonitor:
 # ------------------------------------------------------------------
 
 
+def is_engine_pod(pod_name: str) -> bool:
+    """Return whether *pod_name* belongs to an engine (P / D / U / E) workload.
+
+    Works for every ``engine_type`` and for both deploy modes, because the
+    match is on the role token rather than on the engine name.
+    """
+    if CONTROL_PLANE_POD_RE.search(pod_name):
+        return False
+    return bool(ENGINE_DEPLOYMENT_POD_RE.search(pod_name) or ENGINE_CRD_POD_RE.search(pod_name))
+
+
+def shell_get_all_pods(name_space: str) -> list[tuple[str, str]] | None:
+    """Return ``(pod_name, status)`` for every pod in *name_space*.
+
+    Returns:
+        List of tuples, or ``None`` when the ``kubectl`` query fails.
+    """
+    try:
+        result = subprocess.run(
+            [CMD_KUBECTL, 'get', 'pods', '-n', name_space, '--no-headers'],
+            capture_output=True,
+            text=True,
+            timeout=KUBECTL_QUERY_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"shell_get_all_pods Exception: {e}")
+        return None
+    if result.returncode != 0:
+        return None
+
+    pods = []
+    # --no-headers columns: NAME READY STATUS RESTARTS AGE
+    for line in result.stdout.splitlines():
+        columns = line.split()
+        if len(columns) < 3:
+            continue
+        pods.append((columns[0], columns[2]))
+    return pods
+
+
+def shell_get_engine_pods(name_space: str) -> list[tuple[str, str]] | None:
+    """Return ``(pod_name, status)`` for the engine pods in *name_space*."""
+    pods = shell_get_all_pods(name_space)
+    if pods is None:
+        return None
+    return [(name, status) for name, status in pods if is_engine_pod(name)]
+
+
 def shell_get_pod(name_space: str):
-    """Get list of Running vLLM engine pods in *name_space*.
+    """Get list of Running engine pods in *name_space*.
 
     Returns:
         List of pod names, or ``None`` on error.
     """
-    try:
-        with (
-            subprocess.Popen(
-                [CMD_KUBECTL, 'get', 'pods', '-n', name_space],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            ) as kubectl_cmd,
-            subprocess.Popen(
-                [CMD_AWK, 'NR>1 && $3=="Running" {print $1}'],
-                stdin=kubectl_cmd.stdout,
-                stdout=subprocess.PIPE,
-            ) as awk_cmd,
-            subprocess.Popen(
-                [CMD_GREP, 'vllm-'],
-                stdin=awk_cmd.stdout,
-                stdout=subprocess.PIPE,
-            ) as grep_cmd,
-            subprocess.Popen(
-                [CMD_GREP, '-v', '-e', '-controller-', '-e', '-coordinator-', '-e', '-kv-'],
-                stdin=grep_cmd.stdout,
-                stdout=subprocess.PIPE,
-            ) as grep_v_cmd,
-        ):
-            output, _ = grep_v_cmd.communicate()
-            return output.decode(ENCODE_TYPE).strip().splitlines()
-    except Exception as e:
-        print(f"shell_get_pod Exception: {e}")
+    engine_pods = shell_get_engine_pods(name_space)
+    if engine_pods is None:
         return None
+    return [name for name, status in engine_pods if status == POD_STATUS_RUNNING]
 
 
-def update_log_display(len_list_pod: int, pod_num: int) -> None:
+def format_status_summary(engine_pods: list[tuple[str, str]]) -> str:
+    """Summarise non-Running engine pod statuses, e.g. ``Pending=20``."""
+    counts: dict[str, int] = {}
+    for _name, status in engine_pods:
+        if status == POD_STATUS_RUNNING:
+            continue
+        counts[status] = counts.get(status, 0) + 1
+    return " ".join(f"{status}={count}" for status, count in sorted(counts.items()))
+
+
+def update_log_display(len_list_pod: int, pod_num: int, summary: str = "") -> None:
     """Update the in-place log display with current pod waiting status."""
     sys.stdout.write('\033[2K\r')
     sys.stdout.write(f"  Waiting for pod running: [{len_list_pod}/{pod_num}]")
+    if summary:
+        sys.stdout.write(f"  {summary}")
     sys.stdout.flush()
+
+
+def print_wait_diagnosis(name_space: str, engine_pods: list[tuple[str, str]], pod_num: int) -> None:
+    """Explain why the wait is not progressing instead of spinning silently."""
+    sys.stdout.write("\n")
+    if engine_pods:
+        print(f"  Still waiting for {pod_num} engine pod(s) in namespace '{name_space}':")
+        for name, status in engine_pods:
+            print(f"    {name}  {status}")
+        print(f"  Inspect a stuck pod with: kubectl -n {name_space} describe pod <pod-name>")
+        return
+
+    all_pods = shell_get_all_pods(name_space)
+    print(f"  No engine pod exists in namespace '{name_space}' — the workload was never created.")
+    if all_pods:
+        print("  Pods currently in the namespace:")
+        for name, status in all_pods:
+            print(f"    {name}  {status}")
+    else:
+        print("  The namespace has no pods at all.")
+    print(f"  Check the rollout with: kubectl -n {name_space} get deploy,sts,inferserviceset")
+    print(f"  Check scheduling / admission errors with: kubectl -n {name_space} get events --sort-by=.lastTimestamp")
 
 
 # ------------------------------------------------------------------
@@ -336,19 +412,27 @@ def update_log_display(len_list_pod: int, pod_num: int) -> None:
 def start_monitor(name_space: str, pod_num: int) -> None:
     """Wait for pods to be ready, then start tqdm-based progress monitoring.
 
-    Continuously checks for Running vLLM pods until the expected count is
+    Continuously checks for Running engine pods until the expected count is
     reached, then uses :class:`VLLMProgressMonitor` in tqdm mode to display
-    per-pod startup progress.
+    per-pod startup progress.  Prints a diagnosis when the wait stalls, so a
+    failed rollout is visible instead of an endless ``[0/N]``.
     """
     print("━" * SEPARATOR_WIDTH)
+    list_pod: list[str] = []
+    started_at = time.monotonic()
+    next_diagnosis_at = started_at + POD_WAIT_DIAGNOSE_AFTER
     while True:
         time.sleep(1)
-        list_pod = shell_get_pod(name_space)
-        if list_pod is None:
+        engine_pods = shell_get_engine_pods(name_space)
+        if engine_pods is None:
             continue
-        update_log_display(len(list_pod), pod_num)
+        list_pod = [name for name, status in engine_pods if status == POD_STATUS_RUNNING]
+        update_log_display(len(list_pod), pod_num, format_status_summary(engine_pods))
         if len(list_pod) >= pod_num:
             break
+        if time.monotonic() >= next_diagnosis_at:
+            print_wait_diagnosis(name_space, engine_pods, pod_num)
+            next_diagnosis_at = time.monotonic() + POD_WAIT_DIAGNOSE_INTERVAL
 
     if not list_pod:
         print("No running vLLM pods found")

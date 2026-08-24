@@ -64,9 +64,23 @@ def load_yaml(input_yaml, single_doc):
 
 
 def exec_cmd(cmd):
-    """Execute command with a list of arguments (no shell)."""
-    logger.info(f"Executing command: {' '.join(cmd)}")
-    subprocess.run(cmd, capture_output=True, check=False)
+    """Execute command with a list of arguments (no shell).
+
+    Raises RuntimeError on a non-zero exit code: a failed ``kubectl apply``
+    must abort the deploy instead of letting it report success while no
+    workload was created.
+    """
+    printable_cmd = " ".join(cmd)
+    logger.info("Executing command: %s", printable_cmd)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if stdout:
+        logger.info(stdout)
+    if result.returncode != 0:
+        raise RuntimeError(f"Command failed (exit {result.returncode}): {printable_cmd}\n{stderr or stdout}")
+    if stderr:
+        logger.warning(stderr)
 
 
 def safe_exec_cmd(cmd):
@@ -74,7 +88,7 @@ def safe_exec_cmd(cmd):
     try:
         exec_cmd(cmd)
     except Exception as e:
-        logger.warning(f"Command execution failed: {e}")
+        logger.error("Command execution failed: %s", e)
         raise
 
 

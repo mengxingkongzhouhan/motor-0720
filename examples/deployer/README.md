@@ -27,6 +27,9 @@ MindIE Motor服务部署参数说明如下所示：
 | `--auto_log_collect` | - | 部署完成后自动启动日志采集 |
 | `--nostep` | - | 部署完成后不显示服务启动进度条 |
 
+> 进度条会等待 Engine Pod 全部进入 Running，等待期间显示各 Pod 状态统计（如 `Pending=20`）。
+> 若长时间没有进展，会自动打印停滞原因（Pod 状态清单，或提示 Engine 工作负载根本没有创建）与排查命令。
+
 Motor**配置文件自动生成**参数说明
 
 | 参数 | 简写 | 说明 |
@@ -62,7 +65,7 @@ python deploy.py
 - `Enter` 选中当前高亮项
 - 也可直接按菜单项的字母键（`[R]` `[P]` `[L]` `[U]` `[D]` `[Q]`）快速触发
 
-> 已部署状态下，进度监控（`P`）会自动发现 Running 的 vLLM Pod，通过尾随 `kubectl logs` 解析启动日志，在菜单下方绘制每个 Pod 的实时进度条，并展示 Pod 就绪状态（`kubectl get pods`）。
+> 已部署状态下，进度监控（`P`）会自动发现 Running 的 Engine Pod（按 P/D/U/E 角色识别，不依赖 `engine_type`），通过尾随 `kubectl logs` 解析启动日志，在菜单下方绘制每个 Pod 的实时进度条，并展示 Pod 就绪状态（`kubectl get pods`）。
 
 #### 方式一：指定配置目录（推荐）
 

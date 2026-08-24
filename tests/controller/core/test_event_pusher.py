@@ -327,6 +327,109 @@ def test_heartbeat_detector_failure(event_pusher):
                 assert len(warning_calls) >= 1
 
 
+def test_heartbeat_detector_isolated_failures_are_not_a_restart(event_pusher):
+    """Isolated heartbeat blips separated by successes must not look like a restart.
+
+    A transient DNS / connection failure is expected to recover on the next
+    poll.  Only *consecutive* losses mean the Coordinator went away, so a
+    success in between has to clear the streak.
+    """
+    # success, blip, success, success, blip, success — never two in a row
+    outcomes = [True, False, True, True, False, True]
+    call_count = 0
+
+    def mock_query_status(params: dict | None = None):
+        nonlocal call_count
+        if call_count >= len(outcomes):
+            raise StopIteration
+        succeeds = outcomes[call_count]
+        call_count += 1
+        if not succeeds:
+            raise RuntimeError("Failed to resolve coordinator service")
+        return {"ready": True}
+
+    iter_count = 0
+
+    def mock_wait(timeout=None):
+        nonlocal iter_count
+        iter_count += 1
+        if iter_count > len(outcomes):
+            raise StopIteration
+
+    with (
+        patch('motor.controller.core.event_pusher.CoordinatorApiClient.query_status', side_effect=mock_query_status),
+        patch('motor.controller.core.event_pusher.logger') as mock_logger,
+        patch.object(event_pusher.work_condition, 'wait', side_effect=mock_wait),
+    ):
+        try:
+            event_pusher._coordinator_heartbeat_detector()
+        except StopIteration:
+            pass
+
+    restart_warnings = [
+        call
+        for call in mock_logger.warning.call_args_list
+        if "Coordinator heartbeat lost. Possible restart detected" in str(call)
+    ]
+    assert not restart_warnings, f"Isolated blips reported a restart: {restart_warnings}"
+    assert not event_pusher.is_coordinator_reset
+
+    set_events = []
+    while not event_pusher.event_queue.empty():
+        evt = event_pusher.event_queue.get()
+        if evt.event_type == EventType.SET:
+            set_events.append(evt)
+    assert not set_events, "Isolated blips triggered a spurious full-instance SET resync"
+
+
+def test_heartbeat_detector_consecutive_failures_are_a_restart(event_pusher):
+    """Two heartbeat losses in a row still mean the Coordinator went away."""
+    outcomes = [True, False, False, True]
+    call_count = 0
+
+    def mock_query_status(params: dict | None = None):
+        nonlocal call_count
+        if call_count >= len(outcomes):
+            raise StopIteration
+        succeeds = outcomes[call_count]
+        call_count += 1
+        if not succeeds:
+            raise RuntimeError("Connection failed")
+        return {"ready": True}
+
+    iter_count = 0
+
+    def mock_wait(timeout=None):
+        nonlocal iter_count
+        iter_count += 1
+        if iter_count > len(outcomes):
+            raise StopIteration
+
+    with (
+        patch('motor.controller.core.event_pusher.CoordinatorApiClient.query_status', side_effect=mock_query_status),
+        patch('motor.controller.core.event_pusher.logger') as mock_logger,
+        patch.object(event_pusher.work_condition, 'wait', side_effect=mock_wait),
+    ):
+        try:
+            event_pusher._coordinator_heartbeat_detector()
+        except StopIteration:
+            pass
+
+    restart_warnings = [
+        call
+        for call in mock_logger.warning.call_args_list
+        if "Coordinator heartbeat lost. Possible restart detected" in str(call)
+    ]
+    assert len(restart_warnings) == 1
+
+    set_events = []
+    while not event_pusher.event_queue.empty():
+        evt = event_pusher.event_queue.get()
+        if evt.event_type == EventType.SET:
+            set_events.append(evt)
+    assert len(set_events) == 1
+
+
 def test_heartbeat_detector_ready_false_not_repeated(event_pusher):
     """SET event should only fire once when ready=False persists across iterations."""
     ready_values = [

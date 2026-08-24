@@ -219,7 +219,7 @@ class EventPusher(Observer):
         Detect Coordinator heartbeat, when Coordinator need Controller sent all
         instances resource, this function will produce a SET event.
         """
-        hb_loss_cnt = 0  # Consecutive heartbeat failures (path 2 debounce)
+        hb_loss_cnt = 0  # Consecutive heartbeat failures (path 2 debounce); reset by any success
         not_ready_log_interval = 12  # Only log "not ready" every 12 iterations
         not_ready_log_counter = 0
 
@@ -227,6 +227,10 @@ class EventPusher(Observer):
             try:
                 params = {"status": "normal"}
                 response = CoordinatorApiClient.query_status(params)
+                # A reachable Coordinator breaks the failure streak.  Without this
+                # reset the counter accumulates isolated blips (e.g. two transient
+                # DNS failures hours apart) into a bogus restart detection.
+                hb_loss_cnt = 0
                 # Mark that we've successfully connected to coordinator at least once
                 if not self.is_first_heartbeat_success:
                     self.is_first_heartbeat_success = True
@@ -256,7 +260,6 @@ class EventPusher(Observer):
                     event = Event(EventType.SET, None)
                     self.event_queue.put(event)
                     self.is_coordinator_reset = False
-                    hb_loss_cnt = 0
                     logger.debug("Controller will reset coordinator instance info.")
 
             except Exception as e:

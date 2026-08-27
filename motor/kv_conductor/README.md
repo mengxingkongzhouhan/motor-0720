@@ -257,7 +257,7 @@ Coordinator                                  KV Conductor
 
 | 端点 | 方法 | 用途 |
 |------|------|------|
-| `/register` | POST | 注册 Worker（`medium_endpoints`: `npu` / `cpu` / `disk`） |
+| `/register` | POST | 注册 Worker（`medium_endpoints`: `npu` / `cpu` / `disk`；可选 `node_id`） |
 | `/unregister` | POST | 注销 Worker |
 | `/query` | POST | 按 token_ids 查询各 Worker 命中 block 数 |
 | `/query_by_hash` | POST | 使用预计算 hash 查询 |
@@ -291,6 +291,45 @@ Coordinator 通过 `ConductorApiClient` 与 conductor 通信。`user_config.json
   }
 }
 ```
+
+### 节点拓扑（`node_id`,可选）
+
+`/register` 接受一个可选的 `node_id`，表示该 endpoint 跑在**哪台机器**上（K8s 的
+`status.hostIP`，或任何稳定的单机标识）。它与 `medium_endpoints` 里的 **Pod IP** 是两个
+不同层级——一台机器可以跑多个 Pod，每个 Pod 一个独立 Pod IP。
+
+带上之后 conductor 会维护两张表，可通过 `GET /workers` 的 `topology` 字段查看：
+
+```json
+{
+  "topology": {
+    "pod_to_node": {
+      "10.244.0.5": "node-1",
+      "10.244.0.6": "node-1",
+      "10.244.1.7": "node-2"
+    },
+    "node_to_dps": {
+      "node-1": [
+        {"pod_ip": "10.244.0.5", "instance_id": "vllm-prefill-1", "dp_rank": 0},
+        {"pod_ip": "10.244.0.5", "instance_id": "vllm-prefill-1", "dp_rank": 1},
+        {"pod_ip": "10.244.0.6", "instance_id": "vllm-prefill-2", "dp_rank": 0}
+      ],
+      "node-2": [
+        {"pod_ip": "10.244.1.7", "instance_id": "vllm-prefill-3", "dp_rank": 0}
+      ]
+    }
+  }
+}
+```
+
+写入时机跟随注册生命周期：`/register` 写入、`/unregister` 移除、后端类型变化的重注册
+先移除再写入。**没有轮询或刷新** —— Pod 与机器的绑定是静态的（Pod 不会迁移宿主机，
+重调度得到的是新 Pod、新 IP），所以每个 Pod 只在其注册时写一次。移除是精确的：Pod
+的最后一个 DP 离开时才会同时删掉 `pod_to_node` 与 `node_to_dps` 两级。
+
+**不带 `node_id` 时两张表为空**，其余行为完全不变——目前 Coordinator 尚未下发该字段
+（需要把机器标识从 NodeManager 经 Controller 透传到 Coordinator，见设计文档），所以这
+两张表当前仅供外部客户端与调试使用，**未接入任何匹配或打分逻辑**。
 
 `npu_endpoint` 必须与引擎 `--kv-events-config` 的 `endpoint` 一致（`tcp://*:5557` 为 vLLM 常用值）；
 模式中的 `*` 会被替换为 endpoint IP，端口会加上 `dp_rank`，conductor 主动 connect 到各引擎节点绑定的事件端口。

@@ -88,6 +88,63 @@ fn remove_hbm_ip_index_entries(
     }
 }
 
+/// Record `(pod_ip → node_id)` and `(node_id → dp)` for each NPU endpoint.
+///
+/// The Pod IP is taken from the same endpoint URL that feeds `hbm_ip_index`, so
+/// the two indexes are keyed consistently. No-op when the registration carries
+/// no `node_id`.
+fn add_node_topology_entries(
+    topology: &SharedNodeTopology,
+    node_id: Option<&str>,
+    medium_endpoints: &HashMap<String, String>,
+    instance_id: &str,
+    dp_rank: u32,
+) {
+    let Some(node_id) = node_id else {
+        return;
+    };
+    if node_id.is_empty() {
+        return;
+    }
+    for (medium_str, ep_url) in medium_endpoints {
+        if !StorageMedium::is_hbm_key(medium_str) {
+            continue;
+        }
+        let Some(ref pod_ip) = extract_ip_from_endpoint(ep_url) else {
+            continue;
+        };
+        topology
+            .write()
+            .record(pod_ip, node_id, instance_id, dp_rank);
+        tracing::info!(
+            instance_id = %instance_id, dp_rank, pod_ip = %pod_ip, node_id = %node_id,
+            "node topology recorded"
+        );
+    }
+}
+
+/// Mirror of [`add_node_topology_entries`] for unregistration.
+fn remove_node_topology_entries(
+    topology: &SharedNodeTopology,
+    medium_endpoints: &HashMap<String, String>,
+    instance_id: &str,
+    dp_rank: u32,
+) {
+    for (medium_str, ep_url) in medium_endpoints {
+        if !StorageMedium::is_hbm_key(medium_str) {
+            continue;
+        }
+        let Some(ref pod_ip) = extract_ip_from_endpoint(ep_url) else {
+            continue;
+        };
+        topology.write().forget(pod_ip, instance_id, dp_rank);
+        tracing::info!(
+            instance_id = %instance_id, dp_rank, pod_ip = %pod_ip,
+            "node topology removed"
+        );
+    }
+}
+
 /// Information about a registered endpoint for a worker.
 #[derive(Debug, Clone, Serialize)]
 pub struct EndpointInfo {
@@ -131,6 +188,9 @@ pub struct WorkerRegistry {
     /// Built from HBM endpoint registrations; consumed by the pool subscriber
     /// to map `backend_id` in events to the correct DP(s).
     hbm_ip_index: HbmIpIndex,
+    /// Pod IP → node, and node → DPs. Built from `node_id` in registrations;
+    /// empty when clients do not send it. Exposed via `GET /workers`.
+    node_topology: SharedNodeTopology,
 }
 
 impl WorkerRegistry {
@@ -185,6 +245,7 @@ impl WorkerRegistry {
             indexer: Arc::new(Indexer::with_config(config)),
             zmq_subscribers: tokio::sync::RwLock::new(HashMap::new()),
             hbm_ip_index: Arc::new(ParkingRwLock::new(HashMap::new())),
+            node_topology: Arc::new(ParkingRwLock::new(NodeTopology::default())),
         }
     }
 
@@ -262,6 +323,12 @@ impl WorkerRegistry {
                         &req.instance_id,
                         req.dp_rank,
                     );
+                    remove_node_topology_entries(
+                        &self.node_topology,
+                        &old_medium_endpoints,
+                        &req.instance_id,
+                        req.dp_rank,
+                    );
                 }
             }
         }
@@ -270,6 +337,19 @@ impl WorkerRegistry {
         if sb.index_hbm_ip() && !is_pool {
             add_hbm_ip_index_entries(
                 &self.hbm_ip_index,
+                &req.medium_endpoints,
+                &req.instance_id,
+                req.dp_rank,
+            );
+        }
+
+        // Node topology is backend-agnostic: it describes where the endpoint
+        // runs, not how its KV events are broadcast. Recorded for every HBM
+        // registration that carries a `node_id`.
+        if !is_pool {
+            add_node_topology_entries(
+                &self.node_topology,
+                req.node_id.as_deref(),
                 &req.medium_endpoints,
                 &req.instance_id,
                 req.dp_rank,
@@ -400,6 +480,12 @@ impl WorkerRegistry {
                 if let Some(info) = entry.endpoints.get(&req.dp_rank) {
                     remove_hbm_ip_index_entries(
                         &self.hbm_ip_index,
+                        &info.medium_endpoints,
+                        &req.instance_id,
+                        req.dp_rank,
+                    );
+                    remove_node_topology_entries(
+                        &self.node_topology,
                         &info.medium_endpoints,
                         &req.instance_id,
                         req.dp_rank,
@@ -583,6 +669,17 @@ impl WorkerRegistry {
         self.indexer.summary()
     }
 
+    /// Snapshot of the registration-derived node topology (debug endpoint).
+    pub fn node_topology_summary(&self) -> NodeTopologySummary {
+        self.node_topology.read().summary()
+    }
+
+    /// Shared handle to the node topology, for consumers that need to resolve
+    /// `pod_ip → node → DPs` (e.g. future node-scoped pool attribution).
+    pub fn node_topology(&self) -> &SharedNodeTopology {
+        &self.node_topology
+    }
+
     /// Access the underlying indexer (for advanced use).
     pub fn indexer(&self) -> &Arc<Indexer> {
         &self.indexer
@@ -658,5 +755,200 @@ mod tests {
         assert_eq!(extract_ip_from_endpoint("invalid"), None);
         assert_eq!(extract_ip_from_endpoint("tcp://"), None);
         assert_eq!(extract_ip_from_endpoint("tcp://[:5557"), None);
+    }
+
+    // ── Node topology ─────────────────────────────────────────────────
+
+    fn npu_endpoints(url: &str) -> HashMap<String, String> {
+        HashMap::from([("npu".to_string(), url.to_string())])
+    }
+
+    #[test]
+    fn test_topology_maps_pods_on_one_node_to_all_its_dps() {
+        // Two Pods on node-1, plus one Pod on node-2. Resolving by any Pod IP
+        // must yield every DP on that Pod's node, across Pods.
+        let topo: SharedNodeTopology = Arc::new(ParkingRwLock::new(NodeTopology::default()));
+
+        add_node_topology_entries(
+            &topo,
+            Some("node-1"),
+            &npu_endpoints("tcp://10.244.0.5:50090"),
+            "vllm-prefill-1",
+            0,
+        );
+        add_node_topology_entries(
+            &topo,
+            Some("node-1"),
+            &npu_endpoints("tcp://10.244.0.5:50091"),
+            "vllm-prefill-1",
+            1,
+        );
+        add_node_topology_entries(
+            &topo,
+            Some("node-1"),
+            &npu_endpoints("tcp://10.244.0.6:50090"),
+            "vllm-prefill-2",
+            0,
+        );
+        add_node_topology_entries(
+            &topo,
+            Some("node-2"),
+            &npu_endpoints("tcp://10.244.1.7:50090"),
+            "vllm-prefill-3",
+            0,
+        );
+
+        let t = topo.read();
+        assert_eq!(t.node_of("10.244.0.5"), Some("node-1"));
+        assert_eq!(t.node_of("10.244.0.6"), Some("node-1"));
+        assert_eq!(t.node_of("10.244.1.7"), Some("node-2"));
+        assert_eq!(t.node_of("10.244.9.9"), None);
+
+        // Both DPs of Pod .5 and the DP of Pod .6 share node-1.
+        let mut dps = t.dps_sharing_node_with("10.244.0.5");
+        dps.sort();
+        assert_eq!(
+            dps,
+            vec![
+                ("vllm-prefill-1".to_string(), 0),
+                ("vllm-prefill-1".to_string(), 1),
+                ("vllm-prefill-2".to_string(), 0),
+            ]
+        );
+        // Asking via the other Pod on the same node gives the same answer.
+        let mut via_other_pod = t.dps_sharing_node_with("10.244.0.6");
+        via_other_pod.sort();
+        assert_eq!(via_other_pod, dps);
+
+        // node-2 is separate.
+        assert_eq!(
+            t.dps_sharing_node_with("10.244.1.7"),
+            vec![("vllm-prefill-3".to_string(), 0)]
+        );
+    }
+
+    #[test]
+    fn test_topology_record_is_idempotent() {
+        let topo: SharedNodeTopology = Arc::new(ParkingRwLock::new(NodeTopology::default()));
+        for _ in 0..3 {
+            add_node_topology_entries(
+                &topo,
+                Some("node-1"),
+                &npu_endpoints("tcp://10.244.0.5:50090"),
+                "vllm-prefill-1",
+                0,
+            );
+        }
+        assert_eq!(topo.read().dps_sharing_node_with("10.244.0.5").len(), 1);
+    }
+
+    #[test]
+    fn test_topology_forget_keeps_pod_until_its_last_dp_leaves() {
+        // Pod .5 hosts two DPs. Removing one must keep the Pod→node entry so the
+        // remaining DP is still resolvable.
+        let topo: SharedNodeTopology = Arc::new(ParkingRwLock::new(NodeTopology::default()));
+        for dp in [0u32, 1u32] {
+            add_node_topology_entries(
+                &topo,
+                Some("node-1"),
+                &npu_endpoints("tcp://10.244.0.5:50090"),
+                "vllm-prefill-1",
+                dp,
+            );
+        }
+
+        remove_node_topology_entries(
+            &topo,
+            &npu_endpoints("tcp://10.244.0.5:50090"),
+            "vllm-prefill-1",
+            0,
+        );
+        {
+            let t = topo.read();
+            assert_eq!(t.node_of("10.244.0.5"), Some("node-1"), "Pod still has dp1");
+            assert_eq!(
+                t.dps_sharing_node_with("10.244.0.5"),
+                vec![("vllm-prefill-1".to_string(), 1)]
+            );
+        }
+
+        // Removing the last DP drops both levels.
+        remove_node_topology_entries(
+            &topo,
+            &npu_endpoints("tcp://10.244.0.5:50090"),
+            "vllm-prefill-1",
+            1,
+        );
+        let t = topo.read();
+        assert_eq!(t.node_of("10.244.0.5"), None);
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn test_topology_forget_one_pod_keeps_siblings_on_same_node() {
+        let topo: SharedNodeTopology = Arc::new(ParkingRwLock::new(NodeTopology::default()));
+        add_node_topology_entries(
+            &topo,
+            Some("node-1"),
+            &npu_endpoints("tcp://10.244.0.5:50090"),
+            "vllm-prefill-1",
+            0,
+        );
+        add_node_topology_entries(
+            &topo,
+            Some("node-1"),
+            &npu_endpoints("tcp://10.244.0.6:50090"),
+            "vllm-prefill-2",
+            0,
+        );
+
+        remove_node_topology_entries(
+            &topo,
+            &npu_endpoints("tcp://10.244.0.5:50090"),
+            "vllm-prefill-1",
+            0,
+        );
+
+        let t = topo.read();
+        assert_eq!(t.node_of("10.244.0.5"), None, "the removed Pod is gone");
+        assert_eq!(t.node_of("10.244.0.6"), Some("node-1"), "sibling survives");
+        assert_eq!(
+            t.dps_sharing_node_with("10.244.0.6"),
+            vec![("vllm-prefill-2".to_string(), 0)]
+        );
+    }
+
+    #[test]
+    fn test_topology_empty_without_node_id() {
+        // No `node_id` in the registration → no topology at all, so behaviour is
+        // unchanged for clients that do not send it.
+        let topo: SharedNodeTopology = Arc::new(ParkingRwLock::new(NodeTopology::default()));
+        add_node_topology_entries(
+            &topo,
+            None,
+            &npu_endpoints("tcp://10.244.0.5:50090"),
+            "vllm-prefill-1",
+            0,
+        );
+        add_node_topology_entries(
+            &topo,
+            Some(""),
+            &npu_endpoints("tcp://10.244.0.5:50090"),
+            "vllm-prefill-1",
+            0,
+        );
+        assert!(topo.read().is_empty());
+    }
+
+    #[test]
+    fn test_topology_ignores_non_hbm_endpoints() {
+        // Only the NPU endpoint carries the engine's own Pod IP; cpu/disk
+        // endpoints may point at a pool service elsewhere.
+        let topo: SharedNodeTopology = Arc::new(ParkingRwLock::new(NodeTopology::default()));
+        let mut eps = HashMap::new();
+        eps.insert("cpu".to_string(), "tcp://10.244.0.9:15558".to_string());
+        eps.insert("disk".to_string(), "tcp://10.244.0.9:15559".to_string());
+        add_node_topology_entries(&topo, Some("node-1"), &eps, "vllm-prefill-1", 0);
+        assert!(topo.read().is_empty());
     }
 }

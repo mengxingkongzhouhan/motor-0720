@@ -45,6 +45,125 @@ use crate::hashing::compute_block_hash_for_seq;
 /// the event is applied to every DP whose HBM endpoint resolves to that IP.
 pub type HbmIpIndex = Arc<ParkingRwLock<HashMap<String, Vec<(String, u32)>>>>;
 
+/// One DP registered on a node, tagged with the Pod it runs in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NodeDpEntry {
+    pub pod_ip: String,
+    pub instance_id: InstanceId,
+    pub dp_rank: DpRank,
+}
+
+/// Registration-derived cluster topology: which node each Pod runs on, and
+/// which DPs live on each node.
+///
+/// Two lookups, both fed by `/register`:
+///
+/// - `pod_to_node`: Pod IP → node identity (K8s `status.hostIP`, or whatever the
+///   client sends as `node_id`). A Pod never migrates hosts — a rescheduled Pod
+///   is a new Pod with a new IP — so an entry is written once per registration
+///   and only dropped on unregister. Nothing polls or refreshes it.
+/// - `node_to_dps`: node identity → the DPs on it. Each entry carries its Pod IP
+///   so removing a Pod's last DP can drop both levels precisely, without a
+///   separate reference count.
+///
+/// Both maps live behind one lock so a resolution (`pod_ip → node → dps`) can
+/// never observe a half-updated state.
+///
+/// Empty unless clients send `node_id`; the conductor never infers node identity
+/// on its own.
+#[derive(Debug, Default)]
+pub struct NodeTopology {
+    pod_to_node: HashMap<String, String>,
+    node_to_dps: HashMap<String, Vec<NodeDpEntry>>,
+}
+
+impl NodeTopology {
+    /// Record one DP. Idempotent: re-registering the same DP does not duplicate.
+    pub fn record(&mut self, pod_ip: &str, node_id: &str, instance_id: &str, dp_rank: DpRank) {
+        self.pod_to_node
+            .insert(pod_ip.to_string(), node_id.to_string());
+
+        let entry = NodeDpEntry {
+            pod_ip: pod_ip.to_string(),
+            instance_id: instance_id.to_string(),
+            dp_rank,
+        };
+        let dps = self.node_to_dps.entry(node_id.to_string()).or_default();
+        if !dps.contains(&entry) {
+            dps.push(entry);
+        }
+    }
+
+    /// Drop one DP, cleaning up the Pod and node keys once they are empty.
+    pub fn forget(&mut self, pod_ip: &str, instance_id: &str, dp_rank: DpRank) {
+        let Some(node_id) = self.pod_to_node.get(pod_ip).cloned() else {
+            return;
+        };
+
+        let mut pod_still_present = false;
+        if let Some(dps) = self.node_to_dps.get_mut(&node_id) {
+            dps.retain(|e| {
+                let is_target =
+                    e.pod_ip == pod_ip && e.instance_id == instance_id && e.dp_rank == dp_rank;
+                if !is_target && e.pod_ip == pod_ip {
+                    pod_still_present = true;
+                }
+                !is_target
+            });
+            if dps.is_empty() {
+                self.node_to_dps.remove(&node_id);
+            }
+        }
+
+        if !pod_still_present {
+            self.pod_to_node.remove(pod_ip);
+        }
+    }
+
+    /// Which node a Pod runs on.
+    pub fn node_of(&self, pod_ip: &str) -> Option<&str> {
+        self.pod_to_node.get(pod_ip).map(String::as_str)
+    }
+
+    /// Every `(instance_id, dp_rank)` on the node hosting `pod_ip`, across all
+    /// Pods on that node. Empty when the Pod's node is unknown.
+    pub fn dps_sharing_node_with(&self, pod_ip: &str) -> Vec<(InstanceId, DpRank)> {
+        let Some(node_id) = self.pod_to_node.get(pod_ip) else {
+            return Vec::new();
+        };
+        self.node_to_dps
+            .get(node_id)
+            .map(|dps| {
+                dps.iter()
+                    .map(|e| (e.instance_id.clone(), e.dp_rank))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pod_to_node.is_empty() && self.node_to_dps.is_empty()
+    }
+
+    /// Debug view for `GET /workers`.
+    pub fn summary(&self) -> NodeTopologySummary {
+        NodeTopologySummary {
+            pod_to_node: self.pod_to_node.clone(),
+            node_to_dps: self.node_to_dps.clone(),
+        }
+    }
+}
+
+/// Serializable snapshot of [`NodeTopology`] for the debug endpoint.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeTopologySummary {
+    pub pod_to_node: HashMap<String, String>,
+    pub node_to_dps: HashMap<String, Vec<NodeDpEntry>>,
+}
+
+/// Shared handle to the registration-derived topology.
+pub type SharedNodeTopology = Arc<ParkingRwLock<NodeTopology>>;
+
 // ---------------------------------------------------------------------------
 // Hash types
 // ---------------------------------------------------------------------------
@@ -194,6 +313,14 @@ pub struct RegisterRequest {
     pub replay_endpoint: Option<String>,
     #[serde(default = "default_tenant")]
     pub tenant_id: String,
+    /// Node (machine) this endpoint runs on — K8s `status.hostIP`, or any stable
+    /// per-machine identifier. Optional: when omitted the conductor records no
+    /// node topology for this endpoint and behaviour is unchanged.
+    ///
+    /// Distinct from the Pod IP carried inside `medium_endpoints`: one node hosts
+    /// many Pods, each with its own Pod IP.
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
 fn default_store_backend() -> String {

@@ -37,8 +37,9 @@ pub use indexer::Indexer;
 pub use protocols::{
     DpRank, HbmIpIndex, InstanceId, InstanceMatchData, KvCacheEvent, KvCacheEventData,
     KvCacheStoreData, KvCacheStoredBlockData, KvEventBatch, KvEventWirePayload, LocalBlockHash,
-    OverlapBlocks, QueryByHashRequest, QueryRequest, QueryResponse, RegisterRequest,
-    SequenceBlockHash, StorageMedium, UnregisterRequest, WorkerKey,
+    NodeDpEntry, NodeTopology, NodeTopologySummary, OverlapBlocks, QueryByHashRequest,
+    QueryRequest, QueryResponse, RegisterRequest, SequenceBlockHash, SharedNodeTopology,
+    StorageMedium, UnregisterRequest, WorkerKey,
 };
 pub use registry::WorkerRegistry;
 pub use server::create_router;

@@ -299,6 +299,46 @@ root 走查不依赖任何上层覆盖，所以「HBM 全被驱逐、池中保�
   时，使用**注册记录中的** model/tenant 回收空 `IndexerEntry`，不信任注销请求里的同名字段。
 - `POST /events` 的 `shutdown=true` 当前只记录日志，完整释放仍需显式调用 `/unregister`。
 
+### 节点拓扑：`pod_ip → node` 与 `node → dps`
+
+`/register` 的可选字段 `node_id` 表示该 endpoint 所在的**机器**（K8s `status.hostIP`，
+即 Pod 的宿主 Node）。注意与 `medium_endpoints` 里的 **Pod IP** 分属两个层级：
+
+```text
+  Node（一台机器，status.hostIP）
+   ├── Pod（status.podIP）── DP 0, DP 1 ...
+   └── Pod（另一个 podIP）── DP 0 ...
+```
+
+带上 `node_id` 后，`NodeTopology` 维护两张表（同一把锁，避免解析到半更新状态）：
+
+| 表 | 键 → 值 | 用途 |
+|----|---------|------|
+| `pod_to_node` | Pod IP → node 标识 | 把事件里的 `backend_id`（Pod IP）解析到机器 |
+| `node_to_dps` | node 标识 → `[{pod_ip, instance_id, dp_rank}]` | 拿到该机器上**跨 Pod** 的全部 DP |
+
+`dps_sharing_node_with(pod_ip)` 把两跳合成一次调用。
+
+**生命周期**：写入时机完全跟随注册——`/register` 写、`/unregister` 删、后端类型变化的
+重注册先删再写；**没有轮询也没有刷新**。因为 Pod 与机器的绑定是静态的（Pod 不迁移宿主机，
+重调度产生的是新 Pod、新 IP），所以每个 Pod 只在注册时写一次。`node_to_dps` 的条目携带
+自己的 `pod_ip`，因此不需要额外的引用计数就能精确判断"该 Pod 的最后一个 DP 是否已离开"，
+两级键一并回收。
+
+**只记录 HBM endpoint 的 IP**：`cpu` / `disk` endpoint 可能指向别处的池服务，其 IP 不是
+本引擎的 Pod IP。这也保证 `pod_to_node` 与 `hbm_ip_index` 的键来自同一处
+（`extract_ip_from_endpoint(medium_endpoints["npu"])`），两张索引对得上。
+
+**当前状态**：Coordinator **尚未下发** `node_id`，因此两张表默认为空、行为与之前完全一致；
+表也**尚未接入任何匹配或打分逻辑**，仅通过 `GET /workers` 的 `topology` 字段暴露，供外部
+客户端和排查使用。要让 Coordinator 填上这个字段，需要把机器标识从 NodeManager 经 Controller
+透传到 Coordinator——目前 `motor/` 里 `host_ip` 只在 `inventory_collector.py` 出现过一次
+且是硬编码空串，`NodeManagerInfo` 也只有 `pod_ip`，这条链路尚不存在。
+
+后续可能的用途：区分"本地池命中"（同 Pod / 同 Node，搬运便宜）与"远端池命中"（跨机，
+需走 `device_rdma` / `device_sdma` / `device_urma`），当前所有池命中都统一记作 `cpu_blocks`，
+无法体现搬运距离差异。是否值得做取决于本地与远端池命中的实测 TTFT 差距。
+
 ---
 
 ## 哈希设计

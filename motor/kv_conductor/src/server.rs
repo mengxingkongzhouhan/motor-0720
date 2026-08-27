@@ -382,9 +382,11 @@ async fn health_handler() -> &'static str {
 async fn workers_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let workers = state.registry.list_workers().await;
     let indexer = state.registry.indexer_summary();
+    let topology = state.registry.node_topology_summary();
 
     Json(serde_json::json!({
         "workers": workers,
         "indexer": indexer,
+        "topology": topology,
     }))
 }

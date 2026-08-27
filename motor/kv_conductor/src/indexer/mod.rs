@@ -41,7 +41,7 @@ use serde::Serialize;
 use crate::concurrent_tree::{ConcurrentRadixTree, PrefixMatch, WorkerLookup};
 use crate::error::KvConductorError;
 use crate::hashing::compute_block_hash_for_seq;
-use crate::lower_tier::{ContiguousHit, LowerTierIndexer};
+use crate::lower_tier::LowerTierIndexer;
 use crate::protocols::*;
 
 /// TTL for stale pending pool entries (60 seconds).
@@ -71,81 +71,20 @@ impl Default for CacheMaintenanceConfig {
     }
 }
 
-/// Per-DP absolute coverage ends (in blocks) on each storage medium, plus how
-/// the pooled part splits between this DP's own machine and elsewhere.
-///
-/// `*_local + *_remote` equals that tier's exclusive block count: the split is
-/// taken only over positions past the higher-priority media, which are already
-/// local in HBM and need no fetch.
+/// Per-DP absolute coverage ends (in blocks) on each storage medium.
 #[derive(Debug, Clone, Copy, Default)]
 struct MediumEnds {
     npu: u32,
     cpu: u32,
     disk: u32,
-    cpu_local: u32,
-    cpu_remote: u32,
-    disk_local: u32,
-    disk_remote: u32,
 }
 
-/// Per-medium `locality domain → number of root-walked blocks it holds`.
-pub type NodeHitCounts = FxHashMap<StorageMedium, FxHashMap<String, u32>>;
-
-/// The accumulators a matching pass writes into.
+/// The two accumulators a matching pass writes into.
 struct MatchSink<'a> {
     /// Per-worker block counts — diagnostics, plus the "any hit at all" gate.
     overlap: &'a mut OverlapBlocks,
     /// Per-DP absolute coverage ends; the actual source for the response.
     medium_ends: &'a mut FxHashMap<(String, DpRank), MediumEnds>,
-    /// Histogram over the shared root walk. The root walk is ownership-blind and
-    /// therefore identical for every DP, so per-DP local/remote counts cannot be
-    /// expressed for it once — the raw histogram lets a client answer
-    /// "how much of it is on node N" for any N.
-    root_node_hits: NodeHitCounts,
-}
-
-/// The lower tier being walked, and the medium its hits are attributed to.
-/// They always travel together.
-struct TierRef<'a> {
-    index: &'a LowerTierIndexer,
-    medium: StorageMedium,
-}
-
-/// One traced lower-tier walk: how far it reached, plus the locality domains
-/// holding each block along the way.
-struct TracedSpan {
-    hit: ContiguousHit,
-    /// `domains[i]` holds the block at absolute position `hit.start_pos + i`.
-    domains: Vec<FxHashSet<String>>,
-}
-
-impl TracedSpan {
-    /// Split the positions in `[exclusive_from, end)` into blocks held by
-    /// `my_domain` and blocks held only elsewhere.
-    ///
-    /// The range starts at `exclusive_from` — the end of the higher-priority
-    /// media — because blocks before it are already local in HBM and need no
-    /// fetch. That makes `local + remote` exactly the exclusive block count for
-    /// this tier.
-    fn split_local_remote(&self, exclusive_from: usize, my_domain: Option<&str>) -> (u32, u32) {
-        let start = exclusive_from.max(self.hit.start_pos);
-        let end = self.hit.end_pos();
-        let mut local = 0u32;
-        let mut remote = 0u32;
-        for pos in start..end {
-            let held_locally = my_domain.is_some_and(|domain| {
-                self.domains
-                    .get(pos - self.hit.start_pos)
-                    .is_some_and(|d| d.contains(domain))
-            });
-            if held_locally {
-                local += 1;
-            } else {
-                remote += 1;
-            }
-        }
-        (local, remote)
-    }
 }
 
 /// Upstream-tier match breakpoint used to continue into the next lower tier.
@@ -325,8 +264,7 @@ impl IndexerEntry {
     }
 
     pub fn find_matches_by_hash(&self, block_hashes: &[LocalBlockHash]) -> OverlapBlocks {
-        self.find_matches_with_coverage(block_hashes, &NodeTopology::default())
-            .0
+        self.find_matches_with_coverage(block_hashes).0
     }
 
     /// Query with per-DP absolute coverage ends per medium (in blocks).
@@ -334,19 +272,10 @@ impl IndexerEntry {
     /// Matching still records per-worker segment lengths in `OverlapBlocks`
     /// (for diagnostics / unit tests). Response assembly uses `MediumEnds`
     /// absolute ends, then exclusive-partitions them into `*_blocks`.
-    ///
-    /// `topology` supplies each DP's locality domain so pooled hits can be split
-    /// into local (cheap fetch) and remote (transfer cost). An empty topology
-    /// degrades gracefully: every domain is unknown, so nothing counts as local.
     fn find_matches_with_coverage(
         &self,
         block_hashes: &[LocalBlockHash],
-        topology: &NodeTopology,
-    ) -> (
-        OverlapBlocks,
-        FxHashMap<(String, DpRank), MediumEnds>,
-        NodeHitCounts,
-    ) {
+    ) -> (OverlapBlocks, FxHashMap<(String, DpRank), MediumEnds>) {
         let mut overlap = OverlapBlocks::default();
         let mut medium_ends: FxHashMap<(String, DpRank), MediumEnds> = FxHashMap::default();
 
@@ -384,12 +313,11 @@ impl IndexerEntry {
         // Pooled blocks are reachable from any DP, so a DP holding nothing of
         // its own can still serve a pooled prefix — every known DP must be
         // considered on the lower tiers, not just the ones owning edges.
-        let known_dps = self.known_dps(topology);
+        let known_dps = self.known_dps();
 
         let mut sink = MatchSink {
             overlap: &mut overlap,
             medium_ends: &mut medium_ends,
-            root_node_hits: NodeHitCounts::default(),
         };
 
         // 2) CPU: each DP resumes from its own HBM breakpoint (or from root
@@ -397,12 +325,9 @@ impl IndexerEntry {
         let cpu_breaks = self.lower_tier_lookup(
             block_hashes,
             &hbm_breaks,
-            TierRef {
-                index: &self.cpu_tiers,
-                medium: StorageMedium::Cpu,
-            },
+            &self.cpu_tiers,
+            StorageMedium::Cpu,
             &known_dps,
-            topology,
             &mut sink,
         );
 
@@ -412,27 +337,17 @@ impl IndexerEntry {
         self.lower_tier_lookup(
             block_hashes,
             &disk_breaks,
-            TierRef {
-                index: &self.disk_tiers,
-                medium: StorageMedium::Disk,
-            },
+            &self.disk_tiers,
+            StorageMedium::Disk,
             &known_dps,
-            topology,
             &mut sink,
         );
 
-        let root_node_hits = std::mem::take(&mut sink.root_node_hits);
-        (overlap, medium_ends, root_node_hits)
+        (overlap, medium_ends)
     }
 
-    /// Every `(instance_id, dp_rank)` this index has seen, plus every registered
-    /// DP from the topology.
-    ///
-    /// The topology is included because a DP can serve a pooled prefix while
-    /// holding nothing itself — reporting 0 for it would over-estimate its
-    /// prefill cost. Lower-tier owners are still folded in so the DP set stays
-    /// complete when no topology has been registered.
-    fn known_dps(&self, topology: &NodeTopology) -> FxHashSet<(String, DpRank)> {
+    /// Every `(instance_id, dp_rank)` this index has seen, across all media.
+    fn known_dps(&self) -> FxHashSet<(String, DpRank)> {
         let mut dps: FxHashSet<(String, DpRank)> = FxHashSet::default();
         for wk in self.lookups.read().keys() {
             dps.insert((wk.instance_id.clone(), wk.dp_rank));
@@ -442,9 +357,6 @@ impl IndexerEntry {
         }
         for wk in self.disk_tiers.worker_keys() {
             dps.insert((wk.instance_id, wk.dp_rank));
-        }
-        for (instance_id, dp_rank) in topology.registered_dps() {
-            dps.insert((instance_id.clone(), dp_rank));
         }
         dps
     }
@@ -470,34 +382,6 @@ impl IndexerEntry {
             StorageMedium::Disk => {
                 entry.disk = entry.disk.max(end);
             }
-        }
-    }
-
-    /// Record how a pooled tier's exclusive blocks split between this DP's own
-    /// machine and elsewhere. Only CPU and Disk can be fetched; NPU is always
-    /// local by definition and carries no split.
-    #[inline]
-    fn note_locality(
-        medium_ends: &mut FxHashMap<(String, DpRank), MediumEnds>,
-        instance_id: &str,
-        dp_rank: DpRank,
-        medium: StorageMedium,
-        local: u32,
-        remote: u32,
-    ) {
-        let entry = medium_ends
-            .entry((instance_id.to_string(), dp_rank))
-            .or_default();
-        match medium {
-            StorageMedium::Cpu => {
-                entry.cpu_local = local;
-                entry.cpu_remote = remote;
-            }
-            StorageMedium::Disk => {
-                entry.disk_local = local;
-                entry.disk_remote = remote;
-            }
-            StorageMedium::Npu | StorageMedium::Unknown => {}
         }
     }
 
@@ -554,30 +438,17 @@ impl IndexerEntry {
         &self,
         block_hashes: &[LocalBlockHash],
         upstream_breaks: &[TierBreakpoint],
-        tier: TierRef<'_>,
+        tiers: &LowerTierIndexer,
+        medium: StorageMedium,
         known_dps: &FxHashSet<(String, DpRank)>,
-        topology: &NodeTopology,
         sink: &mut MatchSink<'_>,
     ) -> Vec<TierBreakpoint> {
-        let TierRef {
-            index: tiers,
-            medium,
-        } = tier;
         if block_hashes.is_empty() || known_dps.is_empty() {
             return Vec::new();
         }
 
-        // Same for everyone — one walk, reused for every DP below. Its per-block
-        // owners feed both the shared histogram and each DP's local/remote split.
-        let root_span = Self::trace_span(tiers, block_hashes, 0, None, topology);
-        if let Some(span) = &root_span {
-            let counts = sink.root_node_hits.entry(medium).or_default();
-            for domains in &span.domains {
-                for domain in domains {
-                    *counts.entry(domain.clone()).or_insert(0) += 1;
-                }
-            }
-        }
+        // Same for everyone — one walk, reused for every DP below.
+        let root_hit = tiers.reachable_from(block_hashes, 0, None);
 
         // One breakpoint per DP, keeping the farthest.
         //
@@ -601,42 +472,29 @@ impl IndexerEntry {
 
         let mut breaks = Vec::new();
         for dp in known_dps {
-            let (instance_id, dp_rank) = dp;
+            let mut best = root_hit;
 
-            // Own breakpoint beats the shared root walk when it reaches further.
-            let mut best = root_span.as_ref();
-            let resumed = own_break.get(dp).and_then(|b| {
-                Self::trace_span(tiers, block_hashes, b.end_pos, Some(b.last_seq), topology)
-            });
-            if let Some(span) = &resumed {
-                let farther = match best {
-                    Some(current) => span.hit.end_pos() >= current.hit.end_pos(),
-                    None => true,
-                };
-                if farther {
-                    best = Some(span);
+            if let Some(b) = own_break.get(dp) {
+                let resumed = tiers.reachable_from(block_hashes, b.end_pos, Some(b.last_seq));
+                if let Some(hit) = resumed {
+                    let farther = match best {
+                        Some(current) => hit.end_pos() >= current.end_pos(),
+                        None => true,
+                    };
+                    if farther {
+                        best = Some(hit);
+                    }
                 }
             }
 
-            let Some(span) = best else {
+            let Some(hit) = best else {
                 continue;
             };
-            if span.hit.count == 0 {
+            if hit.count == 0 {
                 continue;
             }
 
-            // Blocks before this position are already covered by a
-            // higher-priority medium, so they need no fetch and are excluded
-            // from the local/remote split — which makes local + remote equal
-            // this tier's exclusive block count.
-            let ends = sink.medium_ends.get(dp).copied().unwrap_or_default();
-            let exclusive_from = match medium {
-                StorageMedium::Disk => ends.npu.max(ends.cpu),
-                _ => ends.npu,
-            } as usize;
-            let (local, remote) =
-                span.split_local_remote(exclusive_from, topology.node_of_dp(instance_id, *dp_rank));
-
+            let (instance_id, dp_rank) = dp;
             sink.overlap.add_blocks(
                 WorkerKey {
                     instance_id: instance_id.clone(),
@@ -644,63 +502,26 @@ impl IndexerEntry {
                     dp_rank: *dp_rank,
                     medium,
                 },
-                span.hit.count as u32,
+                hit.count as u32,
             );
             Self::note_medium_end(
                 sink.medium_ends,
                 instance_id,
                 *dp_rank,
                 medium,
-                span.hit.end_pos() as u32,
+                hit.end_pos() as u32,
             );
-            Self::note_locality(
-                sink.medium_ends,
-                instance_id,
-                *dp_rank,
-                medium,
-                local,
-                remote,
-            );
-            if let Some(last_seq) = span.hit.last_matched_hash {
+            if let Some(last_seq) = hit.last_matched_hash {
                 breaks.push(TierBreakpoint {
                     instance_id: instance_id.clone(),
                     dp_rank: *dp_rank,
-                    end_pos: span.hit.end_pos(),
+                    end_pos: hit.end_pos(),
                     last_seq,
                 });
             }
         }
 
         breaks
-    }
-
-    /// Walk one tier from `start_pos`, recording each block's locality domains.
-    ///
-    /// Owners are DPs; the topology maps each to the machine it runs on. A DP
-    /// with no registered location contributes no domain, so its blocks count as
-    /// remote — never as local, which would understate the fetch cost.
-    fn trace_span(
-        tiers: &LowerTierIndexer,
-        block_hashes: &[LocalBlockHash],
-        start_pos: usize,
-        start_parent: Option<SequenceBlockHash>,
-        topology: &NodeTopology,
-    ) -> Option<TracedSpan> {
-        let mut domains: Vec<FxHashSet<String>> = Vec::new();
-        let hit =
-            tiers.reachable_from_traced(block_hashes, start_pos, start_parent, |pos, owner| {
-                let slot = pos - start_pos;
-                if domains.len() <= slot {
-                    domains.resize_with(slot + 1, FxHashSet::default);
-                }
-                if let Some(domain) = topology.node_of_dp(&owner.instance_id, owner.dp_rank) {
-                    domains[slot].insert(domain.to_string());
-                }
-            })?;
-        // A traversed block with no located owner leaves an empty slot; pad so
-        // indexing by position stays valid for the whole span.
-        domains.resize_with(hit.count, FxHashSet::default);
-        Some(TracedSpan { hit, domains })
     }
 
     // -----------------------------------------------------------------------
@@ -1215,15 +1036,13 @@ impl Indexer {
     /// Query matched block counts for a token sequence against a specific model/tenant.
     ///
     /// `block_size` determines the token-to-hash granularity — it must match
-    /// the size used by the engine when publishing events. `topology` supplies
-    /// DP locations for the pooled local/remote split.
+    /// the size used by the engine when publishing events.
     pub fn query(
         &self,
         model_name: &str,
         tenant_id: &str,
         token_ids: &[i64],
         block_size: u32,
-        topology: &NodeTopology,
     ) -> Result<QueryResponse, KvConductorError> {
         let t0 = std::time::Instant::now();
 
@@ -1237,8 +1056,7 @@ impl Indexer {
         let t_hash = std::time::Instant::now();
         let block_hashes = compute_block_hash_for_seq(token_ids, block_size);
         let hash_us = t_hash.elapsed().as_micros();
-        let (overlap, medium_ends, root_node_hits) =
-            entry.find_matches_with_coverage(&block_hashes, topology);
+        let (overlap, medium_ends) = entry.find_matches_with_coverage(&block_hashes);
         tracing::debug!(
             num_tokens = token_ids.len(),
             block_size,
@@ -1249,25 +1067,13 @@ impl Indexer {
         );
         let t_tree = t0.elapsed();
 
-        let resp = self.build_response(
-            &overlap,
-            &medium_ends,
-            root_node_hits,
-            model_name,
-            tenant_id,
-            block_size,
-        );
+        let resp = self.build_response(&overlap, &medium_ends, model_name, tenant_id, block_size);
         let total = t0.elapsed();
 
         // Longest per-medium coverage across workers, in blocks.
         let npu_blocks = medium_ends.values().map(|m| m.npu).max().unwrap_or(0);
         let cpu_blocks = medium_ends.values().map(|m| m.cpu).max().unwrap_or(0);
         let disk_blocks = medium_ends.values().map(|m| m.disk).max().unwrap_or(0);
-        // Summed across DPs: how much of the pooled coverage is on the asking
-        // DP's own machine versus elsewhere. A large `cpu_remote` total means
-        // hits exist but every one of them costs a cross-machine transfer.
-        let cpu_local_blocks: u32 = medium_ends.values().map(|m| m.cpu_local).sum();
-        let cpu_remote_blocks: u32 = medium_ends.values().map(|m| m.cpu_remote).sum();
 
         tracing::debug!(
             num_tokens = token_ids.len(),
@@ -1278,8 +1084,6 @@ impl Indexer {
             npu_blocks,
             cpu_blocks,
             disk_blocks,
-            cpu_local_blocks,
-            cpu_remote_blocks,
             "query profile"
         );
         resp
@@ -1291,7 +1095,6 @@ impl Indexer {
         model_name: &str,
         tenant_id: &str,
         block_hashes: &[LocalBlockHash],
-        topology: &NodeTopology,
     ) -> Result<QueryResponse, KvConductorError> {
         let entry = self
             .get(model_name, tenant_id)
@@ -1300,31 +1103,21 @@ impl Indexer {
                 tenant_id: tenant_id.to_string(),
             })?;
 
-        let (overlap, medium_ends, root_node_hits) =
-            entry.find_matches_with_coverage(block_hashes, topology);
+        let (overlap, medium_ends) = entry.find_matches_with_coverage(block_hashes);
         // Default to 1 token per hash (no scaling) since we don't know the
         // original block_size from the hash alone.
-        self.build_response(
-            &overlap,
-            &medium_ends,
-            root_node_hits,
-            model_name,
-            tenant_id,
-            1,
-        )
+        self.build_response(&overlap, &medium_ends, model_name, tenant_id, 1)
     }
 
     /// Build a `QueryResponse` from per-DP absolute medium ends.
     ///
     /// `*_blocks` are exclusive contributions (priority NPU > CPU > Disk).
     /// `matched_tokens = (npu + cpu + disk) × block_size` (unweighted coverage;
-    /// Coordinator applies tier affinity weights). Pooled tiers additionally
-    /// carry the local/remote split, which sums to that tier's exclusive count.
+    /// Coordinator applies tier affinity weights).
     fn build_response(
         &self,
         overlap: &OverlapBlocks,
         medium_ends: &FxHashMap<(String, DpRank), MediumEnds>,
-        root_node_hits: NodeHitCounts,
         model_name: &str,
         tenant_id: &str,
         block_size: u32,
@@ -1351,10 +1144,6 @@ impl Indexer {
             dp_match.cpu_blocks = cpu;
             dp_match.disk_blocks = disk;
             dp_match.matched_tokens = covered.saturating_mul(block_size);
-            dp_match.cpu_local_blocks = ends.cpu_local;
-            dp_match.cpu_remote_blocks = ends.cpu_remote;
-            dp_match.disk_local_blocks = ends.disk_local;
-            dp_match.disk_remote_blocks = ends.disk_remote;
         }
 
         for imd in instance_data.values_mut() {
@@ -1362,18 +1151,9 @@ impl Indexer {
         }
 
         let mut response = QueryResponse::default();
-        response.tenants.insert(
-            tenant_id.to_string(),
-            TenantMatchData {
-                instances: instance_data,
-                root_node_hits: root_node_hits
-                    .into_iter()
-                    .map(|(medium, counts)| {
-                        (medium.log_str().to_string(), counts.into_iter().collect())
-                    })
-                    .collect(),
-            },
-        );
+        response
+            .tenants
+            .insert(tenant_id.to_string(), instance_data);
 
         Ok(response)
     }

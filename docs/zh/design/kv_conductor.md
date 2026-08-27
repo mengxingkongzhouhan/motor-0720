@@ -342,35 +342,9 @@ root 走查不依赖任何上层覆盖，所以「HBM 全被驱逐、池中保�
 透传到 Coordinator——目前 `motor/` 里 `host_ip` 只在 `inventory_collector.py` 出现过一次
 且是硬编码空串，`NodeManagerInfo` 也只有 `pod_ip`，这条链路尚不存在。
 
-### 池命中的本地/远端拆分与 root 直方图
-
-池块任意节点可取，但**搬运距离不同**：本机 DRAM 几乎免费，跨机要走
-`device_rdma` / `device_sdma` / `device_urma`。因此每个 DP 的池命中按块所在机器拆开。
-
-**per-DP 拆分**（`DpBlocks` 新增四个字段）：走查时逐块拿 owner，用 `dp_to_node` 把 owner
-映射到机器，与本 DP 的机器比较：
-
-```text
-  走查覆盖 [start, end)，拆分只统计 [exclusive_from, end)
-    exclusive_from = CPU 层取 npu_end；Disk 层取 max(npu_end, cpu_end)
-  之前的位置已被更高优先级介质本地覆盖，不需要搬运
-
-  => cpu_local_blocks + cpu_remote_blocks == cpu_blocks（不变式，有测试守护）
-```
-
-owner 位置未知时**算远端**——位置不明绝不能当作本地，否则低估搬运成本。
-
-**root 直方图**（`_root_node_hits`，tenant 级保留键）：root 走查从块 0 开始且忽略 owner，
-对所有 DP 结果相同、只计算一次，因此没有单一的 per-DP 拆分。改为返回原始直方图
-`medium → 机器 → 块数`，客户端可据此回答任意机器的本地占比。一块可被多台机器同时持有，
-所以各机器计数之和可以大于走查长度。
-
-实现上，`LowerTierIndexer::reachable_from_traced` 通过**回调**逐 owner 上报，
-`indexer` 侧在回调里映射成机器标识——owner 不被克隆，回调直接借用读锁下的引用。
-
-**注意**：Coordinator 尚未下发 `node_id`，此时 `node_id` 回退为 Pod IP，本地/远端退化为
-「同 Pod / 不同 Pod」。仍然有意义，只是检测不到同机跨 Pod 的共置。是否值得把这个信号接入
-打分（新增 `w_remote` 权重），取决于本地与远端池命中的实测 TTFT 差距。
+后续可能的用途：区分"本地池命中"（同 Pod / 同 Node，搬运便宜）与"远端池命中"（跨机，
+需走 `device_rdma` / `device_sdma` / `device_urma`），当前所有池命中都统一记作 `cpu_blocks`，
+无法体现搬运距离差异。是否值得做取决于本地与远端池命中的实测 TTFT 差距。
 
 ---
 

@@ -88,13 +88,11 @@ fn remove_hbm_ip_index_entries(
     }
 }
 
-/// Record where each NPU endpoint runs: `dp → {pod_ip, node_id}` and
-/// `pod_ip → node_id`.
+/// Record `(pod_ip → node_id)` and `(node_id → dp)` for each NPU endpoint.
 ///
 /// The Pod IP is taken from the same endpoint URL that feeds `hbm_ip_index`, so
-/// the two indexes are keyed consistently. Recorded for every HBM registration:
-/// without `node_id` the Pod IP stands in as the locality domain, which keeps the
-/// DP set complete and degrades locality to "same Pod".
+/// the two indexes are keyed consistently. No-op when the registration carries
+/// no `node_id`.
 fn add_node_topology_entries(
     topology: &SharedNodeTopology,
     node_id: Option<&str>,
@@ -102,6 +100,12 @@ fn add_node_topology_entries(
     instance_id: &str,
     dp_rank: u32,
 ) {
+    let Some(node_id) = node_id else {
+        return;
+    };
+    if node_id.is_empty() {
+        return;
+    }
     for (medium_str, ep_url) in medium_endpoints {
         if !StorageMedium::is_hbm_key(medium_str) {
             continue;
@@ -113,8 +117,7 @@ fn add_node_topology_entries(
             .write()
             .record(pod_ip, node_id, instance_id, dp_rank);
         tracing::info!(
-            instance_id = %instance_id, dp_rank, pod_ip = %pod_ip,
-            node_id = node_id.unwrap_or("<pod_ip fallback>"),
+            instance_id = %instance_id, dp_rank, pod_ip = %pod_ip, node_id = %node_id,
             "node topology recorded"
         );
     }
@@ -553,14 +556,8 @@ impl WorkerRegistry {
 
     /// Query KV cache overlap for a token sequence.
     pub async fn query(&self, req: &QueryRequest) -> Result<QueryResponse, KvConductorError> {
-        let topology = self.node_topology.read();
-        self.indexer.query(
-            &req.model,
-            &req.tenant_id,
-            &req.token_ids,
-            req.block_size,
-            &topology,
-        )
+        self.indexer
+            .query(&req.model, &req.tenant_id, &req.token_ids, req.block_size)
     }
 
     /// Query KV cache overlap using pre-computed block hashes.
@@ -573,9 +570,8 @@ impl WorkerRegistry {
             .iter()
             .map(|&h| LocalBlockHash(h))
             .collect();
-        let topology = self.node_topology.read();
         self.indexer
-            .query_by_hash(&req.model, &req.tenant_id, &hashes, &topology)
+            .query_by_hash(&req.model, &req.tenant_id, &hashes)
     }
 
     /// Apply a batch of KV cache events (engine-style, HTTP POST /events).
@@ -883,37 +879,25 @@ mod tests {
     }
 
     #[test]
-    fn test_topology_falls_back_to_pod_ip_without_node_id() {
-        // Without `node_id` the Pod IP stands in as the locality domain: the DP
-        // set stays complete and locality degrades to "same Pod" rather than
-        // disappearing. Two DPs in one Pod are co-located either way, so the
-        // fallback only under-reports co-location *across* Pods on one machine.
+    fn test_topology_empty_without_node_id() {
+        // No `node_id` in the registration → no topology at all, so behaviour is
+        // unchanged for clients that do not send it.
         let topo: SharedNodeTopology = Arc::new(ParkingRwLock::new(NodeTopology::default()));
-        for (node_id, url, dp) in [
-            (None, "tcp://10.244.0.5:50090", 0u32),
-            (Some(""), "tcp://10.244.0.5:50091", 1),
-        ] {
-            add_node_topology_entries(&topo, node_id, &npu_endpoints(url), "vllm-prefill-1", dp);
-        }
-        // A different Pod, also without a node_id.
         add_node_topology_entries(
             &topo,
             None,
-            &npu_endpoints("tcp://10.244.0.6:50090"),
-            "vllm-prefill-2",
+            &npu_endpoints("tcp://10.244.0.5:50090"),
+            "vllm-prefill-1",
             0,
         );
-
-        let t = topo.read();
-        assert!(!t.is_empty(), "DPs are still tracked");
-        assert_eq!(t.node_of_dp("vllm-prefill-1", 0), Some("10.244.0.5"));
-        assert_eq!(t.node_of_dp("vllm-prefill-1", 1), Some("10.244.0.5"));
-        assert_eq!(t.node_of_dp("vllm-prefill-2", 0), Some("10.244.0.6"));
-
-        // Same Pod still resolves as co-located...
-        assert!(t.same_node(("vllm-prefill-1", 0), ("vllm-prefill-1", 1)));
-        // ...while same-machine-different-Pod cannot be detected without node_id.
-        assert!(!t.same_node(("vllm-prefill-1", 0), ("vllm-prefill-2", 0)));
+        add_node_topology_entries(
+            &topo,
+            Some(""),
+            &npu_endpoints("tcp://10.244.0.5:50090"),
+            "vllm-prefill-1",
+            0,
+        );
+        assert!(topo.read().is_empty());
     }
 
     #[test]

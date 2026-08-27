@@ -10,25 +10,6 @@
 
 use super::*;
 
-/// `Indexer::query` with an empty topology: no DP locations are registered, so
-/// nothing counts as pool-local. Tests that exercise locality build their own
-/// topology and call `Indexer::query` directly.
-fn query_default(
-    indexer: &Indexer,
-    model_name: &str,
-    tenant_id: &str,
-    token_ids: &[i64],
-    block_size: u32,
-) -> Result<QueryResponse, KvConductorError> {
-    indexer.query(
-        model_name,
-        tenant_id,
-        token_ids,
-        block_size,
-        &NodeTopology::default(),
-    )
-}
-
 #[test]
 fn test_indexer_get_or_create_and_query() {
     let indexer = Indexer::new();
@@ -59,7 +40,7 @@ fn test_indexer_get_or_create_and_query() {
     entry.apply_event(&wk_npu, &store).unwrap();
 
     // Query with the same tokens
-    let resp = query_default(&indexer, "model-a", "tenant-1", &tokens, 4).unwrap();
+    let resp = indexer.query("model-a", "tenant-1", &tokens, 4).unwrap();
     let tenant = &resp.tenants["tenant-1"];
     let imd = &tenant["inst-1"];
     let dp0 = &imd.dp["0"];
@@ -127,7 +108,7 @@ fn test_per_tier_aggregation() {
         .unwrap();
 
     // Query with tokens_a — should match inst-1 (NPU) only
-    let resp = query_default(&indexer, "model-b", "t1", &tokens_a, 4).unwrap();
+    let resp = indexer.query("model-b", "t1", &tokens_a, 4).unwrap();
     let tenant = &resp.tenants["t1"];
 
     let imd1 = &tenant["inst-1"];
@@ -139,7 +120,7 @@ fn test_per_tier_aggregation() {
     assert_eq!(dp0.cpu_blocks, 0, "inst-1 should have no CPU match");
 
     // Query with tokens_b — should match inst-2 (CPU) only
-    let resp = query_default(&indexer, "model-b", "t1", &tokens_b, 4).unwrap();
+    let resp = indexer.query("model-b", "t1", &tokens_b, 4).unwrap();
     let tenant = &resp.tenants["t1"];
 
     let imd2 = &tenant["inst-2"];
@@ -230,7 +211,7 @@ fn test_cpu_continuation_from_hbm_breakpoint() {
     );
 
     // Exclusive: npu=2, cpu=1; default weights 1/1/0 → matched = 3 blocks.
-    let resp = query_default(&indexer, "model-c", "t1", &tokens, 4).unwrap();
+    let resp = indexer.query("model-c", "t1", &tokens, 4).unwrap();
     let dp0 = &resp.tenants["t1"]["inst-1"].dp["0"];
     assert_eq!(dp0.npu_blocks, 2);
     assert_eq!(dp0.cpu_blocks, 1);
@@ -289,7 +270,7 @@ fn test_cpu_replica_reported_when_hbm_hits_same_dp() {
         )
         .unwrap();
 
-    let resp = query_default(&indexer, "model-d", "t1", &tokens, 4).unwrap();
+    let resp = indexer.query("model-d", "t1", &tokens, 4).unwrap();
     let dp0 = &resp.tenants["t1"]["inst-1"].dp["0"];
     assert_eq!(dp0.npu_blocks, 1);
     // Same-prefix CPU replica is exclusive-attributed to NPU.
@@ -325,7 +306,7 @@ fn test_cpu_root_used_when_no_hbm_on_dp() {
         )
         .unwrap();
 
-    let resp = query_default(&indexer, "model-e", "t1", &tokens, 4).unwrap();
+    let resp = indexer.query("model-e", "t1", &tokens, 4).unwrap();
     let dp0 = &resp.tenants["t1"]["inst-cpu-only"].dp["0"];
     assert_eq!(dp0.npu_blocks, 0);
     assert_eq!(dp0.cpu_blocks, 1);
@@ -404,7 +385,7 @@ fn test_disk_continuation_from_cpu_breakpoint() {
         )
         .unwrap();
 
-    let resp = query_default(&indexer, "model-f", "t1", &tokens, 4).unwrap();
+    let resp = indexer.query("model-f", "t1", &tokens, 4).unwrap();
     let dp0 = &resp.tenants["t1"]["inst-1"].dp["0"];
     assert_eq!(dp0.npu_blocks, 1);
     assert_eq!(dp0.cpu_blocks, 1);
@@ -501,7 +482,7 @@ fn test_overlapping_npu_cpu_disk_replicas_do_not_inflate_matched_tokens() {
         )
         .unwrap();
 
-    let resp = query_default(&indexer, "model-overlap", "t1", &tokens, 4).unwrap();
+    let resp = indexer.query("model-overlap", "t1", &tokens, 4).unwrap();
     let dp0 = &resp.tenants["t1"]["inst-1"].dp["0"];
     assert_eq!(dp0.npu_blocks, 2);
     assert_eq!(dp0.cpu_blocks, 0);
@@ -593,7 +574,9 @@ fn test_shorter_hbm_breakpoint_does_not_overcount_cpu_overlap() {
         )
         .unwrap();
 
-    let resp = query_default(&indexer, "model-short-break", "t1", &tokens, 4).unwrap();
+    let resp = indexer
+        .query("model-short-break", "t1", &tokens, 4)
+        .unwrap();
     let dp0 = &resp.tenants["t1"]["inst-1"].dp["0"];
     assert_eq!(dp0.npu_blocks, 2);
     // CPU continuation ends at the same absolute position as the longer NPU
@@ -665,7 +648,9 @@ fn test_hbm_breakpoint_not_shared_across_instances() {
         )
         .unwrap();
 
-    let resp = query_default(&indexer, "model-break-scope", "t1", &tokens, 4).unwrap();
+    let resp = indexer
+        .query("model-break-scope", "t1", &tokens, 4)
+        .unwrap();
     let tenant = &resp.tenants["t1"];
 
     // inst-a resumes from its OWN breakpoint and then walks ownership-blind, so
@@ -681,10 +666,10 @@ fn test_hbm_breakpoint_not_shared_across_instances() {
     // NOT fetchable across nodes. inst-b therefore cannot serve the prefix at
     // all, and must not inherit inst-a's start position to claim otherwise.
     assert!(
-        !tenant.instances.contains_key("inst-b"),
+        !tenant.contains_key("inst-b"),
         "inst-b cannot reach blocks 0..2 (HBM is not poolable) and must not \
          borrow inst-a's start position, got {:?}",
-        tenant.instances.get("inst-b")
+        tenant.get("inst-b")
     );
 }
 
@@ -744,7 +729,9 @@ fn test_pooled_walk_crosses_ownership_boundary() {
         &[(102, hashes[2].0), (103, hashes[3].0)],
     );
 
-    let resp = query_default(&indexer, "model-pooled-walk", "t1", &tokens, 4).unwrap();
+    let resp = indexer
+        .query("model-pooled-walk", "t1", &tokens, 4)
+        .unwrap();
     let tenant = &resp.tenants["t1"];
 
     for instance_id in ["inst-a", "inst-b"] {
@@ -797,7 +784,7 @@ fn test_own_hbm_bridges_pool_gap_and_differentiates_dps() {
         &[(103, hashes[3].0), (104, hashes[4].0)],
     );
 
-    let resp = query_default(&indexer, "model-bridge", "t1", &tokens, 4).unwrap();
+    let resp = indexer.query("model-bridge", "t1", &tokens, 4).unwrap();
     let tenant = &resp.tenants["t1"];
 
     // inst-a: 3 blocks local in HBM, then fetches the tail across the gap.
@@ -845,7 +832,7 @@ fn test_dp_without_local_data_still_reports_pooled_reach() {
         &[(900, other_hashes[0].0)],
     );
 
-    let resp = query_default(&indexer, "model-idle-dp", "t1", &tokens, 4).unwrap();
+    let resp = indexer.query("model-idle-dp", "t1", &tokens, 4).unwrap();
     let tenant = &resp.tenants["t1"];
 
     let dp_c = &tenant["inst-c"].dp["0"];
@@ -855,170 +842,6 @@ fn test_dp_without_local_data_still_reports_pooled_reach() {
         "inst-c can still fetch both pooled blocks"
     );
     assert_eq!(dp_c.matched_tokens, 2 * 4);
-}
-
-/// Topology placing each `(instance, dp)` on a named node.
-fn topology_of(entries: &[(&str, u32, &str, &str)]) -> NodeTopology {
-    let mut topo = NodeTopology::default();
-    for (instance_id, dp_rank, pod_ip, node_id) in entries {
-        topo.record(pod_ip, Some(node_id), instance_id, *dp_rank);
-    }
-    topo
-}
-
-#[test]
-fn test_pooled_hits_split_into_local_and_remote() {
-    // inst-a and inst-b are different Pods on node-1; inst-c is on node-2.
-    // inst-a's HBM covers [0,1); the pooled chain [1,4) is owned by inst-b (same
-    // machine as inst-a) for block 1 and inst-c (another machine) for blocks 2,3.
-    let indexer = Indexer::new();
-    let entry = indexer.get_or_create("model-locality", "t1");
-
-    let tokens: Vec<i64> = (0..16).collect();
-    let hashes = compute_block_hash_for_seq(&tokens, 4);
-    assert_eq!(hashes.len(), 4);
-
-    // Block 0 lives only in HBM, which is not poolable — so a DP needs its own
-    // copy to have any entry point into the pooled chain that follows.
-    for instance_id in ["inst-a", "inst-c"] {
-        store_chain(
-            &entry,
-            &worker_of(instance_id, 0, StorageMedium::Npu),
-            None,
-            &[(100, hashes[0].0)],
-        );
-    }
-    store_chain(
-        &entry,
-        &worker_of("inst-b", 0, StorageMedium::Cpu),
-        Some(100),
-        &[(101, hashes[1].0)],
-    );
-    store_chain(
-        &entry,
-        &worker_of("inst-c", 0, StorageMedium::Cpu),
-        Some(101),
-        &[(102, hashes[2].0), (103, hashes[3].0)],
-    );
-
-    let topo = topology_of(&[
-        ("inst-a", 0, "10.0.0.5", "node-1"),
-        ("inst-b", 0, "10.0.0.6", "node-1"),
-        ("inst-c", 0, "10.0.1.7", "node-2"),
-    ]);
-    let resp = indexer
-        .query("model-locality", "t1", &tokens, 4, &topo)
-        .unwrap();
-    let tenant = &resp.tenants["t1"];
-
-    // inst-a: block 0 local in HBM; of the 3 pooled blocks, block 1 sits on its
-    // own machine (inst-b) and blocks 2,3 are a machine away.
-    let dp_a = &tenant["inst-a"].dp["0"];
-    assert_eq!(dp_a.npu_blocks, 1);
-    assert_eq!(dp_a.cpu_blocks, 3);
-    assert_eq!(dp_a.cpu_local_blocks, 1, "block 1 is on node-1 via inst-b");
-    assert_eq!(dp_a.cpu_remote_blocks, 2, "blocks 2,3 are on node-2");
-
-    // inst-c is on node-2, so the split flips: blocks 2,3 are its own, block 1
-    // has to come from node-1.
-    let dp_c = &tenant["inst-c"].dp["0"];
-    assert_eq!(dp_c.npu_blocks, 1);
-    assert_eq!(dp_c.cpu_blocks, 3);
-    assert_eq!(dp_c.cpu_local_blocks, 2, "blocks 2,3 are on node-2");
-    assert_eq!(dp_c.cpu_remote_blocks, 1, "block 1 is on node-1");
-
-    // inst-b owns pooled block 1 but has no HBM copy of block 0, so it has no
-    // entry point at all — its own block sits behind a gap it cannot cross.
-    assert!(!tenant.instances.contains_key("inst-b"));
-
-    // The invariant holds for every DP: the split covers exactly this tier's
-    // exclusive blocks, since blocks already in local HBM need no fetch.
-    for imd in tenant.instances.values() {
-        for dp in imd.dp.values() {
-            assert_eq!(
-                dp.cpu_local_blocks + dp.cpu_remote_blocks,
-                dp.cpu_blocks,
-                "local + remote must equal cpu_blocks: {dp:?}"
-            );
-            assert_eq!(dp.disk_local_blocks + dp.disk_remote_blocks, dp.disk_blocks);
-        }
-    }
-}
-
-#[test]
-fn test_root_walk_reports_per_node_hit_counts() {
-    // No HBM at all, so every DP walks from root. The histogram reports how many
-    // of the shared span each machine holds — a DP-agnostic view the per-DP
-    // split cannot express for a walk that is identical for everyone.
-    let indexer = Indexer::new();
-    let entry = indexer.get_or_create("model-histogram", "t1");
-
-    let tokens: Vec<i64> = (0..12).collect();
-    let hashes = compute_block_hash_for_seq(&tokens, 4);
-    assert_eq!(hashes.len(), 3);
-
-    // node-1 holds blocks 0,1; node-2 holds block 2 (and also co-owns block 1).
-    store_chain(
-        &entry,
-        &worker_of("inst-a", 0, StorageMedium::Cpu),
-        None,
-        &[(100, hashes[0].0), (101, hashes[1].0)],
-    );
-    store_chain(
-        &entry,
-        &worker_of("inst-c", 0, StorageMedium::Cpu),
-        Some(100),
-        &[(101, hashes[1].0), (102, hashes[2].0)],
-    );
-
-    let topo = topology_of(&[
-        ("inst-a", 0, "10.0.0.5", "node-1"),
-        ("inst-c", 0, "10.0.1.7", "node-2"),
-    ]);
-    let resp = indexer
-        .query("model-histogram", "t1", &tokens, 4, &topo)
-        .unwrap();
-    let tenant = &resp.tenants["t1"];
-
-    let cpu_hits = &tenant.root_node_hits["cpu"];
-    assert_eq!(cpu_hits["node-1"], 2, "node-1 holds blocks 0 and 1");
-    assert_eq!(cpu_hits["node-2"], 2, "node-2 holds blocks 1 and 2");
-
-    // Each DP's own split is consistent with the histogram: inst-a is on node-1
-    // and holds 2 of the 3 root-walked blocks locally.
-    assert_eq!(tenant["inst-a"].dp["0"].cpu_blocks, 3);
-    assert_eq!(tenant["inst-a"].dp["0"].cpu_local_blocks, 2);
-    assert_eq!(tenant["inst-a"].dp["0"].cpu_remote_blocks, 1);
-}
-
-#[test]
-fn test_unlocated_owner_counts_as_remote() {
-    // A block whose owners have no registered location must count as remote:
-    // scoring an unknown location as local would understate the fetch cost.
-    let indexer = Indexer::new();
-    let entry = indexer.get_or_create("model-unlocated", "t1");
-
-    let tokens: Vec<i64> = (0..8).collect();
-    let hashes = compute_block_hash_for_seq(&tokens, 4);
-
-    store_chain(
-        &entry,
-        &worker_of("inst-a", 0, StorageMedium::Cpu),
-        None,
-        &[(100, hashes[0].0), (101, hashes[1].0)],
-    );
-
-    // Only inst-b is registered; the owner inst-a has no location.
-    let topo = topology_of(&[("inst-b", 0, "10.0.0.6", "node-1")]);
-    let resp = indexer
-        .query("model-unlocated", "t1", &tokens, 4, &topo)
-        .unwrap();
-    let tenant = &resp.tenants["t1"];
-
-    let dp_b = &tenant["inst-b"].dp["0"];
-    assert_eq!(dp_b.cpu_blocks, 2, "inst-b can still fetch both blocks");
-    assert_eq!(dp_b.cpu_local_blocks, 0, "owner location unknown");
-    assert_eq!(dp_b.cpu_remote_blocks, 2);
 }
 
 #[test]
@@ -1083,7 +906,7 @@ fn test_hbm_breakpoint_not_shared_across_dp_ranks() {
             .unwrap();
     }
 
-    let resp = query_default(&indexer, "model-break-dp", "t1", &tokens, 4).unwrap();
+    let resp = indexer.query("model-break-dp", "t1", &tokens, 4).unwrap();
     let imd = &resp.tenants["t1"]["inst-1"];
 
     // dp0 continues from its own breakpoint: 2 HBM + 1 CPU.
@@ -1152,7 +975,7 @@ fn test_disk_continuation_from_hbm_when_cpu_miss() {
         )
         .unwrap();
 
-    let resp = query_default(&indexer, "model-h", "t1", &tokens, 4).unwrap();
+    let resp = indexer.query("model-h", "t1", &tokens, 4).unwrap();
     let dp0 = &resp.tenants["t1"]["inst-1"].dp["0"];
     assert_eq!(dp0.npu_blocks, 1);
     assert_eq!(dp0.cpu_blocks, 0);
@@ -1210,7 +1033,7 @@ fn test_disk_replica_reported_when_cpu_hits_same_dp() {
         )
         .unwrap();
 
-    let resp = query_default(&indexer, "model-g", "t1", &tokens, 4).unwrap();
+    let resp = indexer.query("model-g", "t1", &tokens, 4).unwrap();
     let dp0 = &resp.tenants["t1"]["inst-1"].dp["0"];
     assert_eq!(dp0.cpu_blocks, 1);
     // Same-prefix Disk replica is exclusive-attributed to CPU.
@@ -1266,7 +1089,7 @@ fn test_disk_replica_reported_when_hbm_hits_same_dp() {
         )
         .unwrap();
 
-    let resp = query_default(&indexer, "model-i", "t1", &tokens, 4).unwrap();
+    let resp = indexer.query("model-i", "t1", &tokens, 4).unwrap();
     let dp0 = &resp.tenants["t1"]["inst-1"].dp["0"];
     assert_eq!(dp0.npu_blocks, 1);
     // Same-prefix Disk replica is exclusive-attributed to NPU.
@@ -1337,7 +1160,9 @@ fn test_lower_tier_longer_replica_extends_coverage() {
         )
         .unwrap();
 
-    let resp = query_default(&indexer, "model-long-replica", "t1", &tokens, 4).unwrap();
+    let resp = indexer
+        .query("model-long-replica", "t1", &tokens, 4)
+        .unwrap();
     let dp0 = &resp.tenants["t1"]["inst-1"].dp["0"];
     assert_eq!(dp0.npu_blocks, 1);
     assert_eq!(
@@ -1354,7 +1179,7 @@ fn test_lower_tier_longer_replica_extends_coverage() {
 #[test]
 fn test_no_indexer_error() {
     let indexer = Indexer::new();
-    let err = query_default(&indexer, "no-such-model", "default", &[1, 2, 3, 4], 4);
+    let err = indexer.query("no-such-model", "default", &[1, 2, 3, 4], 4);
     assert!(err.is_err());
     assert!(matches!(
         err.unwrap_err(),
@@ -1493,7 +1318,7 @@ fn test_exclusive_sum_is_unweighted_matched_tokens() {
         )
         .unwrap();
 
-    let resp = query_default(&indexer, "model-coverage", "t1", &tokens, 4).unwrap();
+    let resp = indexer.query("model-coverage", "t1", &tokens, 4).unwrap();
     let dp0 = &resp.tenants["t1"]["inst-1"].dp["0"];
     assert_eq!(dp0.npu_blocks, 1);
     assert_eq!(dp0.cpu_blocks, 1);
@@ -1532,7 +1357,7 @@ fn test_disk_only_coverage_matched_tokens() {
         )
         .unwrap();
 
-    let resp = query_default(&indexer, "model-disk-only", "t1", &tokens, 4).unwrap();
+    let resp = indexer.query("model-disk-only", "t1", &tokens, 4).unwrap();
     let dp0 = &resp.tenants["t1"]["inst-1"].dp["0"];
     assert_eq!(dp0.npu_blocks, 0);
     assert_eq!(dp0.cpu_blocks, 0);

@@ -81,22 +81,7 @@ pub struct NodeTopology {
 
 impl NodeTopology {
     /// Record one DP. Idempotent, and re-registering with a new node overwrites.
-    ///
-    /// `node_id` is optional: without it the Pod IP becomes the DP's locality
-    /// domain, so locality degrades to "same Pod" instead of vanishing. Two DPs
-    /// in one Pod are trivially co-located either way, so the fallback is always
-    /// safe — it only under-reports co-location across Pods on one machine.
-    pub fn record(
-        &mut self,
-        pod_ip: &str,
-        node_id: Option<&str>,
-        instance_id: &str,
-        dp_rank: DpRank,
-    ) {
-        let node_id = match node_id {
-            Some(id) if !id.is_empty() => id,
-            _ => pod_ip,
-        };
+    pub fn record(&mut self, pod_ip: &str, node_id: &str, instance_id: &str, dp_rank: DpRank) {
         self.dp_to_node.insert(
             (instance_id.to_string(), dp_rank),
             DpLocation {
@@ -142,15 +127,6 @@ impl NodeTopology {
             (Some(node_a), Some(node_b)) => node_a == node_b,
             _ => false,
         }
-    }
-
-    /// Every registered DP, for callers that need the full DP set rather than a
-    /// lookup (the lower-tier walk considers every DP, since any of them can
-    /// fetch a pooled block).
-    pub fn registered_dps(&self) -> impl Iterator<Item = (&InstanceId, DpRank)> {
-        self.dp_to_node
-            .keys()
-            .map(|(instance_id, dp_rank)| (instance_id, *dp_rank))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -415,21 +391,6 @@ pub struct DpBlocks {
     pub cpu_blocks: u32,
     /// Exclusive Disk matched block count (beyond max(NPU, CPU) coverage).
     pub disk_blocks: u32,
-    /// How `cpu_blocks` splits by where the block physically lives:
-    /// `cpu_local_blocks` sit on this DP's own machine (cheap fetch),
-    /// `cpu_remote_blocks` elsewhere (transfer over `device_rdma` /
-    /// `device_sdma` / `device_urma`).
-    ///
-    /// Invariant: `cpu_local_blocks + cpu_remote_blocks == cpu_blocks`.
-    /// Blocks already covered by NPU are excluded — they need no fetch.
-    ///
-    /// A block whose owners have no registered node counts as **remote**; an
-    /// unknown location must never be scored as local.
-    pub cpu_local_blocks: u32,
-    pub cpu_remote_blocks: u32,
-    /// Same split for `disk_blocks`.
-    pub disk_local_blocks: u32,
-    pub disk_remote_blocks: u32,
 }
 
 /// Per-instance match data returned in query response.
@@ -442,49 +403,11 @@ pub struct InstanceMatchData {
     pub dp: HashMap<String, DpBlocks>,
 }
 
-/// Reserved tenant-map key carrying the root-walk node histogram. Coordinator
-/// instance IDs (`vllm-prefill-*` / `vllm-union-*`) cannot collide with it.
-pub const ROOT_NODE_HITS_KEY: &str = "_root_node_hits";
-
-/// Per-tenant query payload: the flattened instance map plus
-/// `_root_node_hits`.
-///
-/// The root walk of each pooled tier starts at block 0 and ignores ownership, so
-/// it is **identical for every DP** and is computed once. That means it has no
-/// single per-DP local/remote split — instead the raw histogram is returned:
-/// `medium → locality domain → how many root-walked blocks that machine holds`.
-/// A client can then answer "how much of the shared span is on node N" for any
-/// N, including nodes it did not ask about.
-///
-/// Per-DP entries already carry the split for whichever candidate won
-/// ([`DpBlocks::cpu_local_blocks`]); this histogram is the extra, DP-agnostic
-/// view.
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct TenantMatchData {
-    #[serde(flatten)]
-    pub instances: HashMap<InstanceId, InstanceMatchData>,
-    /// `"npu"` / `"cpu"` / `"disk"` → locality domain → block count. Pooled tiers
-    /// only; NPU never appears (it is not fetchable, so it has no root walk).
-    #[serde(rename = "_root_node_hits")]
-    pub root_node_hits: HashMap<String, HashMap<String, u32>>,
-}
-
-/// Instance lookup by id. Panics on an unknown id, like `HashMap`'s own `Index`;
-/// use `.instances.get()` when absence is expected.
-impl std::ops::Index<&str> for TenantMatchData {
-    type Output = InstanceMatchData;
-
-    fn index(&self, instance_id: &str) -> &InstanceMatchData {
-        &self.instances[instance_id]
-    }
-}
-
-/// Full query response:
-/// `{ tenant_id: { instance_id: InstanceMatchData, "_root_node_hits": {...} } }`
+/// Full query response: { tenant_id: { instance_id: InstanceMatchData } }
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct QueryResponse {
     #[serde(flatten)]
-    pub tenants: HashMap<String, TenantMatchData>,
+    pub tenants: HashMap<String, HashMap<InstanceId, InstanceMatchData>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -529,48 +452,6 @@ pub fn is_msgpack_content_type(headers: &axum::http::HeaderMap) -> bool {
 ///
 /// Written with `rmp::encode` instead of `rmp_serde` to avoid the
 /// `#[serde(flatten)]` map-merge pitfall on `QueryResponse`.
-/// Encode one `DpBlocks`. The field set must stay in sync with the struct's
-/// `Serialize` derive — the msgpack/JSON shape equality test guards this.
-fn encode_dp_blocks_msgpack(out: &mut Vec<u8>, blocks: &DpBlocks) {
-    use rmp::encode::*;
-    write_map_len(out, 8).expect("blocks map len");
-    write_str(out, "matched_tokens").expect("write key");
-    write_u32(out, blocks.matched_tokens).expect("write matched_tokens");
-    write_str(out, "npu_blocks").expect("write key");
-    write_u32(out, blocks.npu_blocks).expect("write npu_blocks");
-    write_str(out, "cpu_blocks").expect("write key");
-    write_u32(out, blocks.cpu_blocks).expect("write cpu_blocks");
-    write_str(out, "disk_blocks").expect("write key");
-    write_u32(out, blocks.disk_blocks).expect("write disk_blocks");
-    write_str(out, "cpu_local_blocks").expect("write key");
-    write_u32(out, blocks.cpu_local_blocks).expect("write cpu_local_blocks");
-    write_str(out, "cpu_remote_blocks").expect("write key");
-    write_u32(out, blocks.cpu_remote_blocks).expect("write cpu_remote_blocks");
-    write_str(out, "disk_local_blocks").expect("write key");
-    write_u32(out, blocks.disk_local_blocks).expect("write disk_local_blocks");
-    write_str(out, "disk_remote_blocks").expect("write key");
-    write_u32(out, blocks.disk_remote_blocks).expect("write disk_remote_blocks");
-}
-
-/// Encode the `_root_node_hits` nested map: medium → domain → count.
-fn encode_root_node_hits_msgpack(out: &mut Vec<u8>, hits: &HashMap<String, HashMap<String, u32>>) {
-    use rmp::encode::*;
-    write_map_len(out, u32::try_from(hits.len()).expect("media len fits u32"))
-        .expect("write map len");
-    for (medium, counts) in hits {
-        write_str(out, medium).expect("write medium");
-        write_map_len(
-            out,
-            u32::try_from(counts.len()).expect("counts len fits u32"),
-        )
-        .expect("write map len");
-        for (domain, count) in counts {
-            write_str(out, domain).expect("write domain");
-            write_u32(out, *count).expect("write count");
-        }
-    }
-}
-
 pub fn encode_query_response_msgpack(response: &QueryResponse, out: &mut Vec<u8>) {
     use rmp::encode::*;
     write_map_len(
@@ -578,30 +459,34 @@ pub fn encode_query_response_msgpack(response: &QueryResponse, out: &mut Vec<u8>
         u32::try_from(response.tenants.len()).expect("tenants len fits u32"),
     )
     .expect("write map len");
-    for (tenant, data) in &response.tenants {
+    for (tenant, instances) in &response.tenants {
         write_str(out, tenant).expect("write tenant");
-        // `+ 1` for the always-present `_root_node_hits`; adding
-        // `skip_serializing_if` to it would silently corrupt the frame.
-        let map_len = u32::try_from(data.instances.len())
-            .expect("instances len fits u32")
-            .checked_add(1)
-            .expect("instances + _root_node_hits fits u32");
-        write_map_len(out, map_len).expect("write map len");
-        for (instance, inst) in &data.instances {
+        write_map_len(
+            out,
+            u32::try_from(instances.len()).expect("instances len fits u32"),
+        )
+        .expect("write map len");
+        for (instance, data) in instances {
             write_str(out, instance).expect("write instance");
             write_map_len(out, 2).expect("instance map len");
             write_str(out, "longest_matched").expect("write key");
-            write_u32(out, inst.longest_matched).expect("write longest_matched");
+            write_u32(out, data.longest_matched).expect("write longest_matched");
             write_str(out, "DP").expect("write key");
-            write_map_len(out, u32::try_from(inst.dp.len()).expect("dp len fits u32"))
+            write_map_len(out, u32::try_from(data.dp.len()).expect("dp len fits u32"))
                 .expect("write map len");
-            for (rank, blocks) in &inst.dp {
+            for (rank, blocks) in &data.dp {
                 write_str(out, rank).expect("write rank");
-                encode_dp_blocks_msgpack(out, blocks);
+                write_map_len(out, 4).expect("blocks map len");
+                write_str(out, "matched_tokens").expect("write key");
+                write_u32(out, blocks.matched_tokens).expect("write matched_tokens");
+                write_str(out, "npu_blocks").expect("write key");
+                write_u32(out, blocks.npu_blocks).expect("write npu_blocks");
+                write_str(out, "cpu_blocks").expect("write key");
+                write_u32(out, blocks.cpu_blocks).expect("write cpu_blocks");
+                write_str(out, "disk_blocks").expect("write key");
+                write_u32(out, blocks.disk_blocks).expect("write disk_blocks");
             }
         }
-        write_str(out, ROOT_NODE_HITS_KEY).expect("write root hits key");
-        encode_root_node_hits_msgpack(out, &data.root_node_hits);
     }
 }
 
@@ -1020,7 +905,6 @@ mod tests {
                 npu_blocks: 6,
                 cpu_blocks: 0,
                 disk_blocks: 0,
-                ..Default::default()
             },
         );
         imd.dp.insert(
@@ -1030,9 +914,6 @@ mod tests {
                 npu_blocks: 0,
                 cpu_blocks: 4,
                 disk_blocks: 0,
-                cpu_local_blocks: 1,
-                cpu_remote_blocks: 3,
-                ..Default::default()
             },
         );
 
@@ -1271,10 +1152,6 @@ mod tests {
                 npu_blocks: 3,
                 cpu_blocks: 0,
                 disk_blocks: 0,
-                cpu_local_blocks: 0,
-                cpu_remote_blocks: 0,
-                disk_local_blocks: 0,
-                disk_remote_blocks: 0,
             },
         );
         dp.insert(
@@ -1284,11 +1161,6 @@ mod tests {
                 npu_blocks: 1,
                 cpu_blocks: 3,
                 disk_blocks: 0,
-                // 2 of the 3 pooled blocks sit on this DP's own machine.
-                cpu_local_blocks: 2,
-                cpu_remote_blocks: 1,
-                disk_local_blocks: 0,
-                disk_remote_blocks: 0,
             },
         );
         instances.insert(
@@ -1298,48 +1170,8 @@ mod tests {
                 dp,
             },
         );
-        // Two machines hold parts of the shared root walk, so the histogram has
-        // more than one entry — exercising the nested msgpack encoding.
-        let mut root_node_hits: HashMap<String, HashMap<String, u32>> = HashMap::new();
-        root_node_hits.insert(
-            "cpu".to_string(),
-            HashMap::from([("node-1".to_string(), 3u32), ("node-2".to_string(), 1u32)]),
-        );
-        root_node_hits.insert("disk".to_string(), HashMap::new());
-
-        tenants.insert(
-            "default".to_string(),
-            TenantMatchData {
-                instances,
-                root_node_hits,
-            },
-        );
+        tenants.insert("default".to_string(), instances);
         QueryResponse { tenants }
-    }
-
-    #[test]
-    fn test_query_response_includes_root_node_hits() {
-        let response = sample_query_response();
-        let json = serde_json::to_value(&response).unwrap();
-        // `_root_node_hits` is a sibling of the instance IDs, not nested in one.
-        assert_eq!(json["default"]["prefill-0"]["longest_matched"], 512);
-        assert_eq!(json["default"]["_root_node_hits"]["cpu"]["node-1"], 3);
-        assert_eq!(json["default"]["_root_node_hits"]["cpu"]["node-2"], 1);
-        assert!(json["default"]["_root_node_hits"]["disk"]
-            .as_object()
-            .unwrap()
-            .is_empty());
-        // The per-DP locality split rides on the DP entries.
-        assert_eq!(
-            json["default"]["prefill-0"]["DP"]["1"]["cpu_local_blocks"],
-            2
-        );
-        assert_eq!(
-            json["default"]["prefill-0"]["DP"]["1"]["cpu_remote_blocks"],
-            1
-        );
-        // The tenant level must not carry instance-shaped fields.
-        assert!(json["default"].get("DP").is_none());
     }
 
     #[test]

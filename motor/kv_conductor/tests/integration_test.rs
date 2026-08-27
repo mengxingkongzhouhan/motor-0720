@@ -571,7 +571,7 @@ async fn test_node_topology_built_from_register_node_id() {
 }
 
 #[tokio::test]
-async fn test_register_without_node_id_falls_back_to_pod_ip() {
+async fn test_register_without_node_id_leaves_topology_empty() {
     let (base_url, _handle) = start_test_server().await;
     let client = Client::new();
 
@@ -599,18 +599,12 @@ async fn test_register_without_node_id_falls_back_to_pod_ip() {
         .json()
         .await
         .unwrap();
-    // Without node_id the Pod IP stands in as the locality domain, so the DP is
-    // still tracked and locality degrades to "same Pod" rather than vanishing.
     let topo = &body["topology"];
-    assert_eq!(
-        topo["dp_to_node"]["vllm-prefill-1/0"]["node_id"], "10.244.0.5",
-        "node falls back to the Pod IP: {topo}"
+    assert!(
+        topo["dp_to_node"].as_object().unwrap().is_empty()
+            && topo["pod_to_node"].as_object().unwrap().is_empty(),
+        "clients that do not send node_id get no topology: {topo}"
     );
-    assert_eq!(
-        topo["dp_to_node"]["vllm-prefill-1/0"]["pod_ip"],
-        "10.244.0.5"
-    );
-    assert_eq!(topo["pod_to_node"]["10.244.0.5"], "10.244.0.5");
 }
 
 // ── Mooncake: duplicate HBM registration (same instance, same dp) ───

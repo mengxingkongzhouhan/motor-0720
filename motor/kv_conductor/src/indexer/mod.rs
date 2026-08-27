@@ -450,16 +450,23 @@ impl IndexerEntry {
         // Same for everyone — one walk, reused for every DP below.
         let root_hit = tiers.reachable_from(block_hashes, 0, None);
 
-        // Keep each DP's farthest own breakpoint. Several may exist for one DP
-        // when the upstream tier saw multiple `backend_id`s.
+        // One breakpoint per DP, keeping the farthest.
+        //
+        // A DP can appear more than once in `upstream_breaks`: the HBM matches
+        // it is built from are keyed by `WorkerKey`, which also carries
+        // `backend_id` and `medium` (`Npu` and `Unknown` both land in the HBM
+        // tree). Iteration order over that map is arbitrary, so a plain
+        // last-wins insert would pick the start position nondeterministically.
+        //
+        // The key deliberately omits `backend_id`, which is what collapses
+        // those duplicates onto one DP.
         let mut own_break: FxHashMap<(String, DpRank), &TierBreakpoint> = FxHashMap::default();
         for b in upstream_breaks {
-            let key = (b.instance_id.clone(), b.dp_rank);
-            match own_break.get(&key) {
-                Some(existing) if existing.end_pos >= b.end_pos => {}
-                _ => {
-                    own_break.insert(key, b);
-                }
+            let slot = own_break
+                .entry((b.instance_id.clone(), b.dp_rank))
+                .or_insert(b);
+            if slot.end_pos < b.end_pos {
+                *slot = b;
             }
         }
 

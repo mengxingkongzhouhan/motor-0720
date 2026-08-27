@@ -652,11 +652,202 @@ fn test_hbm_breakpoint_not_shared_across_instances() {
 
     // inst-b gets no candidate, so it never reaches medium_ends.
     assert!(
-        !tenant.contains_key("inst-b"),
+        !tenant.instances.contains_key("inst-b"),
         "inst-b holds only a mid-sequence segment and must not report coverage \
          borrowed from inst-a's breakpoint, got {:?}",
-        tenant.get("inst-b")
+        tenant.instances.get("inst-b")
     );
+
+    // The pool-wide entry does stitch across DPs: inst-a's HBM covers [0,2) and
+    // inst-b's CPU covers [2,3), so the pool collectively holds all 3 blocks.
+    assert_eq!(tenant.global.npu_blocks, 2);
+    assert_eq!(tenant.global.cpu_blocks, 1);
+    assert_eq!(tenant.global.matched_tokens, 3 * 4);
+    assert_eq!(
+        tenant.global.dp_ranges["inst-a"]["0"],
+        vec![(0, 2)],
+        "inst-a holds the first two blocks"
+    );
+    assert_eq!(
+        tenant.global.dp_ranges["inst-b"]["0"],
+        vec![(2, 3)],
+        "inst-b holds only the third block"
+    );
+}
+
+/// Store one lower-tier chain for `worker`, anchored at `parent`.
+fn store_cpu_chain(
+    entry: &IndexerEntry,
+    worker: &WorkerKey,
+    parent: Option<u64>,
+    blocks: &[(u64, u64)],
+) {
+    entry
+        .apply_event(
+            worker,
+            &KvCacheEventData::Stored(KvCacheStoreData {
+                parent_hash: parent,
+                start_position: None,
+                blocks: blocks
+                    .iter()
+                    .map(|&(block_hash, tokens_hash)| KvCacheStoredBlockData {
+                        block_hash,
+                        tokens_hash,
+                    })
+                    .collect(),
+            }),
+        )
+        .unwrap();
+}
+
+fn cpu_worker(instance_id: &str, dp_rank: u32) -> WorkerKey {
+    WorkerKey {
+        instance_id: instance_id.into(),
+        backend_id: "pool".into(),
+        dp_rank,
+        medium: StorageMedium::Cpu,
+    }
+}
+
+#[test]
+fn test_global_span_stitches_cpu_chains_across_dps() {
+    // The headline case for `_global`: inst-a's DRAM holds [0,2) and inst-b's
+    // DRAM continues [2,4). No single DP covers the prefix, but the pool does —
+    // and any DP can fetch any pooled block, so prefill is skippable for all 4.
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-global-cpu", "t1");
+
+    let tokens: Vec<i64> = (0..16).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+    assert_eq!(hashes.len(), 4);
+
+    let wk_a = cpu_worker("inst-a", 0);
+    let wk_b = cpu_worker("inst-b", 0);
+    store_cpu_chain(&entry, &wk_a, None, &[(10, hashes[0].0), (11, hashes[1].0)]);
+    // inst-b's chain continues from inst-a's last block identity.
+    store_cpu_chain(
+        &entry,
+        &wk_b,
+        Some(11),
+        &[(12, hashes[2].0), (13, hashes[3].0)],
+    );
+
+    let resp = indexer.query("model-global-cpu", "t1", &tokens, 4).unwrap();
+    let tenant = &resp.tenants["t1"];
+
+    // Pool-wide: the walk crosses the ownership boundary at position 2.
+    assert_eq!(tenant.global.cpu_blocks, 4);
+    assert_eq!(tenant.global.npu_blocks, 0);
+    assert_eq!(tenant.global.matched_tokens, 4 * 4);
+
+    // Per-DP is unchanged and stays strictly local: inst-a stops where inst-b's
+    // ownership begins, and inst-b has no entry point of its own (it owns
+    // neither the root edge nor any HBM breakpoint).
+    assert_eq!(tenant["inst-a"].dp["0"].cpu_blocks, 2);
+    assert_eq!(tenant["inst-a"].dp["0"].matched_tokens, 2 * 4);
+    assert!(
+        !tenant.instances.contains_key("inst-b"),
+        "per-DP coverage must not inherit a foreign start position, got {:?}",
+        tenant.instances.get("inst-b")
+    );
+
+    // The pool span therefore exceeds every individual DP — this is information
+    // a per-DP max could never produce.
+    let best_dp = tenant
+        .instances
+        .values()
+        .map(|imd| imd.longest_matched)
+        .max()
+        .unwrap_or(0);
+    assert_eq!(best_dp, 2 * 4);
+    assert!(tenant.global.matched_tokens > best_dp);
+
+    // Ownership map: contiguous runs collapse into a single range each.
+    assert_eq!(tenant.global.dp_ranges["inst-a"]["0"], vec![(0, 2)]);
+    assert_eq!(tenant.global.dp_ranges["inst-b"]["0"], vec![(2, 4)]);
+}
+
+#[test]
+fn test_global_span_stops_at_gap_and_drops_unreachable_blocks() {
+    // inst-a holds [0,2). inst-c holds a chain for position 3 anchored at the
+    // position-2 block identity, but nobody holds position 2 itself — the prefix
+    // is broken there, so the span stops at 2 and inst-c's blocks are not
+    // reported: they sit behind a gap and cannot serve a contiguous prefix.
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-global-gap", "t1");
+
+    let tokens: Vec<i64> = (0..16).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+    assert_eq!(hashes.len(), 4);
+
+    let wk_a = cpu_worker("inst-a", 0);
+    let wk_c = cpu_worker("inst-c", 0);
+    store_cpu_chain(&entry, &wk_a, None, &[(10, hashes[0].0), (11, hashes[1].0)]);
+    // Anchored at block identity 12 (position 2), which was never stored.
+    store_cpu_chain(&entry, &wk_c, Some(12), &[(13, hashes[3].0)]);
+
+    let resp = indexer.query("model-global-gap", "t1", &tokens, 4).unwrap();
+    let tenant = &resp.tenants["t1"];
+
+    assert_eq!(tenant.global.cpu_blocks, 2, "span must stop at the gap");
+    assert_eq!(tenant.global.matched_tokens, 2 * 4);
+    assert_eq!(tenant.global.dp_ranges["inst-a"]["0"], vec![(0, 2)]);
+    assert!(
+        !tenant.global.dp_ranges.contains_key("inst-c"),
+        "blocks behind a gap are unreachable and must be dropped, got {:?}",
+        tenant.global.dp_ranges.get("inst-c")
+    );
+}
+
+#[test]
+fn test_global_span_continues_from_pool_wide_hbm_end() {
+    // The HBM prefix is itself assembled across DPs: inst-a holds block 0,
+    // inst-b holds blocks 0..2 (so the pool-wide HBM end is 2, deeper than
+    // inst-a). inst-c's DRAM continues from there. The global CPU walk must
+    // resume at the pool-wide HBM end, not at any single DP's depth.
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-global-hbm", "t1");
+
+    let tokens: Vec<i64> = (0..12).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+    assert_eq!(hashes.len(), 3);
+
+    let npu = |instance_id: &str| WorkerKey {
+        instance_id: instance_id.into(),
+        backend_id: instance_id.into(),
+        dp_rank: 0,
+        medium: StorageMedium::Npu,
+    };
+    store_cpu_chain(&entry, &npu("inst-a"), None, &[(100, hashes[0].0)]);
+    store_cpu_chain(
+        &entry,
+        &npu("inst-b"),
+        None,
+        &[(100, hashes[0].0), (200, hashes[1].0)],
+    );
+    // inst-c holds only the tail on CPU, chained after HBM block 200.
+    store_cpu_chain(
+        &entry,
+        &cpu_worker("inst-c", 0),
+        Some(200),
+        &[(300, hashes[2].0)],
+    );
+
+    let resp = indexer.query("model-global-hbm", "t1", &tokens, 4).unwrap();
+    let tenant = &resp.tenants["t1"];
+
+    assert_eq!(tenant.global.npu_blocks, 2, "pool-wide HBM prefix");
+    assert_eq!(tenant.global.cpu_blocks, 1, "CPU extends the pool-wide end");
+    assert_eq!(tenant.global.matched_tokens, 3 * 4);
+
+    // Both HBM holders are credited for the blocks they actually hold.
+    assert_eq!(tenant.global.dp_ranges["inst-a"]["0"], vec![(0, 1)]);
+    assert_eq!(tenant.global.dp_ranges["inst-b"]["0"], vec![(0, 2)]);
+    assert_eq!(tenant.global.dp_ranges["inst-c"]["0"], vec![(2, 3)]);
+
+    // Per-DP: inst-c still gets nothing (the breakpoint belongs to inst-b).
+    assert_eq!(tenant["inst-b"].dp["0"].npu_blocks, 2);
+    assert!(!tenant.instances.contains_key("inst-c"));
 }
 
 #[test]

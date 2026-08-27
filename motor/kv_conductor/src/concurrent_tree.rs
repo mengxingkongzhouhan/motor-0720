@@ -265,6 +265,63 @@ impl ConcurrentRadixTree {
         results
     }
 
+    /// Longest prefix present anywhere in the tree, **ignoring** which workers
+    /// hold it, plus the DPs holding each traversed position.
+    ///
+    /// A position counts as available only when the node exists *and* still has
+    /// at least one worker: an empty node is an orphan awaiting
+    /// [`Self::sweep_stale_nodes`], and nobody can serve it.
+    ///
+    /// Unlike [`Self::find_matches_detailed`] this does **not** intersect worker
+    /// sets across levels, so the returned depth can exceed every individual
+    /// worker's depth. That is the point — it answers "how much of this prefix
+    /// is cached somewhere in the pool", which is actionable because pooled
+    /// blocks are fetchable from any node. Per-worker depth remains the
+    /// locality signal used for affinity scheduling.
+    pub fn global_prefix(
+        &self,
+        sequence: &[LocalBlockHash],
+        coverage: &mut [FxHashSet<(InstanceId, DpRank)>],
+    ) -> (usize, Option<SequenceBlockHash>) {
+        let mut current = Arc::clone(&self.root);
+        let mut pos = 0usize;
+        let mut last_seq = None;
+
+        while pos < sequence.len() {
+            let next = {
+                let guard = current.read();
+                guard.children.get(&sequence[pos]).cloned()
+            };
+            let Some(next) = next else {
+                break;
+            };
+
+            let seq_hash = {
+                let guard = next.read();
+                if guard.workers.is_empty() {
+                    None
+                } else {
+                    if let Some(slot) = coverage.get_mut(pos) {
+                        for w in guard.workers.iter() {
+                            slot.insert((w.instance_id.clone(), w.dp_rank));
+                        }
+                    }
+                    Some(guard.block_hash)
+                }
+            };
+            // Orphan node (no owners left) — the prefix is not servable here.
+            let Some(seq_hash) = seq_hash else {
+                break;
+            };
+
+            last_seq = seq_hash;
+            current = next;
+            pos += 1;
+        }
+
+        (pos, last_seq)
+    }
+
     // -----------------------------------------------------------------------
     // Mutation
     // -----------------------------------------------------------------------

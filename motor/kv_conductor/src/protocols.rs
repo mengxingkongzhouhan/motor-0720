@@ -249,6 +249,42 @@ pub struct QueryByHashRequest {
 //     matched_tokens / npu_blocks / cpu_blocks / disk_blocks)
 // ---------------------------------------------------------------------------
 
+/// Reserved tenant-map key for the pool-wide hit. Coordinator instance IDs
+/// (`vllm-prefill-*` / `vllm-union-*`) cannot collide with it.
+pub const GLOBAL_QUERY_KEY: &str = "_global";
+
+/// Pool-wide contiguous prefix availability, ignoring block ownership.
+///
+/// The per-instance `DP` entries answer "what does this DP hold **locally**",
+/// which is the locality signal affinity scheduling ranks by. This entry answers
+/// a different question: "how much of this prefix is cached **anywhere** in the
+/// pool". It walks the indexes ownership-blind, so its span can be assembled
+/// across DPs and may exceed every individual DP's coverage.
+///
+/// That is actionable because pooled blocks are fetchable from any node over the
+/// backend's transfer protocol (`device_rdma` / `device_sdma` / `device_urma`):
+/// a span stitched across DPs still lets the engine skip prefill, only the
+/// transfer cost differs. `dp_ranges` says which parts are local to whom.
+///
+/// **Do not apply tier weights to these `*_blocks`** — they are partitioned over
+/// a span no single DP owns, so a weighted sum would exceed what any routing
+/// decision can actually achieve.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct GlobalMatchData {
+    /// Unweighted coverage of the pool-wide span, in tokens:
+    /// `(npu_blocks + cpu_blocks + disk_blocks) × block_size`.
+    pub matched_tokens: u32,
+    /// Exclusive block counts over the pool-wide span (priority NPU > CPU > Disk).
+    pub npu_blocks: u32,
+    pub cpu_blocks: u32,
+    pub disk_blocks: u32,
+    /// `instance_id → dp_rank → [[start, end), ...]`: which parts of the
+    /// pool-wide span each DP holds locally. Positions are block indexes into
+    /// the query sequence; ranges are half-open, sorted, and never overlap.
+    /// Empty when nothing is cached.
+    pub dp_ranges: HashMap<InstanceId, HashMap<String, Vec<(u32, u32)>>>,
+}
+
 /// Per-DP matched block counts across storage media.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct DpBlocks {
@@ -278,11 +314,36 @@ pub struct InstanceMatchData {
     pub dp: HashMap<String, DpBlocks>,
 }
 
-/// Full query response: { tenant_id: { instance_id: InstanceMatchData } }
+/// Per-tenant query payload: the flattened instance map plus `_global`.
+///
+/// `_global` is serialized as a sibling of the instance IDs so existing clients
+/// that look instances up by key are unaffected. Indexing by `&str` resolves
+/// against the instance map only, keeping `_global` out of the instance lookup
+/// path.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct TenantMatchData {
+    #[serde(flatten)]
+    pub instances: HashMap<InstanceId, InstanceMatchData>,
+    #[serde(rename = "_global")]
+    pub global: GlobalMatchData,
+}
+
+/// Instance lookup by id. Panics on an unknown id, like `HashMap`'s own `Index`;
+/// use `.instances.get()` when absence is expected.
+impl std::ops::Index<&str> for TenantMatchData {
+    type Output = InstanceMatchData;
+
+    fn index(&self, instance_id: &str) -> &InstanceMatchData {
+        &self.instances[instance_id]
+    }
+}
+
+/// Full query response:
+/// `{ tenant_id: { instance_id: InstanceMatchData, "_global": GlobalMatchData } }`
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct QueryResponse {
     #[serde(flatten)]
-    pub tenants: HashMap<String, HashMap<InstanceId, InstanceMatchData>>,
+    pub tenants: HashMap<String, TenantMatchData>,
 }
 
 // ---------------------------------------------------------------------------
@@ -323,10 +384,67 @@ pub fn is_msgpack_content_type(headers: &axum::http::HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// Encode one `DpBlocks` object. Field set must stay in sync with the struct's
+/// `Serialize` derive — the msgpack/JSON shape equality test guards this.
+fn encode_dp_blocks_msgpack(out: &mut Vec<u8>, blocks: &DpBlocks) {
+    use rmp::encode::*;
+    write_map_len(out, 4).expect("blocks map len");
+    write_str(out, "matched_tokens").expect("write key");
+    write_u32(out, blocks.matched_tokens).expect("write matched_tokens");
+    write_str(out, "npu_blocks").expect("write key");
+    write_u32(out, blocks.npu_blocks).expect("write npu_blocks");
+    write_str(out, "cpu_blocks").expect("write key");
+    write_u32(out, blocks.cpu_blocks).expect("write cpu_blocks");
+    write_str(out, "disk_blocks").expect("write key");
+    write_u32(out, blocks.disk_blocks).expect("write disk_blocks");
+}
+
+/// Encode the `_global` object, including the nested `dp_ranges` map.
+fn encode_global_match_msgpack(out: &mut Vec<u8>, global: &GlobalMatchData) {
+    use rmp::encode::*;
+    write_map_len(out, 5).expect("global map len");
+    write_str(out, "matched_tokens").expect("write key");
+    write_u32(out, global.matched_tokens).expect("write matched_tokens");
+    write_str(out, "npu_blocks").expect("write key");
+    write_u32(out, global.npu_blocks).expect("write npu_blocks");
+    write_str(out, "cpu_blocks").expect("write key");
+    write_u32(out, global.cpu_blocks).expect("write cpu_blocks");
+    write_str(out, "disk_blocks").expect("write key");
+    write_u32(out, global.disk_blocks).expect("write disk_blocks");
+    write_str(out, "dp_ranges").expect("write key");
+    write_map_len(
+        out,
+        u32::try_from(global.dp_ranges.len()).expect("dp_ranges len fits u32"),
+    )
+    .expect("write map len");
+    for (instance, ranks) in &global.dp_ranges {
+        write_str(out, instance).expect("write instance");
+        write_map_len(out, u32::try_from(ranks.len()).expect("ranks len fits u32"))
+            .expect("write map len");
+        for (rank, ranges) in ranks {
+            write_str(out, rank).expect("write rank");
+            write_array_len(
+                out,
+                u32::try_from(ranges.len()).expect("ranges len fits u32"),
+            )
+            .expect("write array len");
+            for (start, end) in ranges {
+                write_array_len(out, 2).expect("range tuple len");
+                write_u32(out, *start).expect("write range start");
+                write_u32(out, *end).expect("write range end");
+            }
+        }
+    }
+}
+
 /// Encode a full `/query` response into MessagePack.
 ///
 /// Written with `rmp::encode` instead of `rmp_serde` to avoid the
-/// `#[serde(flatten)]` map-merge pitfall on `QueryResponse`.
+/// `#[serde(flatten)]` map-merge pitfall on `QueryResponse` / `TenantMatchData`.
+///
+/// The tenant map length is `instances + 1` because `_global` is always
+/// serialized (no `skip_serializing_if`); adding one would silently corrupt the
+/// frame if that ever changes.
 pub fn encode_query_response_msgpack(response: &QueryResponse, out: &mut Vec<u8>) {
     use rmp::encode::*;
     write_map_len(
@@ -334,34 +452,28 @@ pub fn encode_query_response_msgpack(response: &QueryResponse, out: &mut Vec<u8>
         u32::try_from(response.tenants.len()).expect("tenants len fits u32"),
     )
     .expect("write map len");
-    for (tenant, instances) in &response.tenants {
+    for (tenant, data) in &response.tenants {
         write_str(out, tenant).expect("write tenant");
-        write_map_len(
-            out,
-            u32::try_from(instances.len()).expect("instances len fits u32"),
-        )
-        .expect("write map len");
-        for (instance, data) in instances {
+        let map_len = u32::try_from(data.instances.len())
+            .expect("instances len fits u32")
+            .checked_add(1)
+            .expect("instances + _global fits u32");
+        write_map_len(out, map_len).expect("write map len");
+        for (instance, inst) in &data.instances {
             write_str(out, instance).expect("write instance");
             write_map_len(out, 2).expect("instance map len");
             write_str(out, "longest_matched").expect("write key");
-            write_u32(out, data.longest_matched).expect("write longest_matched");
+            write_u32(out, inst.longest_matched).expect("write longest_matched");
             write_str(out, "DP").expect("write key");
-            write_map_len(out, u32::try_from(data.dp.len()).expect("dp len fits u32"))
+            write_map_len(out, u32::try_from(inst.dp.len()).expect("dp len fits u32"))
                 .expect("write map len");
-            for (rank, blocks) in &data.dp {
+            for (rank, blocks) in &inst.dp {
                 write_str(out, rank).expect("write rank");
-                write_map_len(out, 4).expect("blocks map len");
-                write_str(out, "matched_tokens").expect("write key");
-                write_u32(out, blocks.matched_tokens).expect("write matched_tokens");
-                write_str(out, "npu_blocks").expect("write key");
-                write_u32(out, blocks.npu_blocks).expect("write npu_blocks");
-                write_str(out, "cpu_blocks").expect("write key");
-                write_u32(out, blocks.cpu_blocks).expect("write cpu_blocks");
-                write_str(out, "disk_blocks").expect("write key");
-                write_u32(out, blocks.disk_blocks).expect("write disk_blocks");
+                encode_dp_blocks_msgpack(out, blocks);
             }
         }
+        write_str(out, GLOBAL_QUERY_KEY).expect("write global key");
+        encode_global_match_msgpack(out, &data.global);
     }
 }
 
@@ -1045,8 +1157,51 @@ mod tests {
                 dp,
             },
         );
-        tenants.insert("default".to_string(), instances);
+
+        // A pool-wide span stitched across two DPs, with a multi-range DP so the
+        // nested `dp_ranges` encoding is exercised (map → map → array of pairs).
+        let mut dp_ranges: HashMap<String, HashMap<String, Vec<(u32, u32)>>> = HashMap::new();
+        dp_ranges
+            .entry("prefill-0".to_string())
+            .or_default()
+            .insert("0".to_string(), vec![(0, 3)]);
+        dp_ranges
+            .entry("prefill-1".to_string())
+            .or_default()
+            .insert("2".to_string(), vec![(0, 1), (3, 5)]);
+
+        tenants.insert(
+            "default".to_string(),
+            TenantMatchData {
+                instances,
+                global: GlobalMatchData {
+                    matched_tokens: 640,
+                    npu_blocks: 3,
+                    cpu_blocks: 2,
+                    disk_blocks: 0,
+                    dp_ranges,
+                },
+            },
+        );
         QueryResponse { tenants }
+    }
+
+    #[test]
+    fn test_query_response_includes_global_key() {
+        let response = sample_query_response();
+        let json = serde_json::to_value(&response).unwrap();
+        // `_global` is a sibling of the instance IDs, not nested under one.
+        assert_eq!(json["default"]["prefill-0"]["longest_matched"], 512);
+        assert_eq!(json["default"]["_global"]["npu_blocks"], 3);
+        assert_eq!(json["default"]["_global"]["cpu_blocks"], 2);
+        assert_eq!(json["default"]["_global"]["matched_tokens"], 640);
+        // Ranges serialize as compact [start, end) pairs.
+        assert_eq!(
+            json["default"]["_global"]["dp_ranges"]["prefill-1"]["2"],
+            serde_json::json!([[0, 1], [3, 5]])
+        );
+        // The tenant level must not accidentally carry instance-shaped fields.
+        assert!(json["default"].get("DP").is_none());
     }
 
     #[test]

@@ -35,10 +35,11 @@ pub use error::KvConductorError;
 pub use hashing::compute_block_hash_for_seq;
 pub use indexer::Indexer;
 pub use protocols::{
-    DpRank, HbmIpIndex, InstanceId, InstanceMatchData, KvCacheEvent, KvCacheEventData,
-    KvCacheStoreData, KvCacheStoredBlockData, KvEventBatch, KvEventWirePayload, LocalBlockHash,
-    OverlapBlocks, QueryByHashRequest, QueryRequest, QueryResponse, RegisterRequest,
-    SequenceBlockHash, StorageMedium, UnregisterRequest, WorkerKey,
+    DpRank, GlobalMatchData, HbmIpIndex, InstanceId, InstanceMatchData, KvCacheEvent,
+    KvCacheEventData, KvCacheStoreData, KvCacheStoredBlockData, KvEventBatch, KvEventWirePayload,
+    LocalBlockHash, OverlapBlocks, QueryByHashRequest, QueryRequest, QueryResponse,
+    RegisterRequest, SequenceBlockHash, StorageMedium, TenantMatchData, UnregisterRequest,
+    WorkerKey, GLOBAL_QUERY_KEY,
 };
 pub use registry::WorkerRegistry;
 pub use server::create_router;

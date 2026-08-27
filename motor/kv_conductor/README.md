@@ -242,6 +242,51 @@ Coordinator                                  KV Conductor
 | `npu_blocks` / `cpu_blocks` / `disk_blocks` | 该 DP 互斥真实命中块数（同前缀副本只归最高优先级介质） |
 | `matched_tokens` | 互斥块数之和 × `block_size`（真实覆盖长度） |
 | `longest_matched` | 该实例所有 DP 的 `matched_tokens` 最大值 |
+| `cpu_local_blocks` / `cpu_remote_blocks` | `cpu_blocks` 按**块在哪台机器**拆开：本地（搬运便宜）/ 远端（跨机传输） |
+| `disk_local_blocks` / `disk_remote_blocks` | 同上，对应 `disk_blocks` |
+
+### 池命中的本地/远端拆分
+
+池块任意节点可取，但**搬运距离不同**：本机 DRAM 几乎免费，跨机要走
+`device_rdma` / `device_sdma` / `device_urma`。原先所有池命中都统一记作 `cpu_blocks`，
+调度器看不出距离差异。现在每个 DP 的池命中会按块所在机器拆成两半：
+
+```text
+  inst-a（node-1）HBM 有块 0；池链 [1,4) 中
+    块 1 的 owner 是 inst-b（也在 node-1）  -> 本地
+    块 2、3 的 owner 是 inst-c（node-2）    -> 远端
+
+  inst-a: npu_blocks=1, cpu_blocks=3, cpu_local_blocks=1, cpu_remote_blocks=2
+  inst-c: npu_blocks=1, cpu_blocks=3, cpu_local_blocks=2, cpu_remote_blocks=1
+```
+
+**不变式**：`cpu_local_blocks + cpu_remote_blocks == cpu_blocks`。拆分只覆盖高优先级
+介质终点之后的位置——之前的块已在本地 HBM，不需要搬运。
+
+**owner 位置未知时算远端**：位置不明绝不能当作本地，否则会低估搬运成本。因此
+Coordinator 尚未下发 `node_id` 时，`node_id` 回退为 Pod IP，本地/远端退化为
+「同 Pod / 不同 Pod」——仍然有意义，只是检测不到同机跨 Pod 的共置。
+
+### root 走查的 node 直方图 `_root_node_hits`
+
+每层池介质的 root 走查从块 0 开始且忽略 owner，因此**对所有 DP 结果相同**、只计算一次。
+这也意味着它没有单一的 per-DP 本地/远端拆分——所以直接返回原始直方图，与实例 ID 平级：
+
+```json
+{
+  "default": {
+    "vllm-prefill-1": { "longest_matched": 512, "DP": { "0": { "...": 0 } } },
+    "_root_node_hits": {
+      "cpu": { "node-1": 3, "node-2": 1 },
+      "disk": {}
+    }
+  }
+}
+```
+
+含义是「该机器持有共享跨度中的多少块」。客户端可以据此回答任意 node 的本地占比，包括
+它没有主动询问的 node。注意一块可能被多台机器同时持有，所以各 node 的计数之和可以大于
+走查长度。
 
 调度器读取 `DP[<dp_rank>]` 的 `*_blocks`，按 `scheduler_config.kv_affinity`
 中的 `w_npu/w_cpu/w_disk`（默认 `1.0/1.0/0.0`）加权后再算亲和分（见亲和性调度文档）。

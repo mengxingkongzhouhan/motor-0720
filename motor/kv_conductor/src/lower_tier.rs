@@ -147,6 +147,14 @@ impl EdgeOwnersEntry {
             Self::Multi { owners, .. } => owners.iter().cloned().collect(),
         }
     }
+
+    /// Visit every owner without allocating.
+    fn for_each_owner(&self, mut f: impl FnMut(&WorkerKey)) {
+        match self {
+            Self::Single { owner, .. } => f(owner),
+            Self::Multi { owners, .. } => owners.iter().for_each(f),
+        }
+    }
 }
 
 /// Where a lower-tier walk should resume for one worker.
@@ -375,6 +383,26 @@ impl LowerTierIndexer {
         start_pos: usize,
         start_parent: Option<SequenceBlockHash>,
     ) -> Option<ContiguousHit> {
+        self.reachable_from_traced(local_hashes, start_pos, start_parent, |_, _| {})
+    }
+
+    /// [`Self::reachable_from`] plus a per-owner callback.
+    ///
+    /// `visit(pos, owner)` fires once per owner of each traversed block, with
+    /// `pos` the absolute query position. Callers use it to attribute blocks —
+    /// e.g. "is this block held by a DP on my own machine" — without this index
+    /// having to know anything about locality, and **without cloning owners**:
+    /// the callback borrows them from under the read lock.
+    pub fn reachable_from_traced<F>(
+        &self,
+        local_hashes: &[LocalBlockHash],
+        start_pos: usize,
+        start_parent: Option<SequenceBlockHash>,
+        mut visit: F,
+    ) -> Option<ContiguousHit>
+    where
+        F: FnMut(usize, &WorkerKey),
+    {
         if start_pos >= local_hashes.len() {
             return None;
         }
@@ -391,6 +419,7 @@ impl LowerTierIndexer {
             let Some(edge) = edges.get(&key) else {
                 break;
             };
+            edge.for_each_owner(|owner| visit(cur_pos, owner));
             cur_hash = Some(edge.child_hash());
             cur_pos += 1;
         }

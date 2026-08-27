@@ -310,20 +310,19 @@ root 走查不依赖任何上层覆盖，所以「HBM 全被驱逐、池中保�
    └── Pod（另一个 podIP）── DP 0 ...
 ```
 
-带上 `node_id` 后，`NodeTopology` 维护两张表（同一把锁，避免解析到半更新状态）。
-**两张表的方向都是「指向 node」**：
+带上 `node_id` 后，`NodeTopology` 维护三张表（同一把锁，避免解析到半更新状态）：
 
 | 表 | 键 → 值 | 用途 |
 |----|---------|------|
-| `dp_to_node` | `(instance_id, dp_rank)` → `{pod_ip, node_id}` | 给一个 DP（边的 owner），问它在哪台机器 |
+| `dp_to_node` | `(instance_id, dp_rank)` → `{pod_ip, node_id, model_name, tenant_id}` | 给一个 DP，问它在哪台机器、服务什么 |
 | `pod_to_node` | Pod IP → node 标识 | 给一个 Pod IP（池事件的 `backend_id`），问它在哪台机器 |
+| `node_to_dps` | node 标识 → 该机器上的 DP 列表 | **池事件的广播集合** |
 
-**为什么是这个方向**：消费者要回答的问题是「这个池块的 owner 和我是不是同一台机器」，
-用 `dp → node` 是两次 O(1) 查表加一次比较；反向的 `node → dps` 每次都要扫列表，而且
-没有对应的消费场景（原本设想的「扇出到同机所有 DP」在走查改为忽略 owner 后已无效果——
-走查不再读 owner，扇出只会让每条边的 owner 集合变大而不改变任何上报数字）。
+前两张指向 node，`node_to_dps` 是反向的。反向表**唯一**的消费者是池事件广播：事件只带
+一个 Pod IP，而池块在整台机器的 DRAM 里，该机器上每个 DP 都能免费读到，所以必须落到
+该 node 上的所有 DP（跨 Pod）。`dp_to_node` 里的 model/tenant 就是用来收窄这个广播的。
 
-`same_node(dp_a, dp_b)` 封装了这个判断。**任一方位置未知时返回 `false`** —— 位置不明
+`same_node(dp_a, dp_b)` 封装了同机判断。**任一方位置未知时返回 `false`** —— 位置不明
 绝不能当作同机，否则远端块会被算成本地、低估搬运成本。
 
 **生命周期**：写入时机完全跟随注册——`/register` 写、`/unregister` 删、后端类型变化的
@@ -331,20 +330,48 @@ root 走查不依赖任何上层覆盖，所以「HBM 全被驱逐、池中保�
 重调度产生的是新 Pod、新 IP），所以每个 Pod 只在注册时写一次。DP 条目在注销时立即删除；
 `pod_to_node` 因为可能被同 Pod 的其他 DP 共用，只在该 Pod 最后一个 DP 离开后才删（DP 表
 的条目里带着自己的 `pod_ip`，扫一遍即可判断，注销是低频操作，比维护单独的计数更简单）。
+`node_to_dps` 里的反向条目与 DP 条目**一起**删除，重注册换机器时也会先摘掉旧机器上的
+条目 —— 否则迁走的 DP 仍会收到旧机器的广播，凭空成为一批读不到的块的 owner。
 
 **只记录 HBM endpoint 的 IP**：`cpu` / `disk` endpoint 可能指向别处的池服务，其 IP 不是
 本引擎的 Pod IP。这也保证 `pod_to_node` 与 `hbm_ip_index` 的键来自同一处
 （`extract_ip_from_endpoint(medium_endpoints["npu"])`），两张索引对得上。
 
-**当前状态**：Coordinator **尚未下发** `node_id`，因此两张表默认为空、行为与之前完全一致；
-表也**尚未接入任何匹配或打分逻辑**，仅通过 `GET /workers` 的 `topology` 字段暴露，供外部
-客户端和排查使用。要让 Coordinator 填上这个字段，需要把机器标识从 NodeManager 经 Controller
-透传到 Coordinator——目前 `motor/` 里 `host_ip` 只在 `inventory_collector.py` 出现过一次
-且是硬编码空串，`NodeManagerInfo` 也只有 `pod_ip`，这条链路尚不存在。
+**当前状态**：Coordinator **尚未下发** `node_id`，因此三张表默认为空，广播退化为「只发给
+事件 Pod 自己的 DP」，即改动前的行为。要让 Coordinator 填上这个字段，需要把机器标识从
+NodeManager 经 Controller 透传到 Coordinator——目前 `motor/` 里 `host_ip` 只在
+`inventory_collector.py` 出现过一次且是硬编码空串，`NodeManagerInfo` 也只有 `pod_ip`，
+这条链路尚不存在。在此之前，下面的本地/远端拆分中「本地」的含义是「同 Pod」。
 
-后续可能的用途：区分"本地池命中"（同 Pod / 同 Node，搬运便宜）与"远端池命中"（跨机，
-需走 `device_rdma` / `device_sdma` / `device_urma`），当前所有池命中都统一记作 `cpu_blocks`，
-无法体现搬运距离差异。是否值得做取决于本地与远端池命中的实测 TTFT 差距。
+### 池命中的本地/远端拆分
+
+池块任意节点可取，但**搬运代价不同**：本机 DRAM 几乎免费，跨机要走
+`device_rdma` / `device_sdma` / `device_urma`。原先所有池命中都统一记作 `cpu_blocks`，
+调度器看不出搬运距离差异。
+
+**机器级归属发生在摄入端，不在查询端。** 一条池事件广播给事件 Pod 所在 node 上的所有
+DP，于是边的 owner 集合直接就是「能免费读到这块的 DP 集合」。查询侧只需问「owner 里有
+没有当前 DP」，**完全不需要拓扑表**：
+
+```text
+  走查覆盖 [start, end)，逐块问 owner 里有没有自己
+    有   -> cpu_local_blocks  += 1     本机 DRAM
+    没有 -> cpu_remote_blocks += 1     跨机传输
+
+  只统计 npu_end 之后的位置：之前的块已在本地 HBM，不需要搬运
+  => cpu_local_blocks + cpu_remote_blocks == cpu_blocks（不变式，有测试守护）
+```
+
+实现上，走查对所有 DP 相同（忽略 owner），所以只走一次并顺手收下经过的块标识
+（`reachable_chain`）；每个 DP 再拿这串标识去查已有的 per-worker 反查表
+（`count_owned`），而不是每个 DP 各走一遍。
+
+**广播按 model + tenant 收窄**：一台机器可以跑多个部署的 Pod，把 A 模型的块记到服务 B
+模型的 DP 上，会让 Coordinator 把请求路由到根本答不上的 Pod —— 这是路由错误，不只是
+指标不准。
+
+是否把这个信号接入打分（新增 `w_remote` 权重）取决于本地与远端池命中的实测 TTFT 差距，
+先把信号暴露出来再谈。
 
 ---
 

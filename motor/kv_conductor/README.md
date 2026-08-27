@@ -218,54 +218,6 @@ Coordinator                                  KV Conductor
 | `matched_tokens` | 互斥块数之和 × `block_size`（真实覆盖长度） |
 | `longest_matched` | 该实例所有 DP 的 `matched_tokens` 最大值 |
 
-### 池级整体命中 `_global`
-
-响应在每个 tenant 里还带一个保留键 `_global`，与实例 ID 平级：
-
-```json
-{
-  "default": {
-    "vllm-prefill-1": { "longest_matched": 256, "DP": { "0": { "...": 0 } } },
-    "_global": {
-      "matched_tokens": 512,
-      "npu_blocks": 2,
-      "cpu_blocks": 2,
-      "disk_blocks": 0,
-      "dp_ranges": {
-        "vllm-prefill-1": { "0": [[0, 2]] },
-        "vllm-prefill-2": { "0": [[2, 4]] }
-      }
-    }
-  }
-}
-```
-
-**它和实例条目回答的是不同的问题：**
-
-| | 实例 `DP` 条目 | `_global` |
-|---|---|---|
-| 问题 | 这个 DP **本地**有多长 | 池子里**任意位置**加起来有多长 |
-| 走查 | 逐边校验 owner，遇到不属于自己的边即停 | **忽略 owner**，只要边存在就继续 |
-| 能否跨 DP 拼接 | 不能 | **能**——可以超过任何单个 DP |
-| 用途 | 亲和调度选点（局部性信号） | 观测池化整体命中率 |
-
-之所以「跨 DP 拼接」是有意义的：池化块通过后端的传输协议
-（`device_rdma` / `device_sdma` / `device_urma`，见 `mmc-local-*.conf` 的
-`ock.mmc.local_service.protocol`）**任意节点可取**，所以跨 DP 拼出来的连续段照样能让引擎
-跳过 prefill，区别只在搬运开销。`dp_ranges` 说明哪一段在谁本地。
-
-| 字段 | 含义 |
-|------|------|
-| `npu_blocks` / `cpu_blocks` / `disk_blocks` | 池级跨度上的互斥块数（同 NPU > CPU > Disk 规则） |
-| `matched_tokens` | 互斥块数之和 × `block_size` |
-| `dp_ranges` | `instance_id → dp_rank → [[start, end), ...]`，块下标半开区间、连续段已合并 |
-
-> **不要对 `_global` 的 `*_blocks` 套介质权重。** 它们是在一个「没有任何单个 DP 完整拥有」的
-> 跨度上做的切分，加权求和会超过任何路由决策实际能达成的值。加权只对实例 `DP` 条目有意义。
-
-走到第一个缺失边即停；缺口之后的块无法作为连续前缀使用，因此不计入 `matched_tokens`，也不会
-出现在 `dp_ranges` 里。无命中时 tenant 仍返回 `{}`（不含 `_global`）。
-
 调度器读取 `DP[<dp_rank>]` 的 `*_blocks`，按 `scheduler_config.kv_affinity`
 中的 `w_npu/w_cpu/w_disk`（默认 `1.0/1.0/0.0`）加权后再算亲和分（见亲和性调度文档）。
 

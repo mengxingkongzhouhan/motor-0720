@@ -38,9 +38,7 @@
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::protocols::{
-    DpRank, InstanceId, KvCacheStoreData, LocalBlockHash, SequenceBlockHash, WorkerKey,
-};
+use crate::protocols::{KvCacheStoreData, LocalBlockHash, SequenceBlockHash, WorkerKey};
 
 type WorkerSet = FxHashSet<WorkerKey>;
 
@@ -147,15 +145,6 @@ impl EdgeOwnersEntry {
         match self {
             Self::Single { owner, .. } => vec![owner.clone()],
             Self::Multi { owners, .. } => owners.iter().cloned().collect(),
-        }
-    }
-
-    /// Visit every owner without allocating (used by the pool-wide walk, which
-    /// touches one edge per block and does not need an owned list).
-    fn for_each_owner(&self, mut f: impl FnMut(&WorkerKey)) {
-        match self {
-            Self::Single { owner, .. } => f(owner),
-            Self::Multi { owners, .. } => owners.iter().for_each(f),
         }
     }
 }
@@ -363,92 +352,6 @@ impl LowerTierIndexer {
 
     pub fn is_empty(&self) -> bool {
         self.worker_blocks.read().is_empty()
-    }
-
-    /// Pool-wide contiguous span on this tier, **ignoring** ownership.
-    ///
-    /// Returns the farthest absolute end reachable by following existing edges,
-    /// plus the sequence hash of the last block (for chaining into the next
-    /// tier). Two candidates are tried — a root walk and, when `resume_pos` is
-    /// non-zero, a resume from the upstream tier's pool-wide end — and the
-    /// farther one wins, mirroring the per-worker candidate logic.
-    ///
-    /// `coverage[i]` accumulates the DPs owning the block at query position `i`
-    /// for every position traversed, including positions from the losing
-    /// candidate: those blocks really are held by those DPs on this tier. The
-    /// caller trims `coverage` to the final span, since blocks past the first
-    /// gap are not reachable as part of a contiguous prefix.
-    ///
-    /// This is deliberately ownership-blind: pooled blocks are fetchable from
-    /// any node, so a span assembled across DPs still lets the engine skip
-    /// prefill. Per-worker coverage ([`Self::query_contiguous_hits`]) remains
-    /// the locality signal used for affinity scheduling.
-    pub fn global_span(
-        &self,
-        local_hashes: &[LocalBlockHash],
-        resume_pos: usize,
-        resume_parent: Option<SequenceBlockHash>,
-        coverage: &mut [FxHashSet<(InstanceId, DpRank)>],
-    ) -> (usize, Option<SequenceBlockHash>) {
-        if local_hashes.is_empty() {
-            return (0, None);
-        }
-        let edges = self.edges.read();
-
-        let mut best = Self::walk_global(&edges, local_hashes, 0, None, coverage);
-
-        if resume_pos > 0 && resume_pos < local_hashes.len() {
-            let resumed =
-                Self::walk_global(&edges, local_hashes, resume_pos, resume_parent, coverage);
-            if let Some(hit) = resumed {
-                let farther = match best {
-                    Some(b) => hit.0 >= b.0,
-                    None => true,
-                };
-                if farther {
-                    best = Some(hit);
-                }
-            }
-        }
-
-        best.unwrap_or((0, None))
-    }
-
-    /// Follow edges from `start_pos` regardless of owner; `None` when the first
-    /// edge is already missing (so a zero-length walk never reports its start
-    /// position as an end).
-    fn walk_global(
-        edges: &FxHashMap<TransitionKey, EdgeOwnersEntry>,
-        local_hashes: &[LocalBlockHash],
-        start_pos: usize,
-        start_parent: Option<SequenceBlockHash>,
-        coverage: &mut [FxHashSet<(InstanceId, DpRank)>],
-    ) -> Option<(usize, Option<SequenceBlockHash>)> {
-        let mut cur_pos = start_pos;
-        let mut cur_hash = start_parent;
-
-        while cur_pos < local_hashes.len() {
-            let key = TransitionKey {
-                parent_hash: cur_hash,
-                local_hash: local_hashes[cur_pos],
-            };
-            let Some(edge) = edges.get(&key) else {
-                break;
-            };
-            if let Some(slot) = coverage.get_mut(cur_pos) {
-                edge.for_each_owner(|w| {
-                    slot.insert((w.instance_id.clone(), w.dp_rank));
-                });
-            }
-            cur_hash = Some(edge.child_hash());
-            cur_pos += 1;
-        }
-
-        if cur_pos > start_pos {
-            Some((cur_pos, cur_hash))
-        } else {
-            None
-        }
     }
 
     /// For each worker, walk contiguous lower-tier hits from its continuations.

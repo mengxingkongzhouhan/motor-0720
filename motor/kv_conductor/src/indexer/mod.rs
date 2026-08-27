@@ -340,102 +340,6 @@ impl IndexerEntry {
         (overlap, medium_ends)
     }
 
-    /// Pool-wide contiguous prefix, ignoring which DP owns each block.
-    ///
-    /// Chains the three tiers the same way [`Self::find_matches_with_coverage`]
-    /// does (HBM → CPU → `max(HBM, CPU)` → Disk) but ownership-blind, so the
-    /// span may be assembled across DPs and exceed every individual DP's
-    /// coverage. Any DP can fetch any pooled block, so such a span still lets
-    /// the engine skip prefill; `dp_ranges` records where each part is local.
-    ///
-    /// Per-DP results are computed separately and are **not** affected — they
-    /// remain the locality signal the scheduler ranks by.
-    fn find_global_span(
-        &self,
-        block_hashes: &[LocalBlockHash],
-        block_size: u32,
-    ) -> GlobalMatchData {
-        if block_hashes.is_empty() {
-            return GlobalMatchData::default();
-        }
-
-        // coverage[i] = DPs holding the block at query position i, on any medium.
-        let mut coverage: Vec<FxHashSet<(String, DpRank)>> =
-            vec![FxHashSet::default(); block_hashes.len()];
-
-        let (npu_end, npu_last) = self.hbm_tree.global_prefix(block_hashes, &mut coverage);
-        let (cpu_end, cpu_last) =
-            self.cpu_tiers
-                .global_span(block_hashes, npu_end, npu_last, &mut coverage);
-
-        // Disk resumes after the farther of HBM / CPU, preferring CPU on ties
-        // (matches the per-DP breakpoint merge).
-        let (disk_resume, disk_parent) = if cpu_end >= npu_end {
-            (cpu_end, cpu_last)
-        } else {
-            (npu_end, npu_last)
-        };
-        let (disk_end, _) =
-            self.disk_tiers
-                .global_span(block_hashes, disk_resume, disk_parent, &mut coverage);
-
-        let ends = MediumEnds {
-            npu: npu_end as u32,
-            cpu: cpu_end as u32,
-            disk: disk_end as u32,
-        };
-        let npu = ends.npu;
-        let cpu = ends.cpu.saturating_sub(ends.npu);
-        let disk = ends.disk.saturating_sub(ends.npu.max(ends.cpu));
-        let covered = npu.saturating_add(cpu).saturating_add(disk);
-
-        // The exclusive partition sums to the farthest end, which is where the
-        // contiguous prefix stops. Blocks past it sit behind a gap and are not
-        // reachable as part of a prefix, so drop them from the ownership map.
-        let span_end = covered as usize;
-        coverage.truncate(span_end);
-
-        GlobalMatchData {
-            matched_tokens: covered.saturating_mul(block_size),
-            npu_blocks: npu,
-            cpu_blocks: cpu,
-            disk_blocks: disk,
-            dp_ranges: Self::coverage_to_ranges(&coverage),
-        }
-    }
-
-    /// Collapse `position → DPs` into `instance → dp_rank → [[start, end), ...]`.
-    ///
-    /// Runs are merged so a DP holding a contiguous stretch yields one range
-    /// instead of one entry per block — the common case, and what keeps the
-    /// response small on long-context queries.
-    fn coverage_to_ranges(
-        coverage: &[FxHashSet<(String, DpRank)>],
-    ) -> HashMap<String, HashMap<String, Vec<(u32, u32)>>> {
-        // (instance, dp) -> ranges, built by extending the open run when the
-        // previous position also belonged to this DP.
-        let mut runs: HashMap<(String, DpRank), Vec<(u32, u32)>> = HashMap::new();
-
-        for (pos, dps) in coverage.iter().enumerate() {
-            let pos = pos as u32;
-            for key in dps {
-                let entry = runs.entry(key.clone()).or_default();
-                match entry.last_mut() {
-                    Some(last) if last.1 == pos => last.1 = pos + 1,
-                    _ => entry.push((pos, pos + 1)),
-                }
-            }
-        }
-
-        let mut out: HashMap<String, HashMap<String, Vec<(u32, u32)>>> = HashMap::new();
-        for ((instance_id, dp_rank), ranges) in runs {
-            out.entry(instance_id)
-                .or_default()
-                .insert(dp_rank.to_string(), ranges);
-        }
-        out
-    }
-
     #[inline]
     fn note_medium_end(
         medium_ends: &mut FxHashMap<(String, DpRank), MediumEnds>,
@@ -1111,42 +1015,23 @@ impl Indexer {
         );
         let t_tree = t0.elapsed();
 
-        let global = entry.find_global_span(&block_hashes, block_size);
-        let global_us = t0.elapsed().saturating_sub(t_tree).as_micros();
-        let resp = self.build_response(
-            &overlap,
-            &medium_ends,
-            global,
-            model_name,
-            tenant_id,
-            block_size,
-        );
+        let resp = self.build_response(&overlap, &medium_ends, model_name, tenant_id, block_size);
         let total = t0.elapsed();
 
         // Longest per-medium coverage across workers, in blocks.
         let npu_blocks = medium_ends.values().map(|m| m.npu).max().unwrap_or(0);
         let cpu_blocks = medium_ends.values().map(|m| m.cpu).max().unwrap_or(0);
         let disk_blocks = medium_ends.values().map(|m| m.disk).max().unwrap_or(0);
-        // Pool-wide span; can exceed the per-DP maxima above when the prefix is
-        // split across DPs.
-        let global_matched_tokens = resp
-            .as_ref()
-            .ok()
-            .and_then(|r| r.tenants.get(tenant_id))
-            .map(|t| t.global.matched_tokens)
-            .unwrap_or(0);
 
         tracing::debug!(
             num_tokens = token_ids.len(),
             block_size,
             hash_us,
             match_us = t_tree.as_micros(),
-            global_us,
             total_us = total.as_micros(),
             npu_blocks,
             cpu_blocks,
             disk_blocks,
-            global_matched_tokens,
             "query profile"
         );
         resp
@@ -1168,24 +1053,19 @@ impl Indexer {
 
         let (overlap, medium_ends) = entry.find_matches_with_coverage(block_hashes);
         // Default to 1 token per hash (no scaling) since we don't know the
-        // original block_size from the hash alone. Same caveat applies to the
-        // `_global` entry: its `matched_tokens` is in blocks on this endpoint.
-        let global = entry.find_global_span(block_hashes, 1);
-        self.build_response(&overlap, &medium_ends, global, model_name, tenant_id, 1)
+        // original block_size from the hash alone.
+        self.build_response(&overlap, &medium_ends, model_name, tenant_id, 1)
     }
 
-    /// Build a `QueryResponse` from per-DP absolute medium ends plus the
-    /// pool-wide `_global` entry.
+    /// Build a `QueryResponse` from per-DP absolute medium ends.
     ///
-    /// Per-DP `*_blocks` are exclusive contributions (priority NPU > CPU > Disk).
+    /// `*_blocks` are exclusive contributions (priority NPU > CPU > Disk).
     /// `matched_tokens = (npu + cpu + disk) × block_size` (unweighted coverage;
-    /// Coordinator applies tier affinity weights). `_global` uses the same
-    /// exclusive rule over the ownership-blind span — see [`GlobalMatchData`].
+    /// Coordinator applies tier affinity weights).
     fn build_response(
         &self,
         overlap: &OverlapBlocks,
         medium_ends: &FxHashMap<(String, DpRank), MediumEnds>,
-        global: GlobalMatchData,
         model_name: &str,
         tenant_id: &str,
         block_size: u32,
@@ -1219,13 +1099,9 @@ impl Indexer {
         }
 
         let mut response = QueryResponse::default();
-        response.tenants.insert(
-            tenant_id.to_string(),
-            TenantMatchData {
-                instances: instance_data,
-                global,
-            },
-        );
+        response
+            .tenants
+            .insert(tenant_id.to_string(), instance_data);
 
         Ok(response)
     }

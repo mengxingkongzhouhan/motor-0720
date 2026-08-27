@@ -87,8 +87,6 @@ Coordinator 调度器（`kv_cache_affinity`）按 `*_blocks` 与配置项
 - 上层介质命中后，下层介质**从本 DP 自己的上层断点续查**（断点不跨 DP 共享）；同时对拥有首边的 worker **无条件 root 走查**，与续接链并列，取绝对终点最远者（如实报告更长副本）
 - HBM 是前缀树（从 root 走）；CPU/Disk 是 continuation-edge 图（断点续查 + root 走查）
 - 同一 `(instance_id, dp_rank)` 的跨介质命中在响应中聚合到同一个 DP 条目
-- 除 per-DP 结果外，另有一路**忽略 owner** 的池级走查产出 `_global`（见下文「池级整体命中」），
-  两者并行计算、互不影响：per-DP 是调度用的局部性信号，`_global` 是池化整体命中率的观测量
 
 ### HBM 索引：ConcurrentRadixTree
 
@@ -203,45 +201,6 @@ DP 覆盖」，而这只有在 `[0, 起点)` 由该 DP **自己的**上层介质
 
 root 走查不受此限制（它自带 `start_pos=0`，不依赖任何上层覆盖），所以「HBM 全被驱逐、
 下层保有完整根链」这一池化核心场景仍能如实报告。
-
-### 池级整体命中：`_global`
-
-per-DP 走查回答「哪个节点**本地**有」，是调度选点用的局部性信号。但池化块通过后端传输协议
-（`device_rdma` / `device_sdma` / `device_urma`）**任意节点可取**，所以还存在另一个有意义的
-问题：「这段前缀在池子里**任意位置**加起来有多长」——只要有，引擎就能跳过 prefill，区别仅在
-搬运开销。这一路由 `IndexerEntry::find_global_span` 计算，写入响应的 `_global` 保留键。
-
-两路走查的差别只有一处：**是否校验 owner**。
-
-```text
-  per-DP   （query_contiguous_hits / find_matches_detailed）
-    edge 存在 && edge.contains(worker)  -> 继续
-    否则                                -> 停
-    => 每个 DP 各自的本地连续覆盖，可用于加权打分
-
-  池级     （global_span / global_prefix）
-    edge 存在（HBM 节点还需 workers 非空，排除待清理的孤儿节点）  -> 继续
-    否则                                                        -> 停
-    => 跨 DP 拼接的连续覆盖，可超过任何单个 DP
-```
-
-三层链接方式与 per-DP 一致（HBM → CPU → `max(HBM, CPU)` → Disk），只是每一层的断点用的是
-**池级**终点而非某个 DP 的终点。走查过程中按位置累计 owner，最后折叠成 `dp_ranges`：
-
-```text
-  inst-a CPU: [0,2)   inst-b CPU: [2,4)（锚在 inst-a 最后一块的 block_hash 上）
-
-  per-DP：inst-a cpu_blocks=2；inst-b 无入口（既不拥有首边、也没有自己的 HBM 断点）→ 缺席
-  池级  ：root 走查忽略 owner，一路走到 4 → cpu_blocks=4, matched_tokens=4×block_size
-          dp_ranges = { inst-a: {0: [[0,2]]}, inst-b: {0: [[2,4]]} }
-```
-
-缺口之后的块**不计入**：`coverage` 会按最终跨度截断，因为断点之后的块无法作为连续前缀使用
-（即使它们确实存在于某个 DP 的 DRAM 里）。
-
-**使用约束**：`_global` 的 `*_blocks` 是在一个「没有任何单个 DP 完整拥有」的跨度上做的互斥
-切分，**不可套介质权重**——加权求和会超过任何路由决策实际能达成的值。介质权重只对实例 `DP`
-条目有意义。`_global` 的定位是观测量（池化命中率、容量规划），不是打分输入。
 
 ---
 

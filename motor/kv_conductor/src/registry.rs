@@ -763,72 +763,57 @@ mod tests {
         HashMap::from([("npu".to_string(), url.to_string())])
     }
 
-    #[test]
-    fn test_topology_maps_pods_on_one_node_to_all_its_dps() {
-        // Two Pods on node-1, plus one Pod on node-2. Resolving by any Pod IP
-        // must yield every DP on that Pod's node, across Pods.
+    /// Two Pods on node-1 (one hosting two DPs), one Pod on node-2.
+    fn seeded_topology() -> SharedNodeTopology {
         let topo: SharedNodeTopology = Arc::new(ParkingRwLock::new(NodeTopology::default()));
-
-        add_node_topology_entries(
-            &topo,
-            Some("node-1"),
-            &npu_endpoints("tcp://10.244.0.5:50090"),
-            "vllm-prefill-1",
-            0,
-        );
-        add_node_topology_entries(
-            &topo,
-            Some("node-1"),
-            &npu_endpoints("tcp://10.244.0.5:50091"),
-            "vllm-prefill-1",
-            1,
-        );
-        add_node_topology_entries(
-            &topo,
-            Some("node-1"),
-            &npu_endpoints("tcp://10.244.0.6:50090"),
-            "vllm-prefill-2",
-            0,
-        );
-        add_node_topology_entries(
-            &topo,
-            Some("node-2"),
-            &npu_endpoints("tcp://10.244.1.7:50090"),
-            "vllm-prefill-3",
-            0,
-        );
-
-        let t = topo.read();
-        assert_eq!(t.node_of("10.244.0.5"), Some("node-1"));
-        assert_eq!(t.node_of("10.244.0.6"), Some("node-1"));
-        assert_eq!(t.node_of("10.244.1.7"), Some("node-2"));
-        assert_eq!(t.node_of("10.244.9.9"), None);
-
-        // Both DPs of Pod .5 and the DP of Pod .6 share node-1.
-        let mut dps = t.dps_sharing_node_with("10.244.0.5");
-        dps.sort();
-        assert_eq!(
-            dps,
-            vec![
-                ("vllm-prefill-1".to_string(), 0),
-                ("vllm-prefill-1".to_string(), 1),
-                ("vllm-prefill-2".to_string(), 0),
-            ]
-        );
-        // Asking via the other Pod on the same node gives the same answer.
-        let mut via_other_pod = t.dps_sharing_node_with("10.244.0.6");
-        via_other_pod.sort();
-        assert_eq!(via_other_pod, dps);
-
-        // node-2 is separate.
-        assert_eq!(
-            t.dps_sharing_node_with("10.244.1.7"),
-            vec![("vllm-prefill-3".to_string(), 0)]
-        );
+        for (node, url, instance, dp) in [
+            ("node-1", "tcp://10.244.0.5:50090", "vllm-prefill-1", 0u32),
+            ("node-1", "tcp://10.244.0.5:50091", "vllm-prefill-1", 1),
+            ("node-1", "tcp://10.244.0.6:50090", "vllm-prefill-2", 0),
+            ("node-2", "tcp://10.244.1.7:50090", "vllm-prefill-3", 0),
+        ] {
+            add_node_topology_entries(&topo, Some(node), &npu_endpoints(url), instance, dp);
+        }
+        topo
     }
 
     #[test]
-    fn test_topology_record_is_idempotent() {
+    fn test_topology_resolves_dp_and_pod_to_node() {
+        let topo = seeded_topology();
+        let t = topo.read();
+
+        assert_eq!(t.node_of_dp("vllm-prefill-1", 0), Some("node-1"));
+        assert_eq!(t.node_of_dp("vllm-prefill-1", 1), Some("node-1"));
+        assert_eq!(t.node_of_dp("vllm-prefill-2", 0), Some("node-1"));
+        assert_eq!(t.node_of_dp("vllm-prefill-3", 0), Some("node-2"));
+        assert_eq!(t.node_of_dp("vllm-prefill-9", 0), None);
+        assert_eq!(t.node_of_dp("vllm-prefill-1", 7), None, "unknown dp_rank");
+
+        assert_eq!(t.node_of_pod("10.244.0.5"), Some("node-1"));
+        assert_eq!(t.node_of_pod("10.244.0.6"), Some("node-1"));
+        assert_eq!(t.node_of_pod("10.244.1.7"), Some("node-2"));
+        assert_eq!(t.node_of_pod("10.244.9.9"), None);
+    }
+
+    #[test]
+    fn test_topology_same_node_across_pods_and_unknowns() {
+        let topo = seeded_topology();
+        let t = topo.read();
+
+        // Same Pod.
+        assert!(t.same_node(("vllm-prefill-1", 0), ("vllm-prefill-1", 1)));
+        // Different Pods, same machine — the case Pod-level indexes miss.
+        assert!(t.same_node(("vllm-prefill-1", 0), ("vllm-prefill-2", 0)));
+        // Different machines.
+        assert!(!t.same_node(("vllm-prefill-1", 0), ("vllm-prefill-3", 0)));
+        // An unknown location must never count as co-located, or a remote block
+        // would be scored as local.
+        assert!(!t.same_node(("vllm-prefill-1", 0), ("vllm-prefill-9", 0)));
+        assert!(!t.same_node(("vllm-prefill-9", 0), ("vllm-prefill-8", 0)));
+    }
+
+    #[test]
+    fn test_topology_record_is_idempotent_and_overwrites_node() {
         let topo: SharedNodeTopology = Arc::new(ParkingRwLock::new(NodeTopology::default()));
         for _ in 0..3 {
             add_node_topology_entries(
@@ -839,23 +824,28 @@ mod tests {
                 0,
             );
         }
-        assert_eq!(topo.read().dps_sharing_node_with("10.244.0.5").len(), 1);
+        assert_eq!(
+            topo.read().node_of_dp("vllm-prefill-1", 0),
+            Some("node-1"),
+            "repeated registration is idempotent"
+        );
+
+        // Re-registering the same DP elsewhere (rescheduled Pod) overwrites.
+        add_node_topology_entries(
+            &topo,
+            Some("node-2"),
+            &npu_endpoints("tcp://10.244.1.9:50090"),
+            "vllm-prefill-1",
+            0,
+        );
+        assert_eq!(topo.read().node_of_dp("vllm-prefill-1", 0), Some("node-2"));
     }
 
     #[test]
     fn test_topology_forget_keeps_pod_until_its_last_dp_leaves() {
         // Pod .5 hosts two DPs. Removing one must keep the Pod→node entry so the
-        // remaining DP is still resolvable.
-        let topo: SharedNodeTopology = Arc::new(ParkingRwLock::new(NodeTopology::default()));
-        for dp in [0u32, 1u32] {
-            add_node_topology_entries(
-                &topo,
-                Some("node-1"),
-                &npu_endpoints("tcp://10.244.0.5:50090"),
-                "vllm-prefill-1",
-                dp,
-            );
-        }
+        // remaining DP is still resolvable by Pod IP.
+        let topo = seeded_topology();
 
         remove_node_topology_entries(
             &topo,
@@ -865,57 +855,27 @@ mod tests {
         );
         {
             let t = topo.read();
-            assert_eq!(t.node_of("10.244.0.5"), Some("node-1"), "Pod still has dp1");
+            assert_eq!(t.node_of_dp("vllm-prefill-1", 0), None, "dp0 removed");
+            assert_eq!(t.node_of_dp("vllm-prefill-1", 1), Some("node-1"));
             assert_eq!(
-                t.dps_sharing_node_with("10.244.0.5"),
-                vec![("vllm-prefill-1".to_string(), 1)]
+                t.node_of_pod("10.244.0.5"),
+                Some("node-1"),
+                "Pod entry survives while dp1 still runs there"
             );
         }
 
-        // Removing the last DP drops both levels.
         remove_node_topology_entries(
             &topo,
-            &npu_endpoints("tcp://10.244.0.5:50090"),
+            &npu_endpoints("tcp://10.244.0.5:50091"),
             "vllm-prefill-1",
             1,
         );
         let t = topo.read();
-        assert_eq!(t.node_of("10.244.0.5"), None);
-        assert!(t.is_empty());
-    }
-
-    #[test]
-    fn test_topology_forget_one_pod_keeps_siblings_on_same_node() {
-        let topo: SharedNodeTopology = Arc::new(ParkingRwLock::new(NodeTopology::default()));
-        add_node_topology_entries(
-            &topo,
-            Some("node-1"),
-            &npu_endpoints("tcp://10.244.0.5:50090"),
-            "vllm-prefill-1",
-            0,
-        );
-        add_node_topology_entries(
-            &topo,
-            Some("node-1"),
-            &npu_endpoints("tcp://10.244.0.6:50090"),
-            "vllm-prefill-2",
-            0,
-        );
-
-        remove_node_topology_entries(
-            &topo,
-            &npu_endpoints("tcp://10.244.0.5:50090"),
-            "vllm-prefill-1",
-            0,
-        );
-
-        let t = topo.read();
-        assert_eq!(t.node_of("10.244.0.5"), None, "the removed Pod is gone");
-        assert_eq!(t.node_of("10.244.0.6"), Some("node-1"), "sibling survives");
-        assert_eq!(
-            t.dps_sharing_node_with("10.244.0.6"),
-            vec![("vllm-prefill-2".to_string(), 0)]
-        );
+        assert_eq!(t.node_of_pod("10.244.0.5"), None, "last DP gone");
+        // The other Pods are untouched.
+        assert_eq!(t.node_of_pod("10.244.0.6"), Some("node-1"));
+        assert_eq!(t.node_of_dp("vllm-prefill-2", 0), Some("node-1"));
+        assert_eq!(t.node_of_dp("vllm-prefill-3", 0), Some("node-2"));
     }
 
     #[test]

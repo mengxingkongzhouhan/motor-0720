@@ -518,22 +518,21 @@ async fn test_node_topology_built_from_register_node_id() {
         .unwrap();
     let topo = &body["topology"];
 
-    // Table 1: pod_ip → node
+    // Table 1: DP → node. prefill-1 and prefill-2 are different Pods on one
+    // machine — the co-location a Pod-level index cannot express.
+    let dps = &topo["dp_to_node"];
+    assert_eq!(dps["vllm-prefill-1/0"]["node_id"], "node-1");
+    assert_eq!(dps["vllm-prefill-1/0"]["pod_ip"], "10.244.0.5");
+    assert_eq!(dps["vllm-prefill-1/1"]["node_id"], "node-1");
+    assert_eq!(dps["vllm-prefill-2/0"]["node_id"], "node-1");
+    assert_eq!(dps["vllm-prefill-2/0"]["pod_ip"], "10.244.0.6");
+    assert_eq!(dps["vllm-prefill-3/0"]["node_id"], "node-2");
+    assert_eq!(dps.as_object().unwrap().len(), 4);
+
+    // Table 2: Pod IP → node
     assert_eq!(topo["pod_to_node"]["10.244.0.5"], "node-1");
     assert_eq!(topo["pod_to_node"]["10.244.0.6"], "node-1");
     assert_eq!(topo["pod_to_node"]["10.244.1.7"], "node-2");
-
-    // Table 2: node → DPs. node-1 spans two Pods and three DPs.
-    let node1 = topo["node_to_dps"]["node-1"].as_array().unwrap();
-    assert_eq!(
-        node1.len(),
-        3,
-        "node-1 hosts 3 DPs across 2 Pods: {node1:?}"
-    );
-    let node2 = topo["node_to_dps"]["node-2"].as_array().unwrap();
-    assert_eq!(node2.len(), 1);
-    assert_eq!(node2[0]["pod_ip"], "10.244.1.7");
-    assert_eq!(node2[0]["instance_id"], "vllm-prefill-3");
 
     // Unregistering one DP keeps its Pod (the other DP is still there).
     let resp = client
@@ -559,11 +558,16 @@ async fn test_node_topology_built_from_register_node_id() {
         .await
         .unwrap();
     let topo = &body["topology"];
+    assert!(
+        topo["dp_to_node"]["vllm-prefill-1/0"].is_null(),
+        "dp0 removed"
+    );
+    assert_eq!(topo["dp_to_node"]["vllm-prefill-1/1"]["node_id"], "node-1");
     assert_eq!(
         topo["pod_to_node"]["10.244.0.5"], "node-1",
         "Pod .5 still hosts dp1"
     );
-    assert_eq!(topo["node_to_dps"]["node-1"].as_array().unwrap().len(), 2);
+    assert_eq!(topo["dp_to_node"].as_object().unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -595,13 +599,11 @@ async fn test_register_without_node_id_leaves_topology_empty() {
         .json()
         .await
         .unwrap();
+    let topo = &body["topology"];
     assert!(
-        body["topology"]["pod_to_node"]
-            .as_object()
-            .unwrap()
-            .is_empty(),
-        "clients that do not send node_id get no topology: {}",
-        body["topology"]
+        topo["dp_to_node"].as_object().unwrap().is_empty()
+            && topo["pod_to_node"].as_object().unwrap().is_empty(),
+        "clients that do not send node_id get no topology: {topo}"
     );
 }
 

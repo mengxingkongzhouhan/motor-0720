@@ -298,34 +298,41 @@ Coordinator 通过 `ConductorApiClient` 与 conductor 通信。`user_config.json
 `status.hostIP`，或任何稳定的单机标识）。它与 `medium_endpoints` 里的 **Pod IP** 是两个
 不同层级——一台机器可以跑多个 Pod，每个 Pod 一个独立 Pod IP。
 
-带上之后 conductor 会维护两张表，可通过 `GET /workers` 的 `topology` 字段查看：
+带上之后 conductor 会维护两张表，**方向都是"指向 node"**，可通过 `GET /workers` 的
+`topology` 字段查看：
 
 ```json
 {
   "topology": {
+    "dp_to_node": {
+      "vllm-prefill-1/0": {"pod_ip": "10.244.0.5", "node_id": "node-1"},
+      "vllm-prefill-1/1": {"pod_ip": "10.244.0.5", "node_id": "node-1"},
+      "vllm-prefill-2/0": {"pod_ip": "10.244.0.6", "node_id": "node-1"},
+      "vllm-prefill-3/0": {"pod_ip": "10.244.1.7", "node_id": "node-2"}
+    },
     "pod_to_node": {
       "10.244.0.5": "node-1",
       "10.244.0.6": "node-1",
       "10.244.1.7": "node-2"
-    },
-    "node_to_dps": {
-      "node-1": [
-        {"pod_ip": "10.244.0.5", "instance_id": "vllm-prefill-1", "dp_rank": 0},
-        {"pod_ip": "10.244.0.5", "instance_id": "vllm-prefill-1", "dp_rank": 1},
-        {"pod_ip": "10.244.0.6", "instance_id": "vllm-prefill-2", "dp_rank": 0}
-      ],
-      "node-2": [
-        {"pod_ip": "10.244.1.7", "instance_id": "vllm-prefill-3", "dp_rank": 0}
-      ]
     }
   }
 }
 ```
 
+| 表 | 键 → 值 | 用途 |
+|----|---------|------|
+| `dp_to_node` | `(instance_id, dp_rank)` → `{pod_ip, node_id}` | 给一个 DP（边的 owner），问它在哪台机器 |
+| `pod_to_node` | Pod IP → node | 给一个 Pod IP（池事件的 `backend_id`），问它在哪台机器 |
+
+**方向是刻意这样的**：消费者要问的是「这个 owner 和我是不是同一台机器」，两次 O(1) 查表
+再比一下即可。反向的 `node → dps` 每次都要扫列表，而且没有对应的消费场景。
+`same_node(dp_a, dp_b)` 直接封装了这个判断；任一方位置未知时返回 `false`——位置不明
+绝不能当作同机，否则远端块会被算成本地。
+
 写入时机跟随注册生命周期：`/register` 写入、`/unregister` 移除、后端类型变化的重注册
 先移除再写入。**没有轮询或刷新** —— Pod 与机器的绑定是静态的（Pod 不会迁移宿主机，
-重调度得到的是新 Pod、新 IP），所以每个 Pod 只在其注册时写一次。移除是精确的：Pod
-的最后一个 DP 离开时才会同时删掉 `pod_to_node` 与 `node_to_dps` 两级。
+重调度得到的是新 Pod、新 IP），所以每个 Pod 只在其注册时写一次。移除是精确的：DP 条目
+立即删除，`pod_to_node` 则在该 Pod 的最后一个 DP 离开后才删。
 
 **不带 `node_id` 时两张表为空**，其余行为完全不变——目前 Coordinator 尚未下发该字段
 （需要把机器标识从 NodeManager 经 Controller 透传到 Coordinator，见设计文档），所以这

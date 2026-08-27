@@ -299,7 +299,7 @@ root 走查不依赖任何上层覆盖，所以「HBM 全被驱逐、池中保�
   时，使用**注册记录中的** model/tenant 回收空 `IndexerEntry`，不信任注销请求里的同名字段。
 - `POST /events` 的 `shutdown=true` 当前只记录日志，完整释放仍需显式调用 `/unregister`。
 
-### 节点拓扑：`pod_ip → node` 与 `node → dps`
+### 节点拓扑：`dp → node` 与 `pod_ip → node`
 
 `/register` 的可选字段 `node_id` 表示该 endpoint 所在的**机器**（K8s `status.hostIP`，
 即 Pod 的宿主 Node）。注意与 `medium_endpoints` 里的 **Pod IP** 分属两个层级：
@@ -310,20 +310,27 @@ root 走查不依赖任何上层覆盖，所以「HBM 全被驱逐、池中保�
    └── Pod（另一个 podIP）── DP 0 ...
 ```
 
-带上 `node_id` 后，`NodeTopology` 维护两张表（同一把锁，避免解析到半更新状态）：
+带上 `node_id` 后，`NodeTopology` 维护两张表（同一把锁，避免解析到半更新状态）。
+**两张表的方向都是「指向 node」**：
 
 | 表 | 键 → 值 | 用途 |
 |----|---------|------|
-| `pod_to_node` | Pod IP → node 标识 | 把事件里的 `backend_id`（Pod IP）解析到机器 |
-| `node_to_dps` | node 标识 → `[{pod_ip, instance_id, dp_rank}]` | 拿到该机器上**跨 Pod** 的全部 DP |
+| `dp_to_node` | `(instance_id, dp_rank)` → `{pod_ip, node_id}` | 给一个 DP（边的 owner），问它在哪台机器 |
+| `pod_to_node` | Pod IP → node 标识 | 给一个 Pod IP（池事件的 `backend_id`），问它在哪台机器 |
 
-`dps_sharing_node_with(pod_ip)` 把两跳合成一次调用。
+**为什么是这个方向**：消费者要回答的问题是「这个池块的 owner 和我是不是同一台机器」，
+用 `dp → node` 是两次 O(1) 查表加一次比较；反向的 `node → dps` 每次都要扫列表，而且
+没有对应的消费场景（原本设想的「扇出到同机所有 DP」在走查改为忽略 owner 后已无效果——
+走查不再读 owner，扇出只会让每条边的 owner 集合变大而不改变任何上报数字）。
+
+`same_node(dp_a, dp_b)` 封装了这个判断。**任一方位置未知时返回 `false`** —— 位置不明
+绝不能当作同机，否则远端块会被算成本地、低估搬运成本。
 
 **生命周期**：写入时机完全跟随注册——`/register` 写、`/unregister` 删、后端类型变化的
 重注册先删再写；**没有轮询也没有刷新**。因为 Pod 与机器的绑定是静态的（Pod 不迁移宿主机，
-重调度产生的是新 Pod、新 IP），所以每个 Pod 只在注册时写一次。`node_to_dps` 的条目携带
-自己的 `pod_ip`，因此不需要额外的引用计数就能精确判断"该 Pod 的最后一个 DP 是否已离开"，
-两级键一并回收。
+重调度产生的是新 Pod、新 IP），所以每个 Pod 只在注册时写一次。DP 条目在注销时立即删除；
+`pod_to_node` 因为可能被同 Pod 的其他 DP 共用，只在该 Pod 最后一个 DP 离开后才删（DP 表
+的条目里带着自己的 `pod_ip`，扫一遍即可判断，注销是低频操作，比维护单独的计数更简单）。
 
 **只记录 HBM endpoint 的 IP**：`cpu` / `disk` endpoint 可能指向别处的池服务，其 IP 不是
 本引擎的 Pod IP。这也保证 `pod_to_node` 与 `hbm_ip_index` 的键来自同一处

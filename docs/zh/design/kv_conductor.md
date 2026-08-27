@@ -84,7 +84,7 @@ Coordinator 调度器（`kv_cache_affinity`）按 `*_blocks` 与配置项
    └─────────────────────────────────────────────────────┘
 ```
 
-- 上层介质命中后，下层介质**从上层断点续查**；同时对拥有首边的 worker **无条件 root 走查**，与续接链并列，取绝对终点最远者（如实报告更长副本）
+- 上层介质命中后，下层介质**从本 DP 自己的上层断点续查**（断点不跨 DP 共享）；同时对拥有首边的 worker **无条件 root 走查**，与续接链并列，取绝对终点最远者（如实报告更长副本）
 - HBM 是前缀树（从 root 走）；CPU/Disk 是 continuation-edge 图（断点续查 + root 走查）
 - 同一 `(instance_id, dp_rank)` 的跨介质命中在响应中聚合到同一个 DP 条目
 
@@ -166,6 +166,7 @@ CPU/DISK 不使用完整 RadixTree，而是轻量的 **continuation-edge 图**�
   HBM tree returns: W1 depth=2, last_seq=seq200
 
   Candidate a) breakpoint resume from (seq200, H2):
+    // only granted to W1's own (instance_id, dp_rank)
     edge(seq200, H2) -> seq300  OK
     edge(seq300, H3) -> seq400  OK
     edge(seq400, H4) -> ???     MISSING -> stop
@@ -180,6 +181,26 @@ CPU/DISK 不使用完整 RadixTree，而是轻量的 **continuation-edge 图**�
   matched_tokens = (npu + cpu + disk) × block_size   // unweighted coverage
   // Coordinator affinity: round((npu×w_npu + cpu×w_cpu + disk×w_disk) × block_size)
 ```
+
+**断点只归产生它的 DP**：`edge_owners(parent, local)` 返回该边的**全部** owner，因此
+构造候选时必须按 `(instance_id, dp_rank)` 过滤（`medium` 不比较——断点来自 NPU/CPU，
+候选 worker 在 CPU/Disk）。原因在于上报的是**绝对覆盖终点**，隐含「`[0, 终点)` 都由该
+DP 覆盖」，而这只有在 `[0, 起点)` 由该 DP **自己的**上层介质覆盖时才成立：
+
+```text
+  inst-a HBM: [0, 2)            -> breakpoint (end_pos=2, last_seq=seq200)
+  inst-b CPU: [2, 3) only       -> owns edge (seq200, H2)
+
+  若允许借用 inst-a 的断点：
+    inst-b 从 pos=2 起跑 -> 走 1 块 -> end_pos=3
+    上报 npu_end=0, cpu_end=3 -> cpu_blocks=3   // inst-b 实际只持有 1 块
+    调度器据此选中 inst-b，而 inst-b 需从第 0 块重算整段前缀
+
+  过滤后：inst-b 无候选，不进 medium_ends；inst-a 如实报告 npu_blocks=2
+```
+
+root 走查不受此限制（它自带 `start_pos=0`，不依赖任何上层覆盖），所以「HBM 全被驱逐、
+下层保有完整根链」这一池化核心场景仍能如实报告。
 
 ---
 
@@ -381,6 +402,7 @@ CPU/DISK 不使用完整 RadixTree，而是轻量的 **continuation-edge 图**�
 | 匹配方式 | root 出发，树遍历 | 边遍历：断点续接链 + root 链并列候选 |
 | 缺失处理 | 第一个缺失即停 | 第一个缺失边/缺失 Worker 即停 |
 | root 走查条件 | 总是 | **无条件**（拥有首边即走；与续接链取绝对终点最远者） |
+| 断点作用域 | 不适用 | **仅本 `(instance_id, dp_rank)`**，不跨 DP 借用 |
 | 保证 | 匹配的块形成合法前缀链 | 与 HBM 衔接的续接链 + 本层更长副本均可如实报告 |
 
 断点续查保证三层命中块是**同一条连续前缀**，与 vLLM prefix cache 的查找语义

@@ -15,10 +15,11 @@
 //! - **HBM tree** (`hbm_tree`) — prefix-chain radix tree for NPU blocks.
 //! - **CPU / Disk continuation indexes** (`cpu_tiers` / `disk_tiers`) —
 //!   ``(parent_seq_hash, tokens_hash) → child`` edges (see `lower_tier`
-//!   and `THIRD_PARTY_NOTICES.md`). CPU continues from the HBM
-//!   breakpoint; Disk continues from ``max(HBM, CPU)`` (CPU preferred
-//!   when it extends further). Root chains are walked unconditionally so
-//!   longer lower-tier replicas are never hidden by shorter upstream hits.
+//!   and `THIRD_PARTY_NOTICES.md`). CPU continues from the same DP's HBM
+//!   breakpoint; Disk continues from that DP's ``max(HBM, CPU)`` (CPU
+//!   preferred when it extends further) — a breakpoint is never shared
+//!   across DPs. Root chains are walked unconditionally so longer
+//!   lower-tier replicas are never hidden by shorter upstream hits.
 //! - **offload_pool_state** — bidirectional offload/pool event matching
 //!   (see [`OffloadPoolState`]). The `offload` side now also carries the
 //!   originating `parent_hash` so that lower-tier continuation edges are
@@ -301,9 +302,9 @@ impl IndexerEntry {
             })
             .collect();
 
-        // 2) CPU: continue from HBM breakpoints; root walk runs for every
-        //    worker owning the first edge so longer lower-tier replicas are
-        //    never hidden by a shorter upstream hit.
+        // 2) CPU: continue from each DP's own HBM breakpoint; root walk runs
+        //    for every worker owning the first edge so longer lower-tier
+        //    replicas are never hidden by a shorter upstream hit.
         let cpu_hits = self.lower_tier_lookup(
             block_hashes,
             &hbm_breaks,
@@ -392,10 +393,18 @@ impl IndexerEntry {
     /// - Root walks run for **every** worker owning the first edge so a
     ///   longer replica on this tier is never hidden by an upstream
     ///   (possibly shorter) hit.
-    /// - Continuation starts from each upstream ``TierBreakpoint``; a worker
-    ///   may hold several candidates (root + breakpoints), and the one with
+    /// - Continuation starts from an upstream ``TierBreakpoint``, but only for
+    ///   the **same** ``(instance_id, dp_rank)`` that produced it. A worker may
+    ///   hold several candidates (root + its own breakpoints), and the one with
     ///   the farthest absolute end wins inside
     ///   [`LowerTierIndexer::query_contiguous_hits`].
+    ///
+    /// The same-DP restriction is required for correctness: the reported metric
+    /// is the absolute end position, which implicitly claims ``[0, end)`` is
+    /// covered by that DP. That only holds when ``[0, start_pos)`` is covered by
+    /// the DP's *own* upstream tier. Accepting another DP's breakpoint would let
+    /// a worker holding only a mid-sequence segment claim contiguity across a
+    /// gap it does not hold.
     fn lower_tier_lookup(
         &self,
         block_hashes: &[LocalBlockHash],
@@ -420,13 +429,22 @@ impl IndexerEntry {
                 .push(LowerTierContinuation::from_root(0));
         }
 
-        // Continue from each upstream breakpoint (candidate list — the walk
-        // keeps the farthest end per worker).
+        // Continue from each upstream breakpoint, restricted to the DP that
+        // produced it (candidate list — the walk keeps the farthest end per
+        // worker). `edge_owners` returns every owner of the entry edge, so
+        // without this filter a worker holding only a mid-sequence segment
+        // would inherit another DP's start position and report coverage from
+        // block 0 (see the doc comment above). The medium deliberately differs
+        // (breakpoint is NPU/CPU, candidate is CPU/Disk), so only the instance
+        // and DP rank are compared.
         for b in upstream_breaks {
             if b.end_pos >= block_hashes.len() {
                 continue;
             }
             for w in tiers.edge_owners(Some(b.last_seq), block_hashes[b.end_pos]) {
+                if w.instance_id != b.instance_id || w.dp_rank != b.dp_rank {
+                    continue;
+                }
                 continuations
                     .entry(w)
                     .or_default()

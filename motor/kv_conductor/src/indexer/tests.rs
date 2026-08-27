@@ -577,6 +577,169 @@ fn test_shorter_hbm_breakpoint_does_not_overcount_cpu_overlap() {
 }
 
 #[test]
+fn test_hbm_breakpoint_not_shared_across_instances() {
+    // inst-a's HBM covers the first two blocks; inst-b holds ONLY the tail on
+    // CPU, chained after inst-a's last HBM block. Reported coverage is an
+    // absolute end position, so letting inst-b start at inst-a's breakpoint
+    // would claim inst-b covers blocks 0..3 — it holds just block 2, and a
+    // request routed there would recompute the whole prefix.
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-break-scope", "t1");
+
+    let tokens: Vec<i64> = (0..12).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+    assert_eq!(hashes.len(), 3);
+
+    let wk_a_npu = WorkerKey {
+        instance_id: "inst-a".into(),
+        backend_id: "inst-a".into(),
+        dp_rank: 0,
+        medium: StorageMedium::Npu,
+    };
+    entry
+        .apply_event(
+            &wk_a_npu,
+            &KvCacheEventData::Stored(KvCacheStoreData {
+                parent_hash: None,
+                start_position: None,
+                blocks: vec![
+                    KvCacheStoredBlockData {
+                        block_hash: 100,
+                        tokens_hash: hashes[0].0,
+                    },
+                    KvCacheStoredBlockData {
+                        block_hash: 200,
+                        tokens_hash: hashes[1].0,
+                    },
+                ],
+            }),
+        )
+        .unwrap();
+
+    // inst-b's DRAM chain is anchored at block_hash=200, which only inst-a ever
+    // held. Block identities are content-derived, so this is a real anchor
+    // inst-b's engine can emit after reusing the same prefix from the pool.
+    let wk_b_cpu = WorkerKey {
+        instance_id: "inst-b".into(),
+        backend_id: "pool".into(),
+        dp_rank: 0,
+        medium: StorageMedium::Cpu,
+    };
+    entry
+        .apply_event(
+            &wk_b_cpu,
+            &KvCacheEventData::Stored(KvCacheStoreData {
+                parent_hash: Some(200),
+                start_position: None,
+                blocks: vec![KvCacheStoredBlockData {
+                    block_hash: 300,
+                    tokens_hash: hashes[2].0,
+                }],
+            }),
+        )
+        .unwrap();
+
+    let resp = indexer
+        .query("model-break-scope", "t1", &tokens, 4)
+        .unwrap();
+    let tenant = &resp.tenants["t1"];
+
+    // inst-a is unaffected — lending a breakpoint costs it nothing.
+    let dp_a = &tenant["inst-a"].dp["0"];
+    assert_eq!(dp_a.npu_blocks, 2);
+    assert_eq!(dp_a.cpu_blocks, 0);
+    assert_eq!(dp_a.matched_tokens, 2 * 4);
+
+    // inst-b gets no candidate, so it never reaches medium_ends.
+    assert!(
+        !tenant.contains_key("inst-b"),
+        "inst-b holds only a mid-sequence segment and must not report coverage \
+         borrowed from inst-a's breakpoint, got {:?}",
+        tenant.get("inst-b")
+    );
+}
+
+#[test]
+fn test_hbm_breakpoint_not_shared_across_dp_ranks() {
+    // Same instance, two DP ranks sharing one CPU continuation edge. dp0 has
+    // HBM coverage and may continue from its own breakpoint; dp1 has none, so
+    // it must not inherit dp0's start position.
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-break-dp", "t1");
+
+    let tokens: Vec<i64> = (0..12).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+    assert_eq!(hashes.len(), 3);
+
+    let wk_npu_dp0 = WorkerKey {
+        instance_id: "inst-1".into(),
+        backend_id: "inst-1".into(),
+        dp_rank: 0,
+        medium: StorageMedium::Npu,
+    };
+    entry
+        .apply_event(
+            &wk_npu_dp0,
+            &KvCacheEventData::Stored(KvCacheStoreData {
+                parent_hash: None,
+                start_position: None,
+                blocks: vec![
+                    KvCacheStoredBlockData {
+                        block_hash: 100,
+                        tokens_hash: hashes[0].0,
+                    },
+                    KvCacheStoredBlockData {
+                        block_hash: 200,
+                        tokens_hash: hashes[1].0,
+                    },
+                ],
+            }),
+        )
+        .unwrap();
+
+    // Both DPs of the node see the same pool block, so they co-own one edge
+    // (same parent, same content hash, same child identity).
+    for dp_rank in [0u32, 1u32] {
+        let wk_cpu = WorkerKey {
+            instance_id: "inst-1".into(),
+            backend_id: "pool".into(),
+            dp_rank,
+            medium: StorageMedium::Cpu,
+        };
+        entry
+            .apply_event(
+                &wk_cpu,
+                &KvCacheEventData::Stored(KvCacheStoreData {
+                    parent_hash: Some(200),
+                    start_position: None,
+                    blocks: vec![KvCacheStoredBlockData {
+                        block_hash: 300,
+                        tokens_hash: hashes[2].0,
+                    }],
+                }),
+            )
+            .unwrap();
+    }
+
+    let resp = indexer.query("model-break-dp", "t1", &tokens, 4).unwrap();
+    let imd = &resp.tenants["t1"]["inst-1"];
+
+    // dp0 continues from its own breakpoint: 2 HBM + 1 CPU.
+    let dp0 = &imd.dp["0"];
+    assert_eq!(dp0.npu_blocks, 2);
+    assert_eq!(dp0.cpu_blocks, 1);
+    assert_eq!(dp0.matched_tokens, 3 * 4);
+
+    // dp1 co-owns the edge but has no upstream coverage of its own.
+    assert!(
+        !imd.dp.contains_key("1"),
+        "dp1 has no HBM prefix and must not inherit dp0's breakpoint, got {:?}",
+        imd.dp.get("1")
+    );
+    assert_eq!(imd.longest_matched, 3 * 4);
+}
+
+#[test]
 fn test_disk_continuation_from_hbm_when_cpu_miss() {
     // vLLM lookup: after NPU hit, Disk can hit even if CPU miss (then promote).
     let indexer = Indexer::new();

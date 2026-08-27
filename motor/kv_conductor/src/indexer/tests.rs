@@ -195,8 +195,17 @@ fn test_cpu_continuation_from_hbm_breakpoint() {
         2,
         "HBM should match first 2 blocks"
     );
+    // Lower-tier results are reported per DP, not per owning WorkerKey: the walk
+    // is ownership-blind, so `backend_id` is the DP's own instance id rather
+    // than the pool daemon that happened to store the block.
+    let cpu_dp = WorkerKey {
+        instance_id: "inst-1".into(),
+        backend_id: "inst-1".into(),
+        dp_rank: 0,
+        medium: StorageMedium::Cpu,
+    };
     assert_eq!(
-        overlap.blocks.get(&wk_cpu).copied().unwrap_or(0),
+        overlap.blocks.get(&cpu_dp).copied().unwrap_or(0),
         1,
         "CPU should continue 1 block from HBM breakpoint"
     );
@@ -644,19 +653,195 @@ fn test_hbm_breakpoint_not_shared_across_instances() {
         .unwrap();
     let tenant = &resp.tenants["t1"];
 
-    // inst-a is unaffected — lending a breakpoint costs it nothing.
+    // inst-a resumes from its OWN breakpoint and then walks ownership-blind, so
+    // it picks up inst-b's pooled block: it can fetch that block and serve all
+    // three without recompute.
     let dp_a = &tenant["inst-a"].dp["0"];
-    assert_eq!(dp_a.npu_blocks, 2);
-    assert_eq!(dp_a.cpu_blocks, 0);
-    assert_eq!(dp_a.matched_tokens, 2 * 4);
+    assert_eq!(dp_a.npu_blocks, 2, "blocks 0..2 are local to inst-a's HBM");
+    assert_eq!(dp_a.cpu_blocks, 1, "block 2 is fetched from the pool");
+    assert_eq!(dp_a.matched_tokens, 3 * 4);
 
-    // inst-b gets no candidate, so it never reaches medium_ends.
+    // inst-b is the asymmetric case and the reason breakpoints stay per-DP:
+    // blocks 0..2 live only in inst-a's *HBM*, which is device memory and is
+    // NOT fetchable across nodes. inst-b therefore cannot serve the prefix at
+    // all, and must not inherit inst-a's start position to claim otherwise.
     assert!(
         !tenant.contains_key("inst-b"),
-        "inst-b holds only a mid-sequence segment and must not report coverage \
-         borrowed from inst-a's breakpoint, got {:?}",
+        "inst-b cannot reach blocks 0..2 (HBM is not poolable) and must not \
+         borrow inst-a's start position, got {:?}",
         tenant.get("inst-b")
     );
+}
+
+/// Store one lower-tier chain for `worker`, anchored at `parent`.
+fn store_chain(
+    entry: &IndexerEntry,
+    worker: &WorkerKey,
+    parent: Option<u64>,
+    blocks: &[(u64, u64)],
+) {
+    entry
+        .apply_event(
+            worker,
+            &KvCacheEventData::Stored(KvCacheStoreData {
+                parent_hash: parent,
+                start_position: None,
+                blocks: blocks
+                    .iter()
+                    .map(|&(block_hash, tokens_hash)| KvCacheStoredBlockData {
+                        block_hash,
+                        tokens_hash,
+                    })
+                    .collect(),
+            }),
+        )
+        .unwrap();
+}
+
+fn worker_of(instance_id: &str, dp_rank: u32, medium: StorageMedium) -> WorkerKey {
+    WorkerKey {
+        instance_id: instance_id.into(),
+        backend_id: instance_id.into(),
+        dp_rank,
+        medium,
+    }
+}
+
+#[test]
+fn test_pooled_walk_crosses_ownership_boundary() {
+    // inst-a's DRAM holds [0,2), inst-b's DRAM continues [2,4). Pooled blocks
+    // are fetchable from any node, so BOTH DPs can serve all four blocks
+    // without recompute — the walk must not stop at the ownership boundary.
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-pooled-walk", "t1");
+
+    let tokens: Vec<i64> = (0..16).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+    assert_eq!(hashes.len(), 4);
+
+    let a = worker_of("inst-a", 0, StorageMedium::Cpu);
+    let b = worker_of("inst-b", 0, StorageMedium::Cpu);
+    store_chain(&entry, &a, None, &[(100, hashes[0].0), (101, hashes[1].0)]);
+    store_chain(
+        &entry,
+        &b,
+        Some(101),
+        &[(102, hashes[2].0), (103, hashes[3].0)],
+    );
+
+    let resp = indexer
+        .query("model-pooled-walk", "t1", &tokens, 4)
+        .unwrap();
+    let tenant = &resp.tenants["t1"];
+
+    for instance_id in ["inst-a", "inst-b"] {
+        let dp0 = &tenant[instance_id].dp["0"];
+        assert_eq!(
+            dp0.cpu_blocks, 4,
+            "{instance_id} can fetch every pooled block, so the walk must cross \
+             the ownership boundary at position 2"
+        );
+        assert_eq!(dp0.npu_blocks, 0);
+        assert_eq!(dp0.matched_tokens, 4 * 4);
+    }
+}
+
+#[test]
+fn test_own_hbm_bridges_pool_gap_and_differentiates_dps() {
+    // The pooled chain is broken: [0,2) exists, position 2 is missing, [3,5)
+    // exists anchored after position 2. Only inst-a's own HBM covers position 2,
+    // and HBM is device memory — not fetchable across nodes. So inst-a bridges
+    // the gap and reaches 5, while inst-b stops at the gap.
+    //
+    // This is why per-DP results still differ under an ownership-blind walk:
+    // the walk's *start* is per-DP even though its *continuation* is not.
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-bridge", "t1");
+
+    let tokens: Vec<i64> = (0..20).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+    assert_eq!(hashes.len(), 5);
+
+    // inst-a HBM: positions 0..3.
+    store_chain(
+        &entry,
+        &worker_of("inst-a", 0, StorageMedium::Npu),
+        None,
+        &[(100, hashes[0].0), (101, hashes[1].0), (102, hashes[2].0)],
+    );
+    // Pool head [0,2) and, after the gap at position 2, tail [3,5).
+    let b_cpu = worker_of("inst-b", 0, StorageMedium::Cpu);
+    store_chain(
+        &entry,
+        &b_cpu,
+        None,
+        &[(100, hashes[0].0), (101, hashes[1].0)],
+    );
+    store_chain(
+        &entry,
+        &b_cpu,
+        Some(102),
+        &[(103, hashes[3].0), (104, hashes[4].0)],
+    );
+
+    let resp = indexer.query("model-bridge", "t1", &tokens, 4).unwrap();
+    let tenant = &resp.tenants["t1"];
+
+    // inst-a: 3 blocks local in HBM, then fetches the tail across the gap.
+    let dp_a = &tenant["inst-a"].dp["0"];
+    assert_eq!(dp_a.npu_blocks, 3);
+    assert_eq!(dp_a.cpu_blocks, 2, "tail fetched after bridging the gap");
+    assert_eq!(dp_a.matched_tokens, 5 * 4);
+
+    // inst-b: only the pooled head is reachable; position 2 lives in inst-a's
+    // HBM, which it cannot fetch.
+    let dp_b = &tenant["inst-b"].dp["0"];
+    assert_eq!(dp_b.npu_blocks, 0);
+    assert_eq!(dp_b.cpu_blocks, 2, "stops at the gap");
+    assert_eq!(dp_b.matched_tokens, 2 * 4);
+
+    // The affinity signal survives: the two DPs are not tied.
+    assert!(dp_a.matched_tokens > dp_b.matched_tokens);
+}
+
+#[test]
+fn test_dp_without_local_data_still_reports_pooled_reach() {
+    // inst-c holds blocks for an unrelated prefix, so it matches nothing of its
+    // own for this query. It can still fetch the pooled prefix, so reporting 0
+    // would over-estimate its prefill cost.
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-idle-dp", "t1");
+
+    let tokens: Vec<i64> = (0..8).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+    assert_eq!(hashes.len(), 2);
+    let other: Vec<i64> = (900..908).collect();
+    let other_hashes = compute_block_hash_for_seq(&other, 4);
+
+    store_chain(
+        &entry,
+        &worker_of("inst-a", 0, StorageMedium::Cpu),
+        None,
+        &[(100, hashes[0].0), (101, hashes[1].0)],
+    );
+    // inst-c is known to the index but holds a different prefix.
+    store_chain(
+        &entry,
+        &worker_of("inst-c", 0, StorageMedium::Npu),
+        None,
+        &[(900, other_hashes[0].0)],
+    );
+
+    let resp = indexer.query("model-idle-dp", "t1", &tokens, 4).unwrap();
+    let tenant = &resp.tenants["t1"];
+
+    let dp_c = &tenant["inst-c"].dp["0"];
+    assert_eq!(dp_c.npu_blocks, 0, "no local HBM hit for this prefix");
+    assert_eq!(
+        dp_c.cpu_blocks, 2,
+        "inst-c can still fetch both pooled blocks"
+    );
+    assert_eq!(dp_c.matched_tokens, 2 * 4);
 }
 
 #[test]

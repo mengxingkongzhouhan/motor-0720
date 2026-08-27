@@ -155,13 +155,38 @@ Engine Worker           Pool Master               KV Conductor
 ```
 
 - **索引结构**：`LowerTierIndexer`，按 `(parent_seq_hash, tokens_hash)` 记录 continuation edge
-- **匹配语义**：
-  - CPU：从**本 DP 自己的** HBM 断点续查；root 链（首块副本）无条件走——更长副本不会被上游较短命中掩盖
-  - Disk：从**本 DP 自己的** `max(HBM, CPU)` 断点续查（CPU 更长时优先接 CPU）；root 链同 CPU 层无条件走
+- **走查忽略 owner**：池化块通过后端传输协议（`device_rdma` / `device_sdma` / `device_urma`，见
+  `mmc-local-*.conf` 的 `ock.mmc.local_service.protocol`）**任意节点可取**，所以别的 DP 持有的块
+  同样能让本 DP 跳过重算。走查只在**边不存在**时停止，不因为边属于别人而停
+- **每个 DP 报的是"我能免重算地服务多长前缀"**，不是"我本地有多长"
+
+那为什么各 DP 的结果还会不同?两处:
+
+1. **起点是 per-DP 的**。每个 DP 从**自己的**上层断点续接;自己上层没命中就从 root 走。
+   **HBM 是设备显存、跨节点取不到**,所以只有持有那些块的 DP 能用它们跨过池链中的缺口
+2. **归属是 per-DP 的**。互斥切分把 `[0, npu_end)` 记为 NPU(本地、免费)、其余记为 CPU/Disk
+   (需搬运),于是 `kv_affinity.w_cpu` / `w_disk` 就是"优先选本地已有的节点"这个旋钮
+
+举例(池链在位置 2 处断开,位置 3-4 另起一段):
+
+```text
+  inst-a HBM 覆盖 [0,3)，inst-b DRAM 覆盖 [0,2) 与 [3,5)
+
+  inst-a：从自己断点 pos=3 起跑 → 取到 inst-b 的 [3,5) → 终点 5
+          npu_blocks=3（本地）+ cpu_blocks=2（搬运）= 5 块
+  inst-b：无 HBM 命中 → 从 root 走 → [0,2) 之后位置 2 缺失 → 终点 2
+          npu_blocks=0 + cpu_blocks=2 = 2 块
+```
+
+`inst-a` 靠自己的 HBM 桥接了缺口,所以走得更远——差异化正来自这里。
+
 - **断点不跨 DP**：断点只供产生它的 `(instance_id, dp_rank)` 使用。上报的是绝对覆盖终点，隐含
-  「`[0, 终点)` 都由该 DP 覆盖」；这只有在 `[0, 起点)` 由该 DP **自己的**上层介质覆盖时才成立。
-  若允许借用其他 DP 的断点，只持有中间段的 worker 会跨过自己没有的空洞谎报连续前缀
-- **连续匹配**：走到第一个缺失边即停；同一 worker 多条候选链（root + 自己的断点）取绝对终点最远者
+  「`[0, 终点)` 对该 DP 都可用」；这只有在 `[0, 起点)` 由该 DP **自己的**上层介质覆盖时才成立
+  （上层是 HBM，取不到别人的）。若允许借用其他 DP 的断点，只持有中间段的 worker 会跨过自己
+  取不到的空洞谎报前缀
+- **所有已知 DP 都参与**：本地什么都没有的 DP 也能从池子取,因此同样会得到 root 走查的结果——
+  否则会高估它的 prefill 代价。「已知」指该索引见过其事件的 DP
+- **连续匹配**：走到第一个缺失边即停；候选（root + 自己的断点）取绝对终点最远者
 - **content 保留**：pool 确认后始终保留 `(tokens_hash, parent_hash)`（无需配置），跨 tier 移除存活，CPU 已驱逐后、保留窗口（300s TTL）内仍可解析 Disk store；窗口关闭自动清除，内存有界（条目为 tier 数据拷贝 + 短暂迁移残留）。未确认的 offload **无 TTL、无硬容量上限**，随未确认块增长，仅在匹配成功或引擎驱逐时清除
 
 各后端的 CPU/Disk 适配差异：

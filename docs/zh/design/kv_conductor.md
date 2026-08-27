@@ -182,25 +182,55 @@ CPU/DISK 不使用完整 RadixTree，而是轻量的 **continuation-edge 图**�
   // Coordinator affinity: round((npu×w_npu + cpu×w_cpu + disk×w_disk) × block_size)
 ```
 
-**断点只归产生它的 DP**：`edge_owners(parent, local)` 返回该边的**全部** owner，因此
-构造候选时必须按 `(instance_id, dp_rank)` 过滤（`medium` 不比较——断点来自 NPU/CPU，
-候选 worker 在 CPU/Disk）。原因在于上报的是**绝对覆盖终点**，隐含「`[0, 终点)` 都由该
-DP 覆盖」，而这只有在 `[0, 起点)` 由该 DP **自己的**上层介质覆盖时才成立：
+### 下层走查忽略 owner：报"能免重算服务多长"而非"本地有多长"
+
+池化块通过后端传输协议（`device_rdma` / `device_sdma` / `device_urma`，见
+`mmc-local-*.conf` 的 `ock.mmc.local_service.protocol`）**任意节点可取**，所以别的 DP
+持有的块同样能让本 DP 跳过重算。下层走查因此**不校验 owner**，只在边不存在时停止。
+
+**关键的介质不对称**：
+
+| 介质 | 跨节点可取? | 走查语义 |
+|------|------------|---------|
+| HBM | ❌ 设备显存，取不到别人的 | `find_matches_detailed` 逐层求交，**严格按 owner** |
+| CPU / Disk | ✅ 池化，任意节点可取 | `reachable_from` **忽略 owner** |
+
+那各 DP 的结果凭什么还不同?两处，都是 per-DP 的：
+
+1. **走查起点**。每个 DP 从**自己的**上层断点续接；自己上层没命中就从 root 走。因为 HBM
+   取不到别人的，只有持有那些块的 DP 能用它们跨过池链中的缺口。
+2. **归属切分**。互斥切分把 `[0, npu_end)` 记为 NPU（本地、免费）、其余记为 CPU/Disk
+   （需搬运），于是 `kv_affinity.w_cpu` / `w_disk` 成为"优先选本地已有的节点"的旋钮。
 
 ```text
-  inst-a HBM: [0, 2)            -> breakpoint (end_pos=2, last_seq=seq200)
-  inst-b CPU: [2, 3) only       -> owns edge (seq200, H2)
+  池链: [0,2) 存在，位置 2 缺失，[3,5) 锚在位置 2 的 block_hash 之后
+  inst-a HBM: [0,3)     inst-b DRAM: [0,2) 与 [3,5)
 
-  若允许借用 inst-a 的断点：
-    inst-b 从 pos=2 起跑 -> 走 1 块 -> end_pos=3
-    上报 npu_end=0, cpu_end=3 -> cpu_blocks=3   // inst-b 实际只持有 1 块
-    调度器据此选中 inst-b，而 inst-b 需从第 0 块重算整段前缀
+  inst-a: 自己断点 pos=3 -> reachable_from(3, seq102) -> 取到 inst-b 的 [3,5) -> 终点 5
+          npu_blocks=3（本地）+ cpu_blocks=2（搬运）= 5 块
+  inst-b: 无 HBM 命中 -> root 走查 -> [0,2) 后位置 2 缺失 -> 终点 2
+          npu_blocks=0 + cpu_blocks=2 = 2 块
 
-  过滤后：inst-b 无候选，不进 medium_ends；inst-a 如实报告 npu_blocks=2
+  => inst-a 靠自己的 HBM 桥接缺口而走得更远；亲和信号未被抹平
 ```
 
-root 走查不受此限制（它自带 `start_pos=0`，不依赖任何上层覆盖），所以「HBM 全被驱逐、
-下层保有完整根链」这一池化核心场景仍能如实报告。
+**断点仍只归产生它的 DP**：`edge_owners` 返回该边的全部 owner，若允许借用别的 DP 的断点，
+只持有中间段的 worker 会跨过自己**取不到**的空洞谎报前缀——因为空洞那一段在别人的 HBM 里：
+
+```text
+  inst-a HBM: [0,2)            -> breakpoint (end_pos=2, last_seq=seq200)
+  inst-b DRAM: [2,3) only
+
+  借用 inst-a 断点：inst-b 从 pos=2 起跑 -> 终点 3 -> npu=0, cpu=3
+    声称能服务 3 块，但位置 0..2 只在 inst-a 的 HBM 里，inst-b 取不到 -> 实际得全量重算
+  按 DP 索引断点后：inst-b 无起点，不进 medium_ends
+    而 inst-a 从自己断点起跑、取到 inst-b 的池块 -> npu=2 + cpu=1 = 3 块（正确）
+```
+
+root 走查不依赖任何上层覆盖，所以「HBM 全被驱逐、池中保有完整根链」这一池化核心场景仍能
+如实报告。**所有已知 DP 都参与下层走查**（`known_dps()`：HBM lookups ∪ 各 tier 的
+`worker_keys()`），本地什么都没有的 DP 也能从池子取，报 0 会高估它的 prefill 代价。root
+走查忽略 owner，因此对所有 DP 结果相同，只计算一次后复用。
 
 ---
 
@@ -400,9 +430,11 @@ root 走查不受此限制（它自带 `start_pos=0`，不依赖任何上层覆�
 | | HBM RadixTree | CPU/Disk Continuation |
 |---|---|---|
 | 匹配方式 | root 出发，树遍历 | 边遍历：断点续接链 + root 链并列候选 |
-| 缺失处理 | 第一个缺失即停 | 第一个缺失边/缺失 Worker 即停 |
-| root 走查条件 | 总是 | **无条件**（拥有首边即走；与续接链取绝对终点最远者） |
+| 缺失处理 | 第一个缺失即停 | 第一个缺失**边**即停（不因边属于别人而停） |
+| 是否校验 owner | ✅ 逐层求交（HBM 跨节点取不到） | ❌ 忽略（池块任意节点可取） |
+| root 走查条件 | 总是 | **无条件**，且对所有 DP 相同（只算一次） |
 | 断点作用域 | 不适用 | **仅本 `(instance_id, dp_rank)`**，不跨 DP 借用 |
+| 报的是什么 | 该 worker 本地持有的前缀 | 该 DP **能免重算服务**的前缀 |
 | 保证 | 匹配的块形成合法前缀链 | 与 HBM 衔接的续接链 + 本层更长副本均可如实报告 |
 
 断点续查保证三层命中块是**同一条连续前缀**，与 vLLM prefix cache 的查找语义

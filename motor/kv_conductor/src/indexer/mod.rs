@@ -41,7 +41,7 @@ use serde::Serialize;
 use crate::concurrent_tree::{ConcurrentRadixTree, PrefixMatch, WorkerLookup};
 use crate::error::KvConductorError;
 use crate::hashing::compute_block_hash_for_seq;
-use crate::lower_tier::{ContiguousHit, LowerTierContinuation, LowerTierIndexer};
+use crate::lower_tier::LowerTierIndexer;
 use crate::protocols::*;
 
 /// TTL for stale pending pool entries (60 seconds).
@@ -77,6 +77,14 @@ struct MediumEnds {
     npu: u32,
     cpu: u32,
     disk: u32,
+}
+
+/// The two accumulators a matching pass writes into.
+struct MatchSink<'a> {
+    /// Per-worker block counts — diagnostics, plus the "any hit at all" gate.
+    overlap: &'a mut OverlapBlocks,
+    /// Per-DP absolute coverage ends; the actual source for the response.
+    medium_ends: &'a mut FxHashMap<(String, DpRank), MediumEnds>,
 }
 
 /// Upstream-tier match breakpoint used to continue into the next lower tier.
@@ -302,29 +310,26 @@ impl IndexerEntry {
             })
             .collect();
 
-        // 2) CPU: continue from each DP's own HBM breakpoint; root walk runs
-        //    for every worker owning the first edge so longer lower-tier
-        //    replicas are never hidden by a shorter upstream hit.
-        let cpu_hits = self.lower_tier_lookup(
+        // Pooled blocks are reachable from any DP, so a DP holding nothing of
+        // its own can still serve a pooled prefix — every known DP must be
+        // considered on the lower tiers, not just the ones owning edges.
+        let known_dps = self.known_dps();
+
+        let mut sink = MatchSink {
+            overlap: &mut overlap,
+            medium_ends: &mut medium_ends,
+        };
+
+        // 2) CPU: each DP resumes from its own HBM breakpoint (or from root
+        //    when its HBM matched nothing) and then walks ownership-blind.
+        let cpu_breaks = self.lower_tier_lookup(
             block_hashes,
             &hbm_breaks,
             &self.cpu_tiers,
-            &mut overlap,
-            &mut medium_ends,
+            StorageMedium::Cpu,
+            &known_dps,
+            &mut sink,
         );
-
-        let cpu_breaks: Vec<TierBreakpoint> = cpu_hits
-            .iter()
-            .filter(|(_, h)| h.count > 0)
-            .filter_map(|(w, h)| {
-                Some(TierBreakpoint {
-                    instance_id: w.instance_id.clone(),
-                    dp_rank: w.dp_rank,
-                    end_pos: h.end_pos(),
-                    last_seq: h.last_matched_hash?,
-                })
-            })
-            .collect();
 
         // 3) Disk: continue from max(HBM, CPU) per DP (CPU wins when it
         //    extends further — matches vLLM lookup: CPU then Disk after NPU).
@@ -333,11 +338,27 @@ impl IndexerEntry {
             block_hashes,
             &disk_breaks,
             &self.disk_tiers,
-            &mut overlap,
-            &mut medium_ends,
+            StorageMedium::Disk,
+            &known_dps,
+            &mut sink,
         );
 
         (overlap, medium_ends)
+    }
+
+    /// Every `(instance_id, dp_rank)` this index has seen, across all media.
+    fn known_dps(&self) -> FxHashSet<(String, DpRank)> {
+        let mut dps: FxHashSet<(String, DpRank)> = FxHashSet::default();
+        for wk in self.lookups.read().keys() {
+            dps.insert((wk.instance_id.clone(), wk.dp_rank));
+        }
+        for wk in self.cpu_tiers.worker_keys() {
+            dps.insert((wk.instance_id, wk.dp_rank));
+        }
+        for wk in self.disk_tiers.worker_keys() {
+            dps.insert((wk.instance_id, wk.dp_rank));
+        }
+        dps
     }
 
     #[inline]
@@ -388,88 +409,112 @@ impl IndexerEntry {
         best.into_values().collect()
     }
 
-    /// Build continuations and count contiguous lower-tier hits.
+    /// Per-DP reachable span on one lower tier, returning this tier's
+    /// breakpoints for the next one.
     ///
-    /// - Root walks run for **every** worker owning the first edge so a
-    ///   longer replica on this tier is never hidden by an upstream
-    ///   (possibly shorter) hit.
-    /// - Continuation starts from an upstream ``TierBreakpoint``, but only for
-    ///   the **same** ``(instance_id, dp_rank)`` that produced it. A worker may
-    ///   hold several candidates (root + its own breakpoints), and the one with
-    ///   the farthest absolute end wins inside
-    ///   [`LowerTierIndexer::query_contiguous_hits`].
+    /// The walk is **ownership-blind**: pooled blocks are fetchable from any
+    /// node over the backend's transfer protocol (`device_rdma` /
+    /// `device_sdma` / `device_urma`), so a block held by another DP still lets
+    /// this DP skip recomputing it. What a DP reports is therefore "how long a
+    /// prefix can I serve without recompute", not "what do I hold locally".
     ///
-    /// The same-DP restriction is required for correctness: the reported metric
-    /// is the absolute end position, which implicitly claims ``[0, end)`` is
-    /// covered by that DP. That only holds when ``[0, start_pos)`` is covered by
-    /// the DP's *own* upstream tier. Accepting another DP's breakpoint would let
-    /// a worker holding only a mid-sequence segment claim contiguity across a
-    /// gap it does not hold.
+    /// Two things still make the answer differ between DPs, which is what keeps
+    /// the affinity signal alive:
+    ///
+    /// 1. **Where the walk starts.** A DP resumes from its *own* upstream
+    ///    breakpoint, or from root when its own upstream tier matched nothing.
+    ///    HBM is device memory and is *not* fetchable across nodes, so only the
+    ///    DP that holds those blocks can use them to bridge a gap in the pooled
+    ///    chain — a DP whose HBM covers the gap reaches further than one whose
+    ///    HBM does not.
+    /// 2. **How the span is attributed.** The exclusive partition credits
+    ///    `[0, npu_end)` to NPU (local, free) and the remainder to CPU/Disk
+    ///    (fetched, transfer cost), so `kv_affinity.w_cpu` / `w_disk` are the
+    ///    knob for "prefer the node that already has it locally".
+    ///
+    /// The root walk is ownership-blind and therefore identical for every DP, so
+    /// it is computed once and reused.
     fn lower_tier_lookup(
         &self,
         block_hashes: &[LocalBlockHash],
         upstream_breaks: &[TierBreakpoint],
         tiers: &LowerTierIndexer,
-        overlap: &mut OverlapBlocks,
-        medium_ends: &mut FxHashMap<(String, DpRank), MediumEnds>,
-    ) -> FxHashMap<WorkerKey, ContiguousHit> {
-        if block_hashes.is_empty() {
-            return FxHashMap::default();
+        medium: StorageMedium,
+        known_dps: &FxHashSet<(String, DpRank)>,
+        sink: &mut MatchSink<'_>,
+    ) -> Vec<TierBreakpoint> {
+        if block_hashes.is_empty() || known_dps.is_empty() {
+            return Vec::new();
         }
 
-        let mut continuations: FxHashMap<WorkerKey, Vec<LowerTierContinuation>> =
-            FxHashMap::default();
+        // Same for everyone — one walk, reused for every DP below.
+        let root_hit = tiers.reachable_from(block_hashes, 0, None);
 
-        // Root walk: unconditional, so a longer replica on this tier is never
-        // hidden by an upstream (possibly shorter) hit.
-        for w in tiers.root_workers(block_hashes[0]) {
-            continuations
-                .entry(w)
-                .or_default()
-                .push(LowerTierContinuation::from_root(0));
-        }
-
-        // Continue from each upstream breakpoint, restricted to the DP that
-        // produced it (candidate list — the walk keeps the farthest end per
-        // worker). `edge_owners` returns every owner of the entry edge, so
-        // without this filter a worker holding only a mid-sequence segment
-        // would inherit another DP's start position and report coverage from
-        // block 0 (see the doc comment above). The medium deliberately differs
-        // (breakpoint is NPU/CPU, candidate is CPU/Disk), so only the instance
-        // and DP rank are compared.
+        // Keep each DP's farthest own breakpoint. Several may exist for one DP
+        // when the upstream tier saw multiple `backend_id`s.
+        let mut own_break: FxHashMap<(String, DpRank), &TierBreakpoint> = FxHashMap::default();
         for b in upstream_breaks {
-            if b.end_pos >= block_hashes.len() {
+            let key = (b.instance_id.clone(), b.dp_rank);
+            match own_break.get(&key) {
+                Some(existing) if existing.end_pos >= b.end_pos => {}
+                _ => {
+                    own_break.insert(key, b);
+                }
+            }
+        }
+
+        let mut breaks = Vec::new();
+        for dp in known_dps {
+            let mut best = root_hit;
+
+            if let Some(b) = own_break.get(dp) {
+                let resumed = tiers.reachable_from(block_hashes, b.end_pos, Some(b.last_seq));
+                if let Some(hit) = resumed {
+                    let farther = match best {
+                        Some(current) => hit.end_pos() >= current.end_pos(),
+                        None => true,
+                    };
+                    if farther {
+                        best = Some(hit);
+                    }
+                }
+            }
+
+            let Some(hit) = best else {
+                continue;
+            };
+            if hit.count == 0 {
                 continue;
             }
-            for w in tiers.edge_owners(Some(b.last_seq), block_hashes[b.end_pos]) {
-                if w.instance_id != b.instance_id || w.dp_rank != b.dp_rank {
-                    continue;
-                }
-                continuations
-                    .entry(w)
-                    .or_default()
-                    .push(LowerTierContinuation::new(b.end_pos, b.last_seq));
+
+            let (instance_id, dp_rank) = dp;
+            sink.overlap.add_blocks(
+                WorkerKey {
+                    instance_id: instance_id.clone(),
+                    backend_id: instance_id.clone(),
+                    dp_rank: *dp_rank,
+                    medium,
+                },
+                hit.count as u32,
+            );
+            Self::note_medium_end(
+                sink.medium_ends,
+                instance_id,
+                *dp_rank,
+                medium,
+                hit.end_pos() as u32,
+            );
+            if let Some(last_seq) = hit.last_matched_hash {
+                breaks.push(TierBreakpoint {
+                    instance_id: instance_id.clone(),
+                    dp_rank: *dp_rank,
+                    end_pos: hit.end_pos(),
+                    last_seq,
+                });
             }
         }
 
-        if continuations.is_empty() {
-            return FxHashMap::default();
-        }
-
-        let hits = tiers.query_contiguous_hits(block_hashes, &continuations);
-        for (worker, hit) in &hits {
-            if hit.count > 0 {
-                overlap.add_blocks(worker.clone(), hit.count as u32);
-                Self::note_medium_end(
-                    medium_ends,
-                    &worker.instance_id,
-                    worker.dp_rank,
-                    worker.medium,
-                    hit.end_pos() as u32,
-                );
-            }
-        }
-        hits
+        breaks
     }
 
     // -----------------------------------------------------------------------

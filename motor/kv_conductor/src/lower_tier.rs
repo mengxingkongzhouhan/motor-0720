@@ -354,6 +354,58 @@ impl LowerTierIndexer {
         self.worker_blocks.read().is_empty()
     }
 
+    /// Contiguous span reachable from `start_pos`, **ignoring** which worker
+    /// owns each edge.
+    ///
+    /// Pooled blocks are fetchable from any node over the backend's transfer
+    /// protocol (`device_rdma` / `device_sdma` / `device_urma`), so a block held
+    /// by another DP still lets this DP skip recomputing it. Ownership therefore
+    /// does not gate the walk — it only decides whether a block is *local*
+    /// (free) or *fetched* (transfer cost), which the caller expresses by
+    /// attributing the span to the NPU vs CPU/Disk tier.
+    ///
+    /// Contrast [`Self::query_contiguous_hits`], which does gate on ownership
+    /// and answers "what does this worker hold locally".
+    ///
+    /// Returns `None` when the first edge is already missing, so a zero-length
+    /// walk never reports its start position as an end.
+    pub fn reachable_from(
+        &self,
+        local_hashes: &[LocalBlockHash],
+        start_pos: usize,
+        start_parent: Option<SequenceBlockHash>,
+    ) -> Option<ContiguousHit> {
+        if start_pos >= local_hashes.len() {
+            return None;
+        }
+
+        let edges = self.edges.read();
+        let mut cur_pos = start_pos;
+        let mut cur_hash = start_parent;
+
+        while cur_pos < local_hashes.len() {
+            let key = TransitionKey {
+                parent_hash: cur_hash,
+                local_hash: local_hashes[cur_pos],
+            };
+            let Some(edge) = edges.get(&key) else {
+                break;
+            };
+            cur_hash = Some(edge.child_hash());
+            cur_pos += 1;
+        }
+
+        if cur_pos > start_pos {
+            Some(ContiguousHit {
+                count: cur_pos - start_pos,
+                start_pos,
+                last_matched_hash: cur_hash,
+            })
+        } else {
+            None
+        }
+    }
+
     /// For each worker, walk contiguous lower-tier hits from its continuations.
     ///
     /// A worker may have several candidate continuations (a root walk plus one

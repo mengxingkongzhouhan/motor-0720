@@ -1,5 +1,16 @@
 use super::*;
+use crate::backend::WorkerResolver;
 use rmp_serde::from_slice;
+
+/// Resolver with no topology: the pool fanout stays within the event's own Pod.
+fn pod_resolver(ip_index: &HbmIpIndex, model_name: &str, tenant_id: &str) -> WorkerResolver {
+    WorkerResolver {
+        ip_index: Some(std::sync::Arc::clone(ip_index)),
+        topology: None,
+        model_name: model_name.to_string(),
+        tenant_id: tenant_id.to_string(),
+    }
+}
 
 fn msgpack_bin(data: &[u8]) -> Vec<u8> {
     let mut buf = vec![0x91, 0xC4, data.len() as u8];
@@ -417,7 +428,7 @@ fn test_apply_vllm_block_stored_computes_tokens_hash() {
         0,
         &[StorageMedium::Npu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
         block_size,
     );
 
@@ -482,7 +493,7 @@ fn test_non_hbm_event_cached_not_in_tree() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
         block_size,
     )
     .unwrap();
@@ -529,7 +540,7 @@ fn test_pool_backend_store_matches_cached_block() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
         block_size,
     )
     .unwrap();
@@ -560,7 +571,7 @@ fn test_pool_backend_store_matches_cached_block() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
     )
     .unwrap();
 
@@ -611,7 +622,7 @@ fn test_pool_backend_store_ignores_unknown_hash() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
     );
     assert!(result.is_ok());
 
@@ -719,7 +730,7 @@ fn test_memcache_batch_parse_and_apply_ip_only() {
         0,
         &[StorageMedium::Npu, StorageMedium::Cpu, StorageMedium::Disk],
         MatchMode::IpOnly,
-        &Some(ip_index),
+        &pod_resolver(&ip_index, "test-model", "default"),
     )
     .unwrap();
 
@@ -766,7 +777,7 @@ fn test_pool_backend_remove_evicts_cache() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
         block_size,
     )
     .unwrap();
@@ -803,7 +814,7 @@ fn test_pool_backend_remove_evicts_cache() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
     )
     .unwrap();
 
@@ -830,7 +841,7 @@ fn test_pool_backend_remove_evicts_cache() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
     )
     .unwrap();
 
@@ -902,7 +913,7 @@ fn test_pool_arrives_before_offload() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
     )
     .unwrap();
 
@@ -939,7 +950,7 @@ fn test_pool_arrives_before_offload() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
         block_size,
     )
     .unwrap();
@@ -1001,7 +1012,7 @@ fn test_pool_arrives_before_offload_multi_worker() {
             dp,
             &[StorageMedium::Cpu],
             MatchMode::None,
-            &None,
+            &WorkerResolver::default(),
         )
         .unwrap();
     }
@@ -1031,7 +1042,7 @@ fn test_pool_arrives_before_offload_multi_worker() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
         block_size,
     )
     .unwrap();
@@ -1093,7 +1104,7 @@ fn test_pool_removal_cleans_pending() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
     )
     .unwrap();
 
@@ -1126,7 +1137,7 @@ fn test_pool_removal_cleans_pending() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
     )
     .unwrap();
 
@@ -1169,7 +1180,7 @@ fn test_offload_then_vllm_removal() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
         block_size,
     )
     .unwrap();
@@ -1195,7 +1206,7 @@ fn test_offload_then_vllm_removal() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
         block_size,
     )
     .unwrap();
@@ -1239,7 +1250,7 @@ fn test_removal_after_both_matched() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
         block_size,
     )
     .unwrap();
@@ -1267,7 +1278,7 @@ fn test_removal_after_both_matched() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
     )
     .unwrap();
 
@@ -1318,7 +1329,7 @@ fn test_removal_after_both_matched() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
     )
     .unwrap();
 
@@ -1364,7 +1375,7 @@ fn test_vllm_removal_after_pool_queued() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
     )
     .unwrap();
 
@@ -1389,7 +1400,7 @@ fn test_vllm_removal_after_pool_queued() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
         block_size,
     )
     .unwrap();
@@ -1436,7 +1447,7 @@ fn test_duplicate_pool_stored_idempotent() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
     )
     .unwrap();
     apply_pool_event(
@@ -1448,7 +1459,7 @@ fn test_duplicate_pool_stored_idempotent() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
     )
     .unwrap();
 
@@ -1492,7 +1503,7 @@ fn test_pending_worker_cleanup() {
             dp,
             &[StorageMedium::Cpu],
             MatchMode::None,
-            &None,
+            &WorkerResolver::default(),
         )
         .unwrap();
     }
@@ -1545,7 +1556,7 @@ fn test_cleared_cleans_pending() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
     )
     .unwrap();
 
@@ -1574,7 +1585,7 @@ fn test_cleared_cleans_pending() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
     )
     .unwrap();
 
@@ -1616,7 +1627,7 @@ fn test_sweep_stale_caches() {
         0,
         &[StorageMedium::Cpu],
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
     )
     .unwrap();
 
@@ -1674,7 +1685,7 @@ fn test_vllm_parent_hash_root_level() {
         0,
         media,
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
         block_size,
     )
     .unwrap();
@@ -1730,7 +1741,7 @@ fn test_vllm_parent_hash_cross_event_chain() {
         0,
         media,
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
         block_size,
     )
     .unwrap();
@@ -1752,7 +1763,7 @@ fn test_vllm_parent_hash_cross_event_chain() {
         0,
         media,
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
         block_size,
     )
     .unwrap();
@@ -1783,7 +1794,7 @@ fn test_vllm_parent_hash_cross_event_chain() {
         0,
         media,
         MatchMode::None,
-        &None,
+        &WorkerResolver::default(),
         block_size,
     );
     assert!(

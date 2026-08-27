@@ -534,6 +534,14 @@ async fn test_node_topology_built_from_register_node_id() {
     assert_eq!(topo["pod_to_node"]["10.244.0.6"], "node-1");
     assert_eq!(topo["pod_to_node"]["10.244.1.7"], "node-2");
 
+    // Table 3: node → DPs. This is the fanout set for a pool event naming any
+    // Pod on that machine, and it deliberately spans Pods.
+    assert_eq!(
+        topo["node_to_dps"]["node-1"],
+        json!(["vllm-prefill-1/0", "vllm-prefill-1/1", "vllm-prefill-2/0"])
+    );
+    assert_eq!(topo["node_to_dps"]["node-2"], json!(["vllm-prefill-3/0"]));
+
     // Unregistering one DP keeps its Pod (the other DP is still there).
     let resp = client
         .post(format!("{}/unregister", base_url))

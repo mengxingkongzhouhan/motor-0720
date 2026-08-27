@@ -707,6 +707,159 @@ fn worker_of(instance_id: &str, dp_rank: u32, medium: StorageMedium) -> WorkerKe
     }
 }
 
+/// Store one pooled chain as the node-wide broadcast would: every DP on the
+/// holding machine becomes an owner, because every one of them can read it
+/// without a cross-machine transfer.
+fn broadcast_to_node(
+    entry: &IndexerEntry,
+    dps_on_node: &[(&str, u32)],
+    parent: Option<u64>,
+    blocks: &[(u64, u64)],
+) {
+    for &(instance_id, dp_rank) in dps_on_node {
+        store_chain(
+            entry,
+            &worker_of(instance_id, dp_rank, StorageMedium::Cpu),
+            parent,
+            blocks,
+        );
+    }
+}
+
+#[test]
+fn test_node_wide_broadcast_splits_local_and_remote_hits() {
+    // node-1 hosts inst-a and inst-b; node-2 hosts inst-c. Every DP has HBM
+    // block 0, then the pooled chain [1,4) is split: block 1 lives on node-1,
+    // blocks 2,3 on node-2. Each event is broadcast to all DPs of its machine.
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-broadcast", "t1");
+
+    let tokens: Vec<i64> = (0..16).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+    assert_eq!(hashes.len(), 4);
+
+    let on_node_1 = [("inst-a", 0), ("inst-b", 0)];
+    let on_node_2 = [("inst-c", 0)];
+    for (instance_id, dp_rank) in on_node_1.iter().chain(on_node_2.iter()) {
+        store_chain(
+            &entry,
+            &worker_of(instance_id, *dp_rank, StorageMedium::Npu),
+            None,
+            &[(100, hashes[0].0)],
+        );
+    }
+    broadcast_to_node(&entry, &on_node_1, Some(100), &[(101, hashes[1].0)]);
+    broadcast_to_node(
+        &entry,
+        &on_node_2,
+        Some(101),
+        &[(102, hashes[2].0), (103, hashes[3].0)],
+    );
+
+    let resp = indexer.query("model-broadcast", "t1", &tokens, 4).unwrap();
+    let tenant = &resp.tenants["t1"];
+
+    // inst-a is on node-1: block 1 is an owner-hit (local), blocks 2,3 are not.
+    let dp_a = &tenant["inst-a"].dp["0"];
+    assert_eq!(dp_a.npu_blocks, 1);
+    assert_eq!(dp_a.cpu_blocks, 3);
+    assert_eq!(dp_a.cpu_local_blocks, 1, "block 1 is in node-1's DRAM");
+    assert_eq!(dp_a.cpu_remote_blocks, 2, "blocks 2,3 are on node-2");
+
+    // inst-b never saw an event addressed to its own Pod — only the node-wide
+    // broadcast made it an owner. It must score identically to inst-a.
+    assert_eq!(&tenant["inst-b"].dp["0"].cpu_local_blocks, &1);
+    assert_eq!(&tenant["inst-b"].dp["0"].cpu_remote_blocks, &2);
+
+    // inst-c is on node-2, so the split flips.
+    let dp_c = &tenant["inst-c"].dp["0"];
+    assert_eq!(dp_c.cpu_local_blocks, 2, "blocks 2,3 are in node-2's DRAM");
+    assert_eq!(dp_c.cpu_remote_blocks, 1, "block 1 is on node-1");
+
+    // The two values always account for exactly the pooled blocks that still
+    // need fetching — blocks already in local HBM are excluded from both.
+    for imd in tenant.values() {
+        for dp in imd.dp.values() {
+            assert_eq!(
+                dp.cpu_local_blocks + dp.cpu_remote_blocks,
+                dp.cpu_blocks,
+                "local + remote must equal cpu_blocks: {dp:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_local_hits_exclude_blocks_already_in_hbm() {
+    // A DP owning the whole pooled chain still reports only the part past its
+    // HBM coverage: the rest is already local and needs no fetch, so counting it
+    // would make `cpu_local_blocks` exceed `cpu_blocks`.
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-hbm-overlap", "t1");
+
+    let tokens: Vec<i64> = (0..16).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+
+    store_chain(
+        &entry,
+        &worker_of("inst-a", 0, StorageMedium::Npu),
+        None,
+        &[(100, hashes[0].0), (101, hashes[1].0)],
+    );
+    broadcast_to_node(
+        &entry,
+        &[("inst-a", 0)],
+        None,
+        &[
+            (100, hashes[0].0),
+            (101, hashes[1].0),
+            (102, hashes[2].0),
+            (103, hashes[3].0),
+        ],
+    );
+
+    let resp = indexer
+        .query("model-hbm-overlap", "t1", &tokens, 4)
+        .unwrap();
+    let dp = &resp.tenants["t1"]["inst-a"].dp["0"];
+
+    assert_eq!(dp.npu_blocks, 2);
+    assert_eq!(dp.cpu_blocks, 2, "only blocks 2,3 are exclusive to CPU");
+    assert_eq!(dp.cpu_local_blocks, 2, "both are in its own machine's DRAM");
+    assert_eq!(dp.cpu_remote_blocks, 0);
+}
+
+#[test]
+fn test_non_owner_pooled_hits_are_all_remote() {
+    // inst-b holds nothing but can still fetch the chain from node-1. Every one
+    // of those blocks costs a transfer, so none of them count as local.
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-all-remote", "t1");
+
+    let tokens: Vec<i64> = (0..8).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+
+    broadcast_to_node(
+        &entry,
+        &[("inst-a", 0)],
+        None,
+        &[(100, hashes[0].0), (101, hashes[1].0)],
+    );
+    store_chain(
+        &entry,
+        &worker_of("inst-b", 0, StorageMedium::Npu),
+        None,
+        &[(900, 99999)],
+    );
+
+    let resp = indexer.query("model-all-remote", "t1", &tokens, 4).unwrap();
+    let dp = &resp.tenants["t1"]["inst-b"].dp["0"];
+
+    assert_eq!(dp.cpu_blocks, 2);
+    assert_eq!(dp.cpu_local_blocks, 0);
+    assert_eq!(dp.cpu_remote_blocks, 2);
+}
+
 #[test]
 fn test_pooled_walk_crosses_ownership_boundary() {
     // inst-a's DRAM holds [0,2), inst-b's DRAM continues [2,4). Pooled blocks

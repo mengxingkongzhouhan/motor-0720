@@ -24,7 +24,7 @@
 
 use serde::Deserialize;
 
-use crate::backend::MatchMode;
+use crate::backend::{MatchMode, WorkerResolver};
 use crate::error::KvConductorError;
 use crate::hashing::compute_block_hash_for_seq;
 use crate::indexer::Indexer;
@@ -588,7 +588,7 @@ pub(crate) fn apply_vllm_event(
     subscriber_dp_rank: u32,
     default_media: &[StorageMedium],
     match_mode: MatchMode,
-    hbm_ip_index: &Option<HbmIpIndex>,
+    resolver: &WorkerResolver,
     registered_block_size: u32,
 ) -> Result<(), KvConductorError> {
     match event {
@@ -714,7 +714,7 @@ pub(crate) fn apply_vllm_event(
                 let target_media = resolve_medium(medium.as_deref(), default_media);
                 let target_workers = resolve_workers(
                     match_mode,
-                    hbm_ip_index,
+                    resolver,
                     backend_id,
                     subscriber_dp_rank,
                     &target_media,
@@ -735,7 +735,7 @@ pub(crate) fn apply_vllm_event(
             let target_media = resolve_medium(medium.as_deref(), default_media);
             let target_workers = resolve_workers(
                 match_mode,
-                hbm_ip_index,
+                resolver,
                 backend_id,
                 subscriber_dp_rank,
                 &target_media,
@@ -757,7 +757,7 @@ pub(crate) fn apply_vllm_event(
             let target_media = resolve_medium(None, default_media);
             let target_workers = resolve_workers(
                 match_mode,
-                hbm_ip_index,
+                resolver,
                 backend_id,
                 subscriber_dp_rank,
                 &target_media,

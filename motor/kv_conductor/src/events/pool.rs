@@ -18,7 +18,7 @@
 
 use serde::Deserialize;
 
-use crate::backend::MatchMode;
+use crate::backend::{MatchMode, WorkerResolver};
 use crate::error::KvConductorError;
 use crate::indexer::Indexer;
 use crate::protocols::*;
@@ -78,7 +78,7 @@ pub(crate) fn apply_pool_event(
     subscriber_dp_rank: u32,
     default_media: &[StorageMedium],
     match_mode: MatchMode,
-    hbm_ip_index: &Option<HbmIpIndex>,
+    resolver: &WorkerResolver,
 ) -> Result<(), KvConductorError> {
     let event_type = pool_event
         .event_type
@@ -133,7 +133,7 @@ pub(crate) fn apply_pool_event(
 
     let entry = indexer.get_or_create(mn, tid);
 
-    let target_workers = resolve_workers(match_mode, hbm_ip_index, be_id, dp_rank, &target_media);
+    let target_workers = resolve_workers(match_mode, resolver, be_id, dp_rank, &target_media);
 
     // ── Cleared events: no seq_hashes needed ──────────────────────────
     if is_cleared {

@@ -71,12 +71,19 @@ impl Default for CacheMaintenanceConfig {
     }
 }
 
-/// Per-DP absolute coverage ends (in blocks) on each storage medium.
+/// Per-DP absolute coverage ends (in blocks) on each storage medium, plus how
+/// much of the pooled coverage this DP can read without a cross-machine
+/// transfer.
 #[derive(Debug, Clone, Copy, Default)]
 struct MediumEnds {
     npu: u32,
     cpu: u32,
     disk: u32,
+    /// Blocks in `[npu, cpu)` that this DP itself owns. Because a pool event
+    /// fans out to every DP on the holding machine, owning a pooled block means
+    /// it sits in this DP's own machine's DRAM. The remainder of `cpu - npu` is
+    /// therefore what has to come over the wire.
+    cpu_local: u32,
 }
 
 /// The two accumulators a matching pass writes into.
@@ -385,6 +392,27 @@ impl IndexerEntry {
         }
     }
 
+    /// Record how many of this tier's exclusive blocks the DP can read locally.
+    ///
+    /// Only CPU is reported today: Disk pooling computes the same value in the
+    /// walk, so surfacing it is a one-line change once the scheduler needs it.
+    #[inline]
+    fn note_local_hits(
+        medium_ends: &mut FxHashMap<(String, DpRank), MediumEnds>,
+        instance_id: &str,
+        dp_rank: DpRank,
+        medium: StorageMedium,
+        local: u32,
+    ) {
+        if medium != StorageMedium::Cpu {
+            return;
+        }
+        medium_ends
+            .entry((instance_id.to_string(), dp_rank))
+            .or_default()
+            .cpu_local = local;
+    }
+
     /// Per `(instance_id, dp_rank)`, keep the farther breakpoint.
     ///
     /// `preferred` (CPU) overwrites `fallback` (HBM) when ``end_pos`` is
@@ -447,8 +475,9 @@ impl IndexerEntry {
             return Vec::new();
         }
 
-        // Same for everyone — one walk, reused for every DP below.
-        let root_hit = tiers.reachable_from(block_hashes, 0, None);
+        // Same for everyone — one walk, reused for every DP below. The chain of
+        // block identities comes along so each DP can ask which of them it owns.
+        let root_chain = tiers.reachable_chain(block_hashes, 0, None);
 
         // One breakpoint per DP, keeping the farthest.
         //
@@ -472,50 +501,62 @@ impl IndexerEntry {
 
         let mut breaks = Vec::new();
         for dp in known_dps {
-            let mut best = root_hit;
+            let (instance_id, dp_rank) = dp;
 
-            if let Some(b) = own_break.get(dp) {
-                let resumed = tiers.reachable_from(block_hashes, b.end_pos, Some(b.last_seq));
-                if let Some(hit) = resumed {
-                    let farther = match best {
-                        Some(current) => hit.end_pos() >= current.end_pos(),
-                        None => true,
-                    };
-                    if farther {
-                        best = Some(hit);
-                    }
+            // Own breakpoint beats the shared root walk when it reaches further.
+            let mut best = root_chain.as_ref();
+            let resumed = own_break
+                .get(dp)
+                .and_then(|b| tiers.reachable_chain(block_hashes, b.end_pos, Some(b.last_seq)));
+            if let Some(reached) = &resumed {
+                let farther = match best {
+                    Some(current) => reached.hit.end_pos() >= current.hit.end_pos(),
+                    None => true,
+                };
+                if farther {
+                    best = Some(reached);
                 }
             }
 
-            let Some(hit) = best else {
+            let Some(reached) = best else {
                 continue;
             };
-            if hit.count == 0 {
+            if reached.hit.count == 0 {
                 continue;
             }
 
-            let (instance_id, dp_rank) = dp;
-            sink.overlap.add_blocks(
-                WorkerKey {
-                    instance_id: instance_id.clone(),
-                    backend_id: instance_id.clone(),
-                    dp_rank: *dp_rank,
-                    medium,
-                },
-                hit.count as u32,
-            );
+            let worker = WorkerKey {
+                instance_id: instance_id.clone(),
+                backend_id: instance_id.clone(),
+                dp_rank: *dp_rank,
+                medium,
+            };
+
+            // Blocks before this position are already covered by a
+            // higher-priority medium and need no fetch, so they are excluded
+            // from the local count — which is what makes it comparable with this
+            // tier's exclusive block count.
+            let ends = sink.medium_ends.get(dp).copied().unwrap_or_default();
+            let exclusive_from = match medium {
+                StorageMedium::Disk => ends.npu.max(ends.cpu),
+                _ => ends.npu,
+            } as usize;
+            let local = tiers.count_owned(&worker, reached.blocks_from(exclusive_from));
+
+            sink.overlap.add_blocks(worker, reached.hit.count as u32);
             Self::note_medium_end(
                 sink.medium_ends,
                 instance_id,
                 *dp_rank,
                 medium,
-                hit.end_pos() as u32,
+                reached.hit.end_pos() as u32,
             );
-            if let Some(last_seq) = hit.last_matched_hash {
+            Self::note_local_hits(sink.medium_ends, instance_id, *dp_rank, medium, local);
+            if let Some(last_seq) = reached.hit.last_matched_hash {
                 breaks.push(TierBreakpoint {
                     instance_id: instance_id.clone(),
                     dp_rank: *dp_rank,
-                    end_pos: hit.end_pos(),
+                    end_pos: reached.hit.end_pos(),
                     last_seq,
                 });
             }
@@ -1074,6 +1115,10 @@ impl Indexer {
         let npu_blocks = medium_ends.values().map(|m| m.npu).max().unwrap_or(0);
         let cpu_blocks = medium_ends.values().map(|m| m.cpu).max().unwrap_or(0);
         let disk_blocks = medium_ends.values().map(|m| m.disk).max().unwrap_or(0);
+        // Summed across DPs: a large local total means the pooled hits are
+        // mostly on-machine reads, a small one that nearly every hit costs a
+        // cross-machine transfer.
+        let cpu_local_blocks: u32 = medium_ends.values().map(|m| m.cpu_local).sum();
 
         tracing::debug!(
             num_tokens = token_ids.len(),
@@ -1084,6 +1129,7 @@ impl Indexer {
             npu_blocks,
             cpu_blocks,
             disk_blocks,
+            cpu_local_blocks,
             "query profile"
         );
         resp
@@ -1144,6 +1190,11 @@ impl Indexer {
             dp_match.cpu_blocks = cpu;
             dp_match.disk_blocks = disk;
             dp_match.matched_tokens = covered.saturating_mul(block_size);
+            // `cpu_local` is counted over the same exclusive range as `cpu`, so
+            // the subtraction cannot underflow; clamp anyway rather than risk a
+            // wrapped count reaching the scheduler.
+            dp_match.cpu_local_blocks = ends.cpu_local.min(cpu);
+            dp_match.cpu_remote_blocks = cpu.saturating_sub(ends.cpu_local);
         }
 
         for imd in instance_data.values_mut() {

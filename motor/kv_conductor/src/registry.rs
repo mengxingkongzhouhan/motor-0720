@@ -88,17 +88,22 @@ fn remove_hbm_ip_index_entries(
     }
 }
 
-/// Record `(pod_ip → node_id)` and `(node_id → dp)` for each NPU endpoint.
+/// Record where each NPU endpoint runs, in all three topology directions.
 ///
 /// The Pod IP is taken from the same endpoint URL that feeds `hbm_ip_index`, so
-/// the two indexes are keyed consistently. No-op when the registration carries
-/// no `node_id`.
+/// the two indexes are keyed consistently. The model/tenant is recorded because
+/// the pool-event fanout is scoped by it. No-op when the registration carries no
+/// `node_id` — without one there is no machine identity to group Pods by, and the
+/// fanout stays per-Pod.
+#[allow(clippy::too_many_arguments)]
 fn add_node_topology_entries(
     topology: &SharedNodeTopology,
     node_id: Option<&str>,
     medium_endpoints: &HashMap<String, String>,
     instance_id: &str,
     dp_rank: u32,
+    model_name: &str,
+    tenant_id: &str,
 ) {
     let Some(node_id) = node_id else {
         return;
@@ -115,9 +120,10 @@ fn add_node_topology_entries(
         };
         topology
             .write()
-            .record(pod_ip, node_id, instance_id, dp_rank);
+            .record(pod_ip, node_id, instance_id, dp_rank, model_name, tenant_id);
         tracing::info!(
             instance_id = %instance_id, dp_rank, pod_ip = %pod_ip, node_id = %node_id,
+            model = %model_name, tenant = %tenant_id,
             "node topology recorded"
         );
     }
@@ -353,6 +359,8 @@ impl WorkerRegistry {
                 &req.medium_endpoints,
                 &req.instance_id,
                 req.dp_rank,
+                &req.modelname,
+                &req.tenant_id,
             );
         }
 
@@ -365,10 +373,19 @@ impl WorkerRegistry {
             } else {
                 MatchMode::None
             };
-            let ip_index = if is_pool {
-                Some(Arc::clone(&self.hbm_ip_index))
+            // Pool subscribers fan an event out to every DP that can read the
+            // block locally, which needs both the Pod index and the machine
+            // grouping. Non-pool subscribers resolve to a fixed DP and need
+            // neither.
+            let resolver = if is_pool {
+                crate::backend::WorkerResolver {
+                    ip_index: Some(Arc::clone(&self.hbm_ip_index)),
+                    topology: Some(Arc::clone(&self.node_topology)),
+                    model_name: req.modelname.clone(),
+                    tenant_id: req.tenant_id.clone(),
+                }
             } else {
-                None
+                crate::backend::WorkerResolver::default()
             };
             for (ep_url, default_media) in &endpoint_media {
                 let sub = crate::zmq_subscriber::ZmqSubscriber::connect(
@@ -381,7 +398,7 @@ impl WorkerRegistry {
                     req.dp_rank,
                     default_media.clone(),
                     match_mode,
-                    ip_index.clone(),
+                    resolver.clone(),
                 )?;
                 subs.push((ep_url.clone(), sub));
             }
@@ -445,10 +462,15 @@ impl WorkerRegistry {
                 let indexer = Arc::clone(&self.indexer);
                 let instance_id = req.instance_id.clone();
                 let match_mode = sb.match_mode();
-                let ip_index = if sb.index_hbm_ip() {
-                    Some(Arc::clone(&self.hbm_ip_index))
+                let resolver = if sb.index_hbm_ip() {
+                    crate::backend::WorkerResolver {
+                        ip_index: Some(Arc::clone(&self.hbm_ip_index)),
+                        topology: Some(Arc::clone(&self.node_topology)),
+                        model_name: req.modelname.clone(),
+                        tenant_id: req.tenant_id.clone(),
+                    }
                 } else {
-                    None
+                    crate::backend::WorkerResolver::default()
                 };
 
                 // Offload blocking ZMQ I/O to a dedicated thread so the
@@ -462,7 +484,7 @@ impl WorkerRegistry {
                         &indexer,
                         &instance_id,
                         match_mode,
-                        &ip_index,
+                        &resolver,
                     );
                 });
             }
@@ -772,7 +794,15 @@ mod tests {
             ("node-1", "tcp://10.244.0.6:50090", "vllm-prefill-2", 0),
             ("node-2", "tcp://10.244.1.7:50090", "vllm-prefill-3", 0),
         ] {
-            add_node_topology_entries(&topo, Some(node), &npu_endpoints(url), instance, dp);
+            add_node_topology_entries(
+                &topo,
+                Some(node),
+                &npu_endpoints(url),
+                instance,
+                dp,
+                "m",
+                "t",
+            );
         }
         topo
     }
@@ -822,6 +852,8 @@ mod tests {
                 &npu_endpoints("tcp://10.244.0.5:50090"),
                 "vllm-prefill-1",
                 0,
+                "m",
+                "t",
             );
         }
         assert_eq!(
@@ -837,8 +869,82 @@ mod tests {
             &npu_endpoints("tcp://10.244.1.9:50090"),
             "vllm-prefill-1",
             0,
+            "m",
+            "t",
         );
         assert_eq!(topo.read().node_of_dp("vllm-prefill-1", 0), Some("node-2"));
+        // The reverse index must not keep the DP on its old machine, or a
+        // node-1 pool event would still fan out to a DP that moved away.
+        let summary = topo.read().summary();
+        assert!(
+            !summary.node_to_dps.contains_key("node-1"),
+            "stale reverse entry left behind: {:?}",
+            summary.node_to_dps
+        );
+        assert_eq!(summary.node_to_dps["node-2"], vec!["vllm-prefill-1/0"]);
+    }
+
+    #[test]
+    fn test_topology_lists_the_fanout_set_for_a_pool_event() {
+        // The fanout for a pool event naming any Pod on node-1 is every DP on
+        // node-1, across Pods; node-2's DP must never appear.
+        let topo = seeded_topology();
+        let t = topo.read();
+
+        let mut on_node_1 = t
+            .dps_on_node_of_pod("10.244.0.5", "m", "t")
+            .expect("node-1 is known");
+        on_node_1.sort();
+        assert_eq!(
+            on_node_1,
+            vec![
+                ("vllm-prefill-1".to_string(), 0),
+                ("vllm-prefill-1".to_string(), 1),
+                ("vllm-prefill-2".to_string(), 0),
+            ],
+            "a block in node-1's DRAM is readable by all of node-1"
+        );
+
+        // Naming the other Pod on the same machine resolves to the same set.
+        let mut via_peer = t.dps_on_node_of_pod("10.244.0.6", "m", "t").unwrap();
+        via_peer.sort();
+        assert_eq!(via_peer, on_node_1);
+
+        assert_eq!(
+            t.dps_on_node_of_pod("10.244.1.7", "m", "t"),
+            Some(vec![("vllm-prefill-3".to_string(), 0)]),
+            "node-2 stands alone"
+        );
+
+        // An unknown Pod yields `None`, the signal to fall back to a per-Pod
+        // fanout rather than guess at a machine grouping.
+        assert!(t.dps_on_node_of_pod("10.9.9.9", "m", "t").is_none());
+
+        // A different model on the same machines resolves to nothing.
+        assert_eq!(
+            t.dps_on_node_of_pod("10.244.0.5", "other-model", "t"),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn test_topology_forget_drops_the_dp_from_its_node() {
+        let topo = seeded_topology();
+        for dp in [0, 1] {
+            remove_node_topology_entries(
+                &topo,
+                &npu_endpoints(&format!("tcp://10.244.0.5:5009{dp}")),
+                "vllm-prefill-1",
+                dp,
+            );
+        }
+
+        let t = topo.read();
+        assert_eq!(
+            t.dps_on_node_of_pod("10.244.0.6", "m", "t"),
+            Some(vec![("vllm-prefill-2".to_string(), 0)]),
+            "only the departed DPs leave the fanout set"
+        );
     }
 
     #[test]
@@ -889,6 +995,8 @@ mod tests {
             &npu_endpoints("tcp://10.244.0.5:50090"),
             "vllm-prefill-1",
             0,
+            "m",
+            "t",
         );
         add_node_topology_entries(
             &topo,
@@ -896,6 +1004,8 @@ mod tests {
             &npu_endpoints("tcp://10.244.0.5:50090"),
             "vllm-prefill-1",
             0,
+            "m",
+            "t",
         );
         assert!(topo.read().is_empty());
     }
@@ -908,7 +1018,7 @@ mod tests {
         let mut eps = HashMap::new();
         eps.insert("cpu".to_string(), "tcp://10.244.0.9:15558".to_string());
         eps.insert("disk".to_string(), "tcp://10.244.0.9:15559".to_string());
-        add_node_topology_entries(&topo, Some("node-1"), &eps, "vllm-prefill-1", 0);
+        add_node_topology_entries(&topo, Some("node-1"), &eps, "vllm-prefill-1", 0, "m", "t");
         assert!(topo.read().is_empty());
     }
 }

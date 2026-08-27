@@ -371,8 +371,11 @@ Pod IP，要落到该 Pod 所在机器上的**所有** DP（跨 Pod）。注意�
 `pod_to_node` 则在该 Pod 的最后一个 DP 离开后才删。
 
 **不带 `node_id` 时三张表为空**，广播退化为「只发给事件 Pod 自己的 DP」，即当前行为。
-目前 Coordinator 尚未下发该字段（需要把机器标识从 NodeManager 经 Controller 透传到
-Coordinator，见设计文档），所以在当前部署里 `cpu_local_blocks` 的含义是「同 Pod」。
+目前 Coordinator 尚未下发该字段，所以在当前部署里 `cpu_local_blocks` 的含义是「同 Pod」。
+
+要接上不需要改 K8s 部署——`HOST_IP`（`status.hostIP`）已经注入到 engine 容器，只是 Python
+侧从不读；缺的是从 NodeManager 经 Controller 到 Coordinator 的字段透传，路径与已经跑通的
+`pod_ip` 完全相同。详见设计文档。
 
 `npu_endpoint` 必须与引擎 `--kv-events-config` 的 `endpoint` 一致（`tcp://*:5557` 为 vLLM 常用值）；
 模式中的 `*` 会被替换为 endpoint IP，端口会加上 `dp_rank`，conductor 主动 connect 到各引擎节点绑定的事件端口。

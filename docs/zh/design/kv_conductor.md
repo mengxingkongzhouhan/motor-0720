@@ -338,10 +338,30 @@ root 走查不依赖任何上层覆盖，所以「HBM 全被驱逐、池中保�
 （`extract_ip_from_endpoint(medium_endpoints["npu"])`），两张索引对得上。
 
 **当前状态**：Coordinator **尚未下发** `node_id`，因此三张表默认为空，广播退化为「只发给
-事件 Pod 自己的 DP」，即改动前的行为。要让 Coordinator 填上这个字段，需要把机器标识从
-NodeManager 经 Controller 透传到 Coordinator——目前 `motor/` 里 `host_ip` 只在
-`inventory_collector.py` 出现过一次且是硬编码空串，`NodeManagerInfo` 也只有 `pod_ip`，
-这条链路尚不存在。在此之前，下面的本地/远端拆分中「本地」的含义是「同 Pod」。
+事件 Pod 自己的 DP」，即改动前的行为。在此之前，下面的本地/远端拆分中「本地」的含义是
+「同 Pod」而不是「同机」。
+
+要填上这个字段，**不需要改 K8s 部署**：`engine_template.yaml` 已经通过 downward API 把
+`status.hostIP` 注入成 `HOST_IP` 环境变量（与 `POD_IP` 并排），只是 Python 运行时从不读它
+（目前只有 HCCL 启动脚本在用）。缺的是数据透传，路径与 `pod_ip` 完全相同：
+
+```text
+  status.podIP -> POD_IP -> Env.pod_ip -> RegisterMsg.pod_ip
+              -> Endpoint.ip -> InsEventMsg -> ConductorApiClient   已通
+  status.hostIP -> HOST_IP -> ??? -> ??? -> ??? -> node_id          缺中间四环
+```
+
+中间四环（`Env.host_ip`、`RegisterMsg`、`Endpoint`/`NodeManagerInfo`、
+`instance_assembler` 组装，最后 `ConductorApiClient` 填字段）都只是加字段加赋值，不需要新
+的通信机制。
+
+另一条路是复用 Controller 容错模块已有的 `K8sClient.get_node_hostname_by_pod_ip()`——它
+已经在维护 `pod_ip → node_name` 映射，只是不进 `Instance`。这样能省掉 NodeManager 那两环，
+代价是标识格式变成 K8s node name 而非 hostIP，两者都能唯一标识一台机器但**必须全局统一**。
+
+注意：部分测试已经在构造 `NodeManagerInfo(..., host_ip=...)` 和引用 `api_config.host_ip`，
+但生产模型里没有这些字段——Pydantic 静默忽略了它们。动手前先确认这些测试的意图，别误以为
+字段已经存在。
 
 ### 池命中的本地/远端拆分
 

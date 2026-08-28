@@ -10,7 +10,7 @@
 
 //! Shared helpers for event application.
 
-use crate::backend::{MatchMode, WorkerResolver};
+use crate::backend::MatchMode;
 use crate::protocols::*;
 
 /// Resolve the target storage media list from an event's optional `medium`
@@ -30,11 +30,11 @@ pub(super) fn resolve_medium(
 ///
 /// - `MatchMode::None` (YuanRong): one worker per medium, using `backend_id`
 ///   directly as the instance identity.
-/// - Other modes (Mooncake/Memcache): delegates to `MatchMode::resolve_workers`,
-///   which fans out to every DP that can read the block locally.
+/// - Other modes (Mooncake/Memcache): delegates to `MatchMode::resolve_workers`
+///   which fans out via `hbm_ip_index`.
 pub(super) fn resolve_workers(
     match_mode: MatchMode,
-    resolver: &WorkerResolver,
+    hbm_ip_index: &Option<HbmIpIndex>,
     backend_id: &str,
     dp_rank: u32,
     target_media: &[StorageMedium],
@@ -50,6 +50,6 @@ pub(super) fn resolve_workers(
             })
             .collect()
     } else {
-        match_mode.resolve_workers(resolver, backend_id, dp_rank, target_media)
+        match_mode.resolve_workers(hbm_ip_index.as_ref(), backend_id, dp_rank, target_media)
     }
 }

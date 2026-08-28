@@ -51,131 +51,51 @@ pub type HbmIpIndex = Arc<ParkingRwLock<HashMap<String, Vec<(String, u32)>>>>;
 pub struct DpLocation {
     pub pod_ip: String,
     pub node_id: String,
-    /// What this DP serves. The pool-event fanout is scoped by it: a machine can
-    /// host Pods of several deployments, and attributing one model's blocks to a
-    /// DP serving another would let the Coordinator route a request to a Pod that
-    /// cannot answer it.
-    pub model_name: String,
-    pub tenant_id: String,
 }
 
 /// Registration-derived cluster topology: where each Pod and each DP runs.
 ///
-/// Three lookups, all fed by `/register`:
+/// Two lookups, both fed by `/register` and both pointing **towards** the node,
+/// which is the direction consumers need: given a DP (an edge owner) or a Pod IP
+/// (a pool event's `backend_id`), answer "which machine is this on". Comparing
+/// two DPs for co-location is then two O(1) lookups.
 ///
 /// - `dp_to_node`: `(instance_id, dp_rank)` → [`DpLocation`]
 /// - `pod_to_node`: Pod IP → node identity
-/// - `node_to_dps`: node identity → the DPs running on that machine
-///
-/// The first two point **towards** the node — given a DP or a Pod IP, answer
-/// "which machine is this on". `node_to_dps` is the reverse, and exists for the
-/// pool-event fanout: a pooled block lives in one machine's DRAM and is readable
-/// by every DP on that machine, so an event naming one Pod must reach all of
-/// them ([`Self::dps_on_node_of_pod`]).
 ///
 /// The node identity is whatever the client sends as `node_id` (K8s
 /// `status.hostIP` in the Motor deployment). A Pod never migrates hosts — a
 /// rescheduled Pod is a new Pod with a new IP — so an entry is written once per
 /// registration and only dropped on unregister. Nothing polls or refreshes it.
 ///
-/// All maps live behind one lock so a resolution can never observe a
+/// Both maps live behind one lock so a resolution can never observe a
 /// half-updated state.
 ///
 /// Empty unless clients send `node_id`; the conductor never infers node identity
-/// on its own, and without it the fanout stays per-Pod.
+/// on its own.
 #[derive(Debug, Default)]
 pub struct NodeTopology {
     dp_to_node: HashMap<(InstanceId, DpRank), DpLocation>,
     pod_to_node: HashMap<String, String>,
-    node_to_dps: HashMap<String, Vec<(InstanceId, DpRank)>>,
 }
 
 impl NodeTopology {
     /// Record one DP. Idempotent, and re-registering with a new node overwrites.
-    pub fn record(
-        &mut self,
-        pod_ip: &str,
-        node_id: &str,
-        instance_id: &str,
-        dp_rank: DpRank,
-        model_name: &str,
-        tenant_id: &str,
-    ) {
-        let dp = (instance_id.to_string(), dp_rank);
-
-        // Re-registration may move a DP to a different node; drop the stale
-        // reverse entry first or the DP would be listed on both machines.
-        if let Some(old) = self.dp_to_node.get(&dp) {
-            if old.node_id != node_id {
-                Self::detach_from_node(&mut self.node_to_dps, &old.node_id.clone(), &dp);
-            }
-        }
-
+    pub fn record(&mut self, pod_ip: &str, node_id: &str, instance_id: &str, dp_rank: DpRank) {
         self.dp_to_node.insert(
-            dp.clone(),
+            (instance_id.to_string(), dp_rank),
             DpLocation {
                 pod_ip: pod_ip.to_string(),
                 node_id: node_id.to_string(),
-                model_name: model_name.to_string(),
-                tenant_id: tenant_id.to_string(),
             },
         );
         self.pod_to_node
             .insert(pod_ip.to_string(), node_id.to_string());
-
-        let peers = self.node_to_dps.entry(node_id.to_string()).or_default();
-        if !peers.contains(&dp) {
-            peers.push(dp);
-        }
-    }
-
-    /// Every DP that can read a pooled block held by `pod_ip`'s machine, i.e.
-    /// every DP on that machine serving the same model and tenant.
-    ///
-    /// Returns `None` when the Pod's node is unknown, which is the signal to fall
-    /// back to a per-Pod fanout rather than guess. The model/tenant filter is
-    /// what keeps a co-located Pod of a *different* deployment from being
-    /// recorded as an owner.
-    pub fn dps_on_node_of_pod(
-        &self,
-        pod_ip: &str,
-        model_name: &str,
-        tenant_id: &str,
-    ) -> Option<Vec<(InstanceId, DpRank)>> {
-        let node_id = self.pod_to_node.get(pod_ip)?;
-        let dps = self.node_to_dps.get(node_id)?;
-        Some(
-            dps.iter()
-                .filter(|dp| {
-                    self.dp_to_node.get(*dp).is_some_and(|loc| {
-                        loc.model_name == model_name && loc.tenant_id == tenant_id
-                    })
-                })
-                .cloned()
-                .collect(),
-        )
-    }
-
-    /// Remove one DP from a node's list, dropping the node key when it empties.
-    fn detach_from_node(
-        node_to_dps: &mut HashMap<String, Vec<(InstanceId, DpRank)>>,
-        node_id: &str,
-        dp: &(InstanceId, DpRank),
-    ) {
-        if let Some(peers) = node_to_dps.get_mut(node_id) {
-            peers.retain(|peer| peer != dp);
-            if peers.is_empty() {
-                node_to_dps.remove(node_id);
-            }
-        }
     }
 
     /// Drop one DP, dropping the Pod entry once its last DP is gone.
     pub fn forget(&mut self, pod_ip: &str, instance_id: &str, dp_rank: DpRank) {
-        let dp = (instance_id.to_string(), dp_rank);
-        if let Some(loc) = self.dp_to_node.remove(&dp) {
-            Self::detach_from_node(&mut self.node_to_dps, &loc.node_id, &dp);
-        }
+        self.dp_to_node.remove(&(instance_id.to_string(), dp_rank));
 
         // The Pod entry outlives its DPs only while some DP still runs there.
         // The DP map is small and unregistration is rare, so a scan is cheaper
@@ -210,7 +130,7 @@ impl NodeTopology {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.dp_to_node.is_empty() && self.pod_to_node.is_empty() && self.node_to_dps.is_empty()
+        self.dp_to_node.is_empty() && self.pod_to_node.is_empty()
     }
 
     /// Debug view for `GET /workers`.
@@ -227,18 +147,6 @@ impl NodeTopology {
                 })
                 .collect(),
             pod_to_node: self.pod_to_node.clone(),
-            node_to_dps: self
-                .node_to_dps
-                .iter()
-                .map(|(node_id, dps)| {
-                    let mut flat: Vec<String> = dps
-                        .iter()
-                        .map(|(instance_id, dp_rank)| format!("{instance_id}/{dp_rank}"))
-                        .collect();
-                    flat.sort();
-                    (node_id.clone(), flat)
-                })
-                .collect(),
         }
     }
 }
@@ -249,9 +157,6 @@ pub struct NodeTopologySummary {
     /// `"<instance_id>/<dp_rank>"` → where that DP runs.
     pub dp_to_node: HashMap<String, DpLocation>,
     pub pod_to_node: HashMap<String, String>,
-    /// node identity → the `"<instance_id>/<dp_rank>"` DPs on that machine,
-    /// i.e. the fanout set for a pool event naming any Pod on it.
-    pub node_to_dps: HashMap<String, Vec<String>>,
 }
 
 /// Shared handle to the registration-derived topology.
@@ -486,19 +391,23 @@ pub struct DpBlocks {
     pub cpu_blocks: u32,
     /// Exclusive Disk matched block count (beyond max(NPU, CPU) coverage).
     pub disk_blocks: u32,
-    /// How `cpu_blocks` splits by where the block physically sits.
+    /// How `cpu_blocks` splits by how far the block has to travel.
     ///
-    /// A pool event fans out to every DP on the machine holding the block, so
-    /// "this DP owns the block" and "the block is in this DP's own machine's
-    /// DRAM" are the same statement. Local blocks are a near-free read; remote
-    /// ones cost a transfer over `device_rdma` / `device_sdma` / `device_urma`.
+    /// A pool event fans out to every DP in the Pod that reported it, so "this DP
+    /// owns the block" means "the block is in this DP's own Pod" — and same Pod
+    /// implies same machine, i.e. a near-free DRAM read. Everything else is
+    /// counted remote and costs a transfer over `device_rdma` / `device_sdma` /
+    /// `device_urma`.
     ///
     /// Invariant: `cpu_local_blocks + cpu_remote_blocks == cpu_blocks`. Blocks
     /// already covered by NPU are excluded from both — they need no fetch.
     ///
-    /// Without `node_id` from the client the fanout stays per-Pod, so `local`
-    /// then means "same Pod" rather than "same machine": an under-count, never
-    /// an over-count.
+    /// The split is deliberately conservative: a block held by a *different* Pod
+    /// on the same machine is also a cheap read, but the conductor cannot see
+    /// that without a machine identity, so it counts as remote. `local` is
+    /// therefore a lower bound on co-location — never an over-count, which is the
+    /// safe direction (over-counting would tell the scheduler a fetch is free
+    /// when it is not).
     pub cpu_local_blocks: u32,
     pub cpu_remote_blocks: u32,
 }

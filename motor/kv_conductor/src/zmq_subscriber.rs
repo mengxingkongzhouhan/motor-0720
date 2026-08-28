@@ -21,11 +21,11 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::backend::{MatchMode, WorkerResolver};
+use crate::backend::MatchMode;
 use crate::error::KvConductorError;
 use crate::events::{self, PoolEvent};
 use crate::indexer::Indexer;
-use crate::protocols::StorageMedium;
+use crate::protocols::{HbmIpIndex, StorageMedium};
 
 /// Maximum backoff delay between reconnection attempts.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -59,7 +59,7 @@ impl ZmqSubscriber {
         dp_rank: u32,
         default_media: Vec<StorageMedium>,
         match_mode: MatchMode,
-        resolver: crate::backend::WorkerResolver,
+        hbm_ip_index: Option<crate::protocols::HbmIpIndex>,
     ) -> Result<Self, KvConductorError> {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
@@ -83,7 +83,7 @@ impl ZmqSubscriber {
                 dp_rank,
                 default_media,
                 match_mode,
-                resolver,
+                hbm_ip_index,
                 cancel_clone,
             );
             stopped_clone.store(true, Ordering::Release);
@@ -162,7 +162,7 @@ fn subscriber_loop_with_reconnect(
     dp_rank: u32,
     default_media: Vec<StorageMedium>,
     match_mode: MatchMode,
-    resolver: crate::backend::WorkerResolver,
+    hbm_ip_index: Option<crate::protocols::HbmIpIndex>,
     cancel: CancellationToken,
 ) {
     let mut retry_delay = INITIAL_RETRY_DELAY;
@@ -188,7 +188,7 @@ fn subscriber_loop_with_reconnect(
                     dp_rank,
                     default_media.clone(),
                     match_mode,
-                    resolver.clone(),
+                    hbm_ip_index.clone(),
                     cancel.clone(),
                 );
 
@@ -229,7 +229,7 @@ fn subscriber_loop(
     dp_rank: u32,
     default_media: Vec<StorageMedium>,
     match_mode: MatchMode,
-    resolver: crate::backend::WorkerResolver,
+    hbm_ip_index: Option<crate::protocols::HbmIpIndex>,
     cancel: CancellationToken,
 ) {
     let mut batch_count: u64 = 0;
@@ -281,7 +281,7 @@ fn subscriber_loop(
             dp_rank,
             &default_media,
             match_mode,
-            &resolver,
+            &hbm_ip_index,
             &mut batch_count,
             &mut event_count,
             &mut parse_errors,
@@ -301,7 +301,7 @@ fn process_payload(
     dp_rank: u32,
     default_media: &[StorageMedium],
     match_mode: MatchMode,
-    resolver: &crate::backend::WorkerResolver,
+    hbm_ip_index: &Option<crate::protocols::HbmIpIndex>,
     batch_count: &mut u64,
     event_count: &mut u64,
     parse_errors: &mut u64,
@@ -364,7 +364,7 @@ fn process_payload(
                     dp_rank,
                     default_media,
                     match_mode,
-                    resolver,
+                    hbm_ip_index,
                 ) {
                     *parse_errors += 1;
                     tracing::warn!(%backend_id, dp_rank, event_id = zmq_event.event_id, "{e}");
@@ -389,7 +389,7 @@ fn process_payload(
                     dp_rank,
                     default_media,
                     match_mode,
-                    resolver,
+                    hbm_ip_index,
                     block_size,
                 ) {
                     *parse_errors += 1;
@@ -418,7 +418,7 @@ fn process_payload(
                     dp_rank,
                     default_media,
                     match_mode,
-                    resolver,
+                    hbm_ip_index,
                 ) {
                     *parse_errors += 1;
                     tracing::warn!(%backend_id, dp_rank, event_id = zmq_event.event_id, "{e}");
@@ -506,7 +506,7 @@ pub fn replay_events(
     indexer: &Indexer,
     backend_id: &str,
     match_mode: MatchMode,
-    resolver: &WorkerResolver,
+    hbm_ip_index: &Option<HbmIpIndex>,
 ) {
     let ctx = zmq::Context::new();
     let socket = match ctx.socket(zmq::DEALER) {
@@ -576,7 +576,7 @@ pub fn replay_events(
                     bdp,
                     &[],
                     match_mode,
-                    resolver,
+                    hbm_ip_index,
                     _block_size,
                 ) {
                     tracing::warn!(%replay_endpoint, "replay vLLM event apply error: {e}");
@@ -597,7 +597,7 @@ pub fn replay_events(
                     bdp,
                     &[],
                     match_mode,
-                    resolver,
+                    hbm_ip_index,
                 ) {
                     tracing::warn!(%replay_endpoint, event_id = zmq_event.event_id,
                                    "replay apply error: {e}");

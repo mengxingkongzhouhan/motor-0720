@@ -80,9 +80,9 @@ struct MediumEnds {
     cpu: u32,
     disk: u32,
     /// Blocks in `[npu, cpu)` that this DP itself owns. Because a pool event
-    /// fans out to every DP on the holding machine, owning a pooled block means
-    /// it sits in this DP's own machine's DRAM. The remainder of `cpu - npu` is
-    /// therefore what has to come over the wire.
+    /// fans out to every DP in the reporting Pod, owning a pooled block means it
+    /// sits in this DP's own Pod — hence on its own machine. The remainder of
+    /// `cpu - npu` is what has to come over the wire.
     cpu_local: u32,
 }
 

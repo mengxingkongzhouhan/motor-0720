@@ -26,7 +26,7 @@
 //! dp_rank — instead every DP on the target node records the event's hash.
 //! This avoids the overhead of per-DP event routing.
 
-use crate::protocols::{HbmIpIndex, SharedNodeTopology, WorkerKey};
+use crate::protocols::{HbmIpIndex, WorkerKey};
 
 // ---------------------------------------------------------------------------
 // StoreBackend
@@ -103,69 +103,36 @@ pub enum MatchMode {
     IpAndDpRank,
 }
 
-/// The lookup tables a subscriber uses to turn an event's `backend_id` into
-/// owner keys, plus the model/tenant the subscriber serves.
-#[derive(Clone, Default)]
-pub struct WorkerResolver {
-    /// Pod IP → the DPs in that Pod. Built from HBM registrations.
-    pub ip_index: Option<HbmIpIndex>,
-    /// When present, [`MatchMode::IpOnly`] widens the fanout from the event's
-    /// Pod to every Pod on the same machine.
-    pub topology: Option<SharedNodeTopology>,
-    /// Scopes the widened fanout — see [`NodeTopology::dps_on_node_of_pod`].
-    pub model_name: String,
-    pub tenant_id: String,
-}
-
-impl WorkerResolver {
-    /// Which DPs should own a block reported at `lookup_ip`.
-    ///
-    /// A pooled block lives in one machine's DRAM and is readable by every DP on
-    /// that machine, so the fanout is node-wide when the topology knows the
-    /// Pod's node. That makes edge ownership answer "which DPs can read this
-    /// locally" directly — the query side then needs no topology at all.
-    ///
-    /// Falls back to the Pod's own DPs when the node is unknown (no `node_id`
-    /// from the client). Same-Pod DPs are trivially co-located, so the fallback
-    /// is a narrower but never wrong answer.
-    fn owner_dps(&self, lookup_ip: &str) -> Vec<(String, u32)> {
-        if let Some(topology) = &self.topology {
-            if let Some(dps) =
-                topology
-                    .read()
-                    .dps_on_node_of_pod(lookup_ip, &self.model_name, &self.tenant_id)
-            {
-                return dps;
-            }
-        }
-        match &self.ip_index {
-            Some(index) => index.read().get(lookup_ip).cloned().unwrap_or_default(),
-            None => Vec::new(),
-        }
-    }
-}
-
 impl MatchMode {
-    /// Resolve one event into the list of `WorkerKey`s that should receive it.
+    /// Look up target workers in the HBM IP index, returning the list of
+    /// `WorkerKey`s that should receive this event.
     ///
-    /// - `resolver`: the lookup tables and the subscriber's model/tenant scope.
-    /// - `lookup_ip`: the `backend_id` from the event (a Pod IP).
+    /// - `ip_index`: the shared IP → DP lookup table.
+    /// - `lookup_ip`: the `backend_id` from the event (node IP).
     /// - `event_dp_rank`: the dp_rank from the event (only used by `IpAndDpRank`).
     /// - `media`: the target storage media for this event.
     pub fn resolve_workers(
         self,
-        resolver: &WorkerResolver,
+        ip_index: Option<&HbmIpIndex>,
         lookup_ip: &str,
         event_dp_rank: u32,
         media: &[crate::protocols::StorageMedium],
     ) -> Vec<WorkerKey> {
-        let dps = resolver.owner_dps(lookup_ip);
+        let index = match ip_index {
+            Some(idx) => idx,
+            None => return Vec::new(),
+        };
+        let idx = index.read();
+        let dps = match idx.get(lookup_ip) {
+            Some(dps) => dps,
+            None => return Vec::new(),
+        };
 
         let mut workers = Vec::new();
-        for (iid, dp) in dps {
+        for &(ref iid, dp) in dps {
             let include = match self {
                 Self::None => unreachable!("resolve_workers called with MatchMode::None"),
-                Self::IpOnly => true, // every DP that can read it locally
+                Self::IpOnly => true, // apply to all DPs on the node
                 Self::IpAndDpRank => dp == event_dp_rank, // exact match
             };
             if include {
@@ -208,34 +175,6 @@ mod tests {
             })
             .collect();
         Arc::new(parking_lot::RwLock::new(map))
-    }
-
-    /// Resolver with no topology: the fanout stays within the event's own Pod.
-    fn pod_only(index: &HbmIpIndex) -> WorkerResolver {
-        WorkerResolver {
-            ip_index: Some(Arc::clone(index)),
-            topology: None,
-            model_name: "m".into(),
-            tenant_id: "t".into(),
-        }
-    }
-
-    /// Resolver whose topology places the given DPs on named machines.
-    /// Entries are `(pod_ip, node_id, instance_id, dp_rank, model, tenant)`.
-    fn with_topology(
-        index: &HbmIpIndex,
-        entries: &[(&str, &str, &str, u32, &str, &str)],
-    ) -> WorkerResolver {
-        let mut topo = crate::protocols::NodeTopology::default();
-        for (pod_ip, node_id, instance_id, dp_rank, model, tenant) in entries {
-            topo.record(pod_ip, node_id, instance_id, *dp_rank, model, tenant);
-        }
-        WorkerResolver {
-            ip_index: Some(Arc::clone(index)),
-            topology: Some(Arc::new(parking_lot::RwLock::new(topo))),
-            model_name: "m".into(),
-            tenant_id: "t".into(),
-        }
     }
 
     // ── StoreBackend parsing ──────────────────────────────────────────
@@ -287,7 +226,7 @@ mod tests {
         let media = &[StorageMedium::Cpu, StorageMedium::Disk];
 
         let workers = MatchMode::IpOnly.resolve_workers(
-            &pod_only(&index),
+            Some(&index),
             "10.0.0.1",
             /*dp_rank=*/ 99,
             media,
@@ -302,113 +241,12 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_workers_fans_out_across_pods_on_one_machine() {
-        // A pooled block lives in node-1's DRAM and is readable by every DP on
-        // node-1 — including the DPs of a *different* Pod. The event names only
-        // Pod 10.0.0.1, so a per-Pod fanout would miss prefill-b entirely.
-        let index = make_ip_index(vec![
-            ("10.0.0.1", vec![("prefill-a", 0)]),
-            ("10.0.0.2", vec![("prefill-b", 0)]),
-        ]);
-        let resolver = with_topology(
-            &index,
-            &[
-                ("10.0.0.1", "node-1", "prefill-a", 0, "m", "t"),
-                ("10.0.0.2", "node-1", "prefill-b", 0, "m", "t"),
-            ],
-        );
-
-        let workers =
-            MatchMode::IpOnly.resolve_workers(&resolver, "10.0.0.1", 0, &[StorageMedium::Cpu]);
-
-        let mut ids: Vec<&str> = workers.iter().map(|w| w.instance_id.as_str()).collect();
-        ids.sort();
-        assert_eq!(ids, vec!["prefill-a", "prefill-b"]);
-    }
-
-    #[test]
-    fn test_resolve_workers_fanout_stops_at_the_machine_boundary() {
-        let index = make_ip_index(vec![
-            ("10.0.0.1", vec![("prefill-a", 0)]),
-            ("10.0.1.9", vec![("prefill-far", 0)]),
-        ]);
-        let resolver = with_topology(
-            &index,
-            &[
-                ("10.0.0.1", "node-1", "prefill-a", 0, "m", "t"),
-                ("10.0.1.9", "node-2", "prefill-far", 0, "m", "t"),
-            ],
-        );
-
-        let workers =
-            MatchMode::IpOnly.resolve_workers(&resolver, "10.0.0.1", 0, &[StorageMedium::Cpu]);
-
-        let ids: Vec<&str> = workers.iter().map(|w| w.instance_id.as_str()).collect();
-        assert_eq!(ids, vec!["prefill-a"], "node-2 cannot read node-1's DRAM");
-    }
-
-    #[test]
-    fn test_resolve_workers_fanout_is_scoped_to_the_same_model_and_tenant() {
-        // One machine can host Pods of several deployments. Attributing this
-        // model's blocks to a DP serving another would let the Coordinator route
-        // a request to a Pod that cannot answer it.
-        let index = make_ip_index(vec![
-            ("10.0.0.1", vec![("prefill-a", 0)]),
-            ("10.0.0.2", vec![("other-model", 0)]),
-            ("10.0.0.3", vec![("other-tenant", 0)]),
-        ]);
-        let resolver = with_topology(
-            &index,
-            &[
-                ("10.0.0.1", "node-1", "prefill-a", 0, "m", "t"),
-                (
-                    "10.0.0.2",
-                    "node-1",
-                    "other-model",
-                    0,
-                    "SOME-OTHER-MODEL",
-                    "t",
-                ),
-                (
-                    "10.0.0.3",
-                    "node-1",
-                    "other-tenant",
-                    0,
-                    "m",
-                    "SOME-OTHER-TENANT",
-                ),
-            ],
-        );
-
-        let workers =
-            MatchMode::IpOnly.resolve_workers(&resolver, "10.0.0.1", 0, &[StorageMedium::Cpu]);
-
-        let ids: Vec<&str> = workers.iter().map(|w| w.instance_id.as_str()).collect();
-        assert_eq!(ids, vec!["prefill-a"]);
-    }
-
-    #[test]
-    fn test_resolve_workers_falls_back_to_pod_when_node_is_unknown() {
-        // No node_id was registered for this Pod, so there is no machine to group
-        // by. Falling back to the Pod's own DPs is narrower but never wrong.
-        let index = make_ip_index(vec![("10.0.0.1", vec![("prefill-a", 0), ("prefill-a", 1)])]);
-        let resolver = with_topology(&index, &[("10.9.9.9", "node-9", "elsewhere", 0, "m", "t")]);
-
-        let workers =
-            MatchMode::IpOnly.resolve_workers(&resolver, "10.0.0.1", 0, &[StorageMedium::Cpu]);
-
-        assert_eq!(workers.len(), 2, "both DPs of the event's own Pod");
-        assert!(workers.iter().all(|w| w.instance_id == "prefill-a"));
-    }
-
-    #[test]
     fn test_resolve_workers_ip_and_dp_rank_exact_match() {
         let index = make_ip_index(vec![("10.0.0.1", vec![("prefill-0", 0), ("prefill-1", 1)])]);
         let media = &[StorageMedium::Cpu];
 
         // dp_rank=1 → only prefill-1 matches
-        let workers =
-            MatchMode::IpAndDpRank.resolve_workers(&pod_only(&index), "10.0.0.1", 1, media);
+        let workers = MatchMode::IpAndDpRank.resolve_workers(Some(&index), "10.0.0.1", 1, media);
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].instance_id, "prefill-1");
         assert_eq!(workers[0].dp_rank, 1);
@@ -420,8 +258,7 @@ mod tests {
         let media = &[StorageMedium::Cpu];
 
         // dp_rank=7 — no DP with that rank on 10.0.0.1
-        let workers =
-            MatchMode::IpAndDpRank.resolve_workers(&pod_only(&index), "10.0.0.1", 7, media);
+        let workers = MatchMode::IpAndDpRank.resolve_workers(Some(&index), "10.0.0.1", 7, media);
         assert!(workers.is_empty());
     }
 
@@ -430,19 +267,17 @@ mod tests {
         let index = make_ip_index(vec![("10.0.0.1", vec![("prefill-0", 0)])]);
         let media = &[StorageMedium::Cpu];
 
-        let workers = MatchMode::IpOnly.resolve_workers(&pod_only(&index), "10.0.99.99", 0, media);
+        let workers = MatchMode::IpOnly.resolve_workers(Some(&index), "10.0.99.99", 0, media);
         assert!(workers.is_empty());
 
-        let workers =
-            MatchMode::IpAndDpRank.resolve_workers(&pod_only(&index), "10.0.99.99", 0, media);
+        let workers = MatchMode::IpAndDpRank.resolve_workers(Some(&index), "10.0.99.99", 0, media);
         assert!(workers.is_empty());
     }
 
     #[test]
     fn test_resolve_workers_returns_empty_when_index_is_none() {
         let media = &[StorageMedium::Cpu];
-        let workers =
-            MatchMode::IpOnly.resolve_workers(&WorkerResolver::default(), "10.0.0.1", 0, media);
+        let workers = MatchMode::IpOnly.resolve_workers(None, "10.0.0.1", 0, media);
         assert!(workers.is_empty());
     }
 
@@ -450,7 +285,7 @@ mod tests {
     fn test_resolve_workers_empty_ip_index() {
         let index = make_ip_index(vec![]);
         let media = &[StorageMedium::Npu];
-        let workers = MatchMode::IpOnly.resolve_workers(&pod_only(&index), "10.0.0.1", 0, media);
+        let workers = MatchMode::IpOnly.resolve_workers(Some(&index), "10.0.0.1", 0, media);
         assert!(workers.is_empty());
     }
 
@@ -459,7 +294,7 @@ mod tests {
         let index = make_ip_index(vec![("10.0.0.1", vec![("prefill-0", 0)])]);
         let media = &[StorageMedium::Npu, StorageMedium::Cpu, StorageMedium::Disk];
 
-        let workers = MatchMode::IpOnly.resolve_workers(&pod_only(&index), "10.0.0.1", 0, media);
+        let workers = MatchMode::IpOnly.resolve_workers(Some(&index), "10.0.0.1", 0, media);
         assert_eq!(workers.len(), 3); // 1 DP × 3 media
         let media_set: std::collections::HashSet<_> = workers.iter().map(|w| w.medium).collect();
         assert_eq!(media_set.len(), 3);
@@ -472,8 +307,7 @@ mod tests {
         let index = make_ip_index(vec![("10.0.0.1", vec![("prefill-a", 0), ("prefill-b", 0)])]);
         let media = &[StorageMedium::Cpu];
 
-        let workers =
-            MatchMode::IpAndDpRank.resolve_workers(&pod_only(&index), "10.0.0.1", 0, media);
+        let workers = MatchMode::IpAndDpRank.resolve_workers(Some(&index), "10.0.0.1", 0, media);
         assert_eq!(workers.len(), 2);
         let ids: Vec<&str> = workers.iter().map(|w| w.instance_id.as_str()).collect();
         assert!(ids.contains(&"prefill-a"));

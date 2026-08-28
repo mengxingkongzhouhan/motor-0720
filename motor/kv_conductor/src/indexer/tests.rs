@@ -707,16 +707,16 @@ fn worker_of(instance_id: &str, dp_rank: u32, medium: StorageMedium) -> WorkerKe
     }
 }
 
-/// Store one pooled chain as the node-wide broadcast would: every DP on the
-/// holding machine becomes an owner, because every one of them can read it
-/// without a cross-machine transfer.
-fn broadcast_to_node(
+/// Store one pooled chain as the per-Pod broadcast would: every DP in the
+/// reporting Pod becomes an owner, because a block in that Pod's DRAM is
+/// readable by all of them without a transfer.
+fn broadcast_to_pod(
     entry: &IndexerEntry,
-    dps_on_node: &[(&str, u32)],
+    dps_in_pod: &[(&str, u32)],
     parent: Option<u64>,
     blocks: &[(u64, u64)],
 ) {
-    for &(instance_id, dp_rank) in dps_on_node {
+    for &(instance_id, dp_rank) in dps_in_pod {
         store_chain(
             entry,
             &worker_of(instance_id, dp_rank, StorageMedium::Cpu),
@@ -727,10 +727,10 @@ fn broadcast_to_node(
 }
 
 #[test]
-fn test_node_wide_broadcast_splits_local_and_remote_hits() {
-    // node-1 hosts inst-a and inst-b; node-2 hosts inst-c. Every DP has HBM
-    // block 0, then the pooled chain [1,4) is split: block 1 lives on node-1,
-    // blocks 2,3 on node-2. Each event is broadcast to all DPs of its machine.
+fn test_pod_broadcast_splits_local_and_remote_hits() {
+    // Pod A holds inst-a's two DPs; Pod B holds inst-c. Every DP has HBM block
+    // 0, then the pooled chain [1,4) is split: block 1 was offloaded by Pod A,
+    // blocks 2,3 by Pod B. Each event is broadcast to all DPs of its own Pod.
     let indexer = Indexer::new();
     let entry = indexer.get_or_create("model-broadcast", "t1");
 
@@ -738,9 +738,9 @@ fn test_node_wide_broadcast_splits_local_and_remote_hits() {
     let hashes = compute_block_hash_for_seq(&tokens, 4);
     assert_eq!(hashes.len(), 4);
 
-    let on_node_1 = [("inst-a", 0), ("inst-b", 0)];
-    let on_node_2 = [("inst-c", 0)];
-    for (instance_id, dp_rank) in on_node_1.iter().chain(on_node_2.iter()) {
+    let pod_a = [("inst-a", 0), ("inst-a", 1)];
+    let pod_b = [("inst-c", 0)];
+    for (instance_id, dp_rank) in pod_a.iter().chain(pod_b.iter()) {
         store_chain(
             &entry,
             &worker_of(instance_id, *dp_rank, StorageMedium::Npu),
@@ -748,10 +748,10 @@ fn test_node_wide_broadcast_splits_local_and_remote_hits() {
             &[(100, hashes[0].0)],
         );
     }
-    broadcast_to_node(&entry, &on_node_1, Some(100), &[(101, hashes[1].0)]);
-    broadcast_to_node(
+    broadcast_to_pod(&entry, &pod_a, Some(100), &[(101, hashes[1].0)]);
+    broadcast_to_pod(
         &entry,
-        &on_node_2,
+        &pod_b,
         Some(101),
         &[(102, hashes[2].0), (103, hashes[3].0)],
     );
@@ -759,22 +759,25 @@ fn test_node_wide_broadcast_splits_local_and_remote_hits() {
     let resp = indexer.query("model-broadcast", "t1", &tokens, 4).unwrap();
     let tenant = &resp.tenants["t1"];
 
-    // inst-a is on node-1: block 1 is an owner-hit (local), blocks 2,3 are not.
-    let dp_a = &tenant["inst-a"].dp["0"];
-    assert_eq!(dp_a.npu_blocks, 1);
-    assert_eq!(dp_a.cpu_blocks, 3);
-    assert_eq!(dp_a.cpu_local_blocks, 1, "block 1 is in node-1's DRAM");
-    assert_eq!(dp_a.cpu_remote_blocks, 2, "blocks 2,3 are on node-2");
+    // inst-a/0 is in Pod A: block 1 is an owner-hit (local), blocks 2,3 are not.
+    let dp_a0 = &tenant["inst-a"].dp["0"];
+    assert_eq!(dp_a0.npu_blocks, 1);
+    assert_eq!(dp_a0.cpu_blocks, 3);
+    assert_eq!(
+        dp_a0.cpu_local_blocks, 1,
+        "block 1 is in its own Pod's DRAM"
+    );
+    assert_eq!(dp_a0.cpu_remote_blocks, 2, "blocks 2,3 came from Pod B");
 
-    // inst-b never saw an event addressed to its own Pod — only the node-wide
-    // broadcast made it an owner. It must score identically to inst-a.
-    assert_eq!(&tenant["inst-b"].dp["0"].cpu_local_blocks, &1);
-    assert_eq!(&tenant["inst-b"].dp["0"].cpu_remote_blocks, &2);
+    // dp 1 shares Pod A, so the broadcast made it an owner too even though the
+    // offload came from its sibling. It must score identically to dp 0.
+    assert_eq!(&tenant["inst-a"].dp["1"].cpu_local_blocks, &1);
+    assert_eq!(&tenant["inst-a"].dp["1"].cpu_remote_blocks, &2);
 
-    // inst-c is on node-2, so the split flips.
+    // inst-c is in Pod B, so the split flips.
     let dp_c = &tenant["inst-c"].dp["0"];
-    assert_eq!(dp_c.cpu_local_blocks, 2, "blocks 2,3 are in node-2's DRAM");
-    assert_eq!(dp_c.cpu_remote_blocks, 1, "block 1 is on node-1");
+    assert_eq!(dp_c.cpu_local_blocks, 2, "blocks 2,3 are in Pod B's DRAM");
+    assert_eq!(dp_c.cpu_remote_blocks, 1, "block 1 came from Pod A");
 
     // The two values always account for exactly the pooled blocks that still
     // need fetching — blocks already in local HBM are excluded from both.
@@ -806,7 +809,7 @@ fn test_local_hits_exclude_blocks_already_in_hbm() {
         None,
         &[(100, hashes[0].0), (101, hashes[1].0)],
     );
-    broadcast_to_node(
+    broadcast_to_pod(
         &entry,
         &[("inst-a", 0)],
         None,
@@ -825,13 +828,13 @@ fn test_local_hits_exclude_blocks_already_in_hbm() {
 
     assert_eq!(dp.npu_blocks, 2);
     assert_eq!(dp.cpu_blocks, 2, "only blocks 2,3 are exclusive to CPU");
-    assert_eq!(dp.cpu_local_blocks, 2, "both are in its own machine's DRAM");
+    assert_eq!(dp.cpu_local_blocks, 2, "both are in its own Pod's DRAM");
     assert_eq!(dp.cpu_remote_blocks, 0);
 }
 
 #[test]
 fn test_non_owner_pooled_hits_are_all_remote() {
-    // inst-b holds nothing but can still fetch the chain from node-1. Every one
+    // inst-b holds nothing but can still fetch the chain from the pool. Every one
     // of those blocks costs a transfer, so none of them count as local.
     let indexer = Indexer::new();
     let entry = indexer.get_or_create("model-all-remote", "t1");
@@ -839,7 +842,7 @@ fn test_non_owner_pooled_hits_are_all_remote() {
     let tokens: Vec<i64> = (0..8).collect();
     let hashes = compute_block_hash_for_seq(&tokens, 4);
 
-    broadcast_to_node(
+    broadcast_to_pod(
         &entry,
         &[("inst-a", 0)],
         None,

@@ -452,9 +452,10 @@ impl LowerTierIndexer {
 
     /// How many of `blocks` this worker owns.
     ///
-    /// For a pooled medium, ownership means "holds a copy readable without a
-    /// cross-machine transfer": the pool-event fanout registers every DP on the
-    /// holding machine as an owner, so this is exactly the count of *local* hits.
+    /// For a pooled medium this is the count of *local* hits: the pool-event
+    /// fanout registers every DP in the reporting Pod as an owner, so owning a
+    /// pooled block means holding a copy readable without a cross-machine
+    /// transfer.
     pub fn count_owned(&self, worker: &WorkerKey, blocks: &[SequenceBlockHash]) -> u32 {
         let worker_blocks = self.worker_blocks.read();
         let Some(owned) = worker_blocks.get(worker) else {

@@ -242,10 +242,7 @@ Coordinator                                  KV Conductor
 | `npu_blocks` / `cpu_blocks` / `disk_blocks` | 该 DP 互斥真实命中块数（同前缀副本只归最高优先级介质） |
 | `matched_tokens` | 互斥块数之和 × `block_size`（真实覆盖长度） |
 | `longest_matched` | 该实例所有 DP 的 `matched_tokens` 最大值 |
-| `cpu_local_blocks` / `cpu_remote_blocks` | `cpu_blocks` 按块在**哪台机器**拆开：本机 DRAM（读取几乎免费）/ 跨机（需传输） |
-
-调度器读取 `DP[<dp_rank>]` 的 `*_blocks`，按 `scheduler_config.kv_affinity`
-中的 `w_npu/w_cpu/w_disk`（默认 `1.0/1.0/0.0`）加权后再算亲和分（见亲和性调度文档）。
+| `cpu_local_blocks` / `cpu_remote_blocks` | `cpu_blocks` 按搬运代价拆开：本 Pod DRAM（几乎免费）/ 需要传输 |
 
 ### 池命中的本地/远端拆分
 
@@ -253,28 +250,28 @@ Coordinator                                  KV Conductor
 `device_rdma` / `device_sdma` / `device_urma`。原先所有池命中都统一记作 `cpu_blocks`，
 调度器看不出这个差异。
 
-关键在于**机器级的归属发生在摄入端而不是查询端**：池块在某台机器的 DRAM 里，该机器上
-每个 DP 都能免费读到它，所以一条 KV 事件会广播给**事件 Pod 所在 node 上的所有 DP**
-（跨 Pod）。这样「边的 owner 里有当前 DP」与「这块在当前 DP 的机器上」变成同一句话，
-查询侧完全不需要拓扑表：
+判断依据是**边的 owner**：一条池事件会广播给上报它的那个 Pod 里的所有 DP，所以「owner 里有
+当前 DP」等价于「这块在当前 DP 自己的 Pod 里」，而同 Pod 必然同机 —— 于是这就是一次免搬运
+的本地读。查询侧不需要任何拓扑信息：
 
 ```text
   走查覆盖 [start, end)，逐块问 owner 里有没有自己
-    有 -> cpu_local_blocks  += 1     （本机 DRAM）
-    没有 -> cpu_remote_blocks += 1    （跨机传输）
-  只统计 npu_end 之后的位置：之前的块已在本地 HBM，不需要搬运
+    有   -> cpu_local_blocks  += 1     本 Pod DRAM
+    没有 -> cpu_remote_blocks += 1     需要传输
 
-  => cpu_local_blocks + cpu_remote_blocks == cpu_blocks   （不变式，有测试守护）
+  只统计 npu_end 之后的位置：之前的块已在本地 HBM，不需要搬运
+  => cpu_local_blocks + cpu_remote_blocks == cpu_blocks（不变式，有测试守护）
 ```
 
-统计本身很便宜：走查是所有 DP 共享的（忽略 owner，结果相同），只走一次并顺手收下经过
-的块标识；每个 DP 再拿这串标识去查已有的 per-worker 反查表，**不需要每个 DP 各走一遍**。
+**这个拆分刻意保守**：同机不同 Pod 的块其实也便宜，但 conductor 没有机器标识就看不出来，
+只能记作远端。所以 `cpu_local_blocks` 是共置的**下界** —— 只会低估不会高估。高估的后果更
+严重：会告诉调度器「这次搬运免费」，而实际要跨机。
 
-**广播按 model + tenant 收窄**。一台机器可以跑多个部署的 Pod，把 A 模型的块记到服务 B
-模型的 DP 上，会让 Coordinator 把请求路由到根本答不上的 Pod。
+要升级成真正的「同机」语义，需要广播覆盖整台机器上的所有 DP（跨 Pod），依赖 `node_id`
+那条尚未打通的链路；**在一机一 Pod 的部署下没有收益**（那时 Pod 级广播已等价于机器级）。
 
-**不带 `node_id` 时广播退化为「只发给事件 Pod 自己的 DP」**，此时 `local` 的含义是
-「同 Pod」而不是「同机」——是**低估**共置，不会高估。
+调度器读取 `DP[<dp_rank>]` 的 `*_blocks`，按 `scheduler_config.kv_affinity`
+中的 `w_npu/w_cpu/w_disk`（默认 `1.0/1.0/0.0`）加权后再算亲和分（见亲和性调度文档）。
 
 ## 启动参数
 
@@ -328,26 +325,22 @@ Coordinator 通过 `ConductorApiClient` 与 conductor 通信。`user_config.json
 `status.hostIP`，或任何稳定的单机标识）。它与 `medium_endpoints` 里的 **Pod IP** 是两个
 不同层级——一台机器可以跑多个 Pod，每个 Pod 一个独立 Pod IP。
 
-带上之后 conductor 会维护三张表，可通过 `GET /workers` 的 `topology` 字段查看：
+带上之后 conductor 会维护两张表，**方向都是"指向 node"**，可通过 `GET /workers` 的
+`topology` 字段查看：
 
 ```json
 {
   "topology": {
     "dp_to_node": {
-      "vllm-prefill-1/0": {"pod_ip": "10.244.0.5", "node_id": "node-1",
-                           "model_name": "qwen", "tenant_id": "default"},
-      "vllm-prefill-1/1": {"pod_ip": "10.244.0.5", "node_id": "node-1", "...": "..."},
-      "vllm-prefill-2/0": {"pod_ip": "10.244.0.6", "node_id": "node-1", "...": "..."},
-      "vllm-prefill-3/0": {"pod_ip": "10.244.1.7", "node_id": "node-2", "...": "..."}
+      "vllm-prefill-1/0": {"pod_ip": "10.244.0.5", "node_id": "node-1"},
+      "vllm-prefill-1/1": {"pod_ip": "10.244.0.5", "node_id": "node-1"},
+      "vllm-prefill-2/0": {"pod_ip": "10.244.0.6", "node_id": "node-1"},
+      "vllm-prefill-3/0": {"pod_ip": "10.244.1.7", "node_id": "node-2"}
     },
     "pod_to_node": {
       "10.244.0.5": "node-1",
       "10.244.0.6": "node-1",
       "10.244.1.7": "node-2"
-    },
-    "node_to_dps": {
-      "node-1": ["vllm-prefill-1/0", "vllm-prefill-1/1", "vllm-prefill-2/0"],
-      "node-2": ["vllm-prefill-3/0"]
     }
   }
 }
@@ -355,27 +348,25 @@ Coordinator 通过 `ConductorApiClient` 与 conductor 通信。`user_config.json
 
 | 表 | 键 → 值 | 用途 |
 |----|---------|------|
-| `dp_to_node` | `(instance_id, dp_rank)` → `{pod_ip, node_id, model_name, tenant_id}` | 给一个 DP，问它在哪台机器、服务什么 |
+| `dp_to_node` | `(instance_id, dp_rank)` → `{pod_ip, node_id}` | 给一个 DP（边的 owner），问它在哪台机器 |
 | `pod_to_node` | Pod IP → node | 给一个 Pod IP（池事件的 `backend_id`），问它在哪台机器 |
-| `node_to_dps` | node → 该机器上的 DP 列表 | **池事件的广播集合** |
 
-前两张指向 node，`node_to_dps` 是反向的，唯一消费者就是池事件广播：一条事件只带一个
-Pod IP，要落到该 Pod 所在机器上的**所有** DP（跨 Pod）。注意上例中 `prefill-1` 与
-`prefill-2` 是同一台机器上的两个 Pod —— 这正是 Pod 级索引表达不了、而广播必须覆盖的
-共置关系。`dp_to_node` 里的 model/tenant 用于把广播收窄到同一部署。
+**方向是刻意这样的**：消费者要问的是「这个 owner 和我是不是同一台机器」，两次 O(1) 查表
+再比一下即可。反向的 `node → dps` 每次都要扫列表，而且没有对应的消费场景。
+`same_node(dp_a, dp_b)` 直接封装了这个判断；任一方位置未知时返回 `false`——位置不明
+绝不能当作同机，否则远端块会被算成本地。
 
 写入时机跟随注册生命周期：`/register` 写入、`/unregister` 移除、后端类型变化的重注册
 先移除再写入。**没有轮询或刷新** —— Pod 与机器的绑定是静态的（Pod 不会迁移宿主机，
 重调度得到的是新 Pod、新 IP），所以每个 Pod 只在其注册时写一次。移除是精确的：DP 条目
-与它在 `node_to_dps` 里的反向条目一起删除（否则迁走的 DP 仍会收到旧机器的广播），
-`pod_to_node` 则在该 Pod 的最后一个 DP 离开后才删。
+立即删除，`pod_to_node` 则在该 Pod 的最后一个 DP 离开后才删。
 
-**不带 `node_id` 时三张表为空**，广播退化为「只发给事件 Pod 自己的 DP」，即当前行为。
-目前 Coordinator 尚未下发该字段，所以在当前部署里 `cpu_local_blocks` 的含义是「同 Pod」。
+**不带 `node_id` 时两张表为空**，其余行为完全不变——目前 Coordinator 尚未下发该字段，所以这
+两张表当前仅供外部客户端与调试使用，**未接入任何匹配或打分逻辑**。
 
 要接上不需要改 K8s 部署——`HOST_IP`（`status.hostIP`）已经注入到 engine 容器，只是 Python
 侧从不读；缺的是从 NodeManager 经 Controller 到 Coordinator 的字段透传，路径与已经跑通的
-`pod_ip` 完全相同。详见设计文档。
+`pod_ip` 完全相同。另一条路是复用 Controller 容错模块已有的 K8s 查询。详见设计文档。
 
 `npu_endpoint` 必须与引擎 `--kv-events-config` 的 `endpoint` 一致（`tcp://*:5557` 为 vLLM 常用值）；
 模式中的 `*` 会被替换为 endpoint IP，端口会加上 `dp_rank`，conductor 主动 connect 到各引擎节点绑定的事件端口。

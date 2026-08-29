@@ -369,6 +369,7 @@ class BaseRouter(ABC):
         """Undo a scheduler allocation if local request workload bookkeeping fails."""
         rollback_workload = Workload(
             active_tokens=-allocate_workload.active_tokens,
+            prefill_cost=-float(getattr(allocate_workload, "prefill_cost", 0) or 0),
         )
         params = UpdateWorkloadParams(
             instance_id=instance.id,

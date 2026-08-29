@@ -45,6 +45,123 @@ use crate::hashing::compute_block_hash_for_seq;
 /// the event is applied to every DP whose HBM endpoint resolves to that IP.
 pub type HbmIpIndex = Arc<ParkingRwLock<HashMap<String, Vec<(String, u32)>>>>;
 
+/// Where one DP runs. `pod_ip` is kept alongside the node so unregistration can
+/// tell when a Pod's last DP is gone, and so the debug view shows both levels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DpLocation {
+    pub pod_ip: String,
+    pub node_id: String,
+}
+
+/// Registration-derived cluster topology: where each Pod and each DP runs.
+///
+/// Two lookups, both fed by `/register` and both pointing **towards** the node,
+/// which is the direction consumers need: given a DP (an edge owner) or a Pod IP
+/// (a pool event's `backend_id`), answer "which machine is this on". Comparing
+/// two DPs for co-location is then two O(1) lookups.
+///
+/// - `dp_to_node`: `(instance_id, dp_rank)` → [`DpLocation`]
+/// - `pod_to_node`: Pod IP → node identity
+///
+/// The node identity is whatever the client sends as `node_id` (K8s
+/// `status.hostIP` in the Motor deployment). A Pod never migrates hosts — a
+/// rescheduled Pod is a new Pod with a new IP — so an entry is written once per
+/// registration and only dropped on unregister. Nothing polls or refreshes it.
+///
+/// Both maps live behind one lock so a resolution can never observe a
+/// half-updated state.
+///
+/// Empty unless clients send `node_id`; the conductor never infers node identity
+/// on its own.
+#[derive(Debug, Default)]
+pub struct NodeTopology {
+    dp_to_node: HashMap<(InstanceId, DpRank), DpLocation>,
+    pod_to_node: HashMap<String, String>,
+}
+
+impl NodeTopology {
+    /// Record one DP. Idempotent, and re-registering with a new node overwrites.
+    pub fn record(&mut self, pod_ip: &str, node_id: &str, instance_id: &str, dp_rank: DpRank) {
+        self.dp_to_node.insert(
+            (instance_id.to_string(), dp_rank),
+            DpLocation {
+                pod_ip: pod_ip.to_string(),
+                node_id: node_id.to_string(),
+            },
+        );
+        self.pod_to_node
+            .insert(pod_ip.to_string(), node_id.to_string());
+    }
+
+    /// Drop one DP, dropping the Pod entry once its last DP is gone.
+    pub fn forget(&mut self, pod_ip: &str, instance_id: &str, dp_rank: DpRank) {
+        self.dp_to_node.remove(&(instance_id.to_string(), dp_rank));
+
+        // The Pod entry outlives its DPs only while some DP still runs there.
+        // The DP map is small and unregistration is rare, so a scan is cheaper
+        // than maintaining a separate per-Pod count.
+        let pod_still_used = self.dp_to_node.values().any(|loc| loc.pod_ip == pod_ip);
+        if !pod_still_used {
+            self.pod_to_node.remove(pod_ip);
+        }
+    }
+
+    /// Which node a DP runs on.
+    pub fn node_of_dp(&self, instance_id: &str, dp_rank: DpRank) -> Option<&str> {
+        self.dp_to_node
+            .get(&(instance_id.to_string(), dp_rank))
+            .map(|loc| loc.node_id.as_str())
+    }
+
+    /// Which node a Pod runs on.
+    pub fn node_of_pod(&self, pod_ip: &str) -> Option<&str> {
+        self.pod_to_node.get(pod_ip).map(String::as_str)
+    }
+
+    /// Whether two DPs share a machine.
+    ///
+    /// `false` when either DP's node is unknown — an unknown location must never
+    /// be treated as co-located, or a remote block would be scored as local.
+    pub fn same_node(&self, a: (&str, DpRank), b: (&str, DpRank)) -> bool {
+        match (self.node_of_dp(a.0, a.1), self.node_of_dp(b.0, b.1)) {
+            (Some(node_a), Some(node_b)) => node_a == node_b,
+            _ => false,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.dp_to_node.is_empty() && self.pod_to_node.is_empty()
+    }
+
+    /// Debug view for `GET /workers`.
+    ///
+    /// DP keys are flattened to `"<instance_id>/<dp_rank>"` because JSON object
+    /// keys must be strings.
+    pub fn summary(&self) -> NodeTopologySummary {
+        NodeTopologySummary {
+            dp_to_node: self
+                .dp_to_node
+                .iter()
+                .map(|((instance_id, dp_rank), loc)| {
+                    (format!("{instance_id}/{dp_rank}"), loc.clone())
+                })
+                .collect(),
+            pod_to_node: self.pod_to_node.clone(),
+        }
+    }
+}
+
+/// Serializable snapshot of [`NodeTopology`] for the debug endpoint.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeTopologySummary {
+    /// `"<instance_id>/<dp_rank>"` → where that DP runs.
+    pub dp_to_node: HashMap<String, DpLocation>,
+    pub pod_to_node: HashMap<String, String>,
+}
+
+/// Shared handle to the registration-derived topology.
+pub type SharedNodeTopology = Arc<ParkingRwLock<NodeTopology>>;
+
 // ---------------------------------------------------------------------------
 // Hash types
 // ---------------------------------------------------------------------------
@@ -194,6 +311,14 @@ pub struct RegisterRequest {
     pub replay_endpoint: Option<String>,
     #[serde(default = "default_tenant")]
     pub tenant_id: String,
+    /// Node (machine) this endpoint runs on — K8s `status.hostIP`, or any stable
+    /// per-machine identifier. Optional: when omitted the conductor records no
+    /// node topology for this endpoint and behaviour is unchanged.
+    ///
+    /// Distinct from the Pod IP carried inside `medium_endpoints`: one node hosts
+    /// many Pods, each with its own Pod IP.
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
 fn default_store_backend() -> String {
@@ -266,6 +391,25 @@ pub struct DpBlocks {
     pub cpu_blocks: u32,
     /// Exclusive Disk matched block count (beyond max(NPU, CPU) coverage).
     pub disk_blocks: u32,
+    /// How `cpu_blocks` splits by how far the block has to travel.
+    ///
+    /// A pool event fans out to every DP in the Pod that reported it, so "this DP
+    /// owns the block" means "the block is in this DP's own Pod" — and same Pod
+    /// implies same machine, i.e. a near-free DRAM read. Everything else is
+    /// counted remote and costs a transfer over `device_rdma` / `device_sdma` /
+    /// `device_urma`.
+    ///
+    /// Invariant: `cpu_local_blocks + cpu_remote_blocks == cpu_blocks`. Blocks
+    /// already covered by NPU are excluded from both — they need no fetch.
+    ///
+    /// The split is deliberately conservative: a block held by a *different* Pod
+    /// on the same machine is also a cheap read, but the conductor cannot see
+    /// that without a machine identity, so it counts as remote. `local` is
+    /// therefore a lower bound on co-location — never an over-count, which is the
+    /// safe direction (over-counting would tell the scheduler a fetch is free
+    /// when it is not).
+    pub cpu_local_blocks: u32,
+    pub cpu_remote_blocks: u32,
 }
 
 /// Per-instance match data returned in query response.
@@ -351,7 +495,9 @@ pub fn encode_query_response_msgpack(response: &QueryResponse, out: &mut Vec<u8>
                 .expect("write map len");
             for (rank, blocks) in &data.dp {
                 write_str(out, rank).expect("write rank");
-                write_map_len(out, 4).expect("blocks map len");
+                // Field count must match the `Serialize` derive on `DpBlocks`;
+                // the msgpack/JSON shape equality test guards the two together.
+                write_map_len(out, 6).expect("blocks map len");
                 write_str(out, "matched_tokens").expect("write key");
                 write_u32(out, blocks.matched_tokens).expect("write matched_tokens");
                 write_str(out, "npu_blocks").expect("write key");
@@ -360,6 +506,10 @@ pub fn encode_query_response_msgpack(response: &QueryResponse, out: &mut Vec<u8>
                 write_u32(out, blocks.cpu_blocks).expect("write cpu_blocks");
                 write_str(out, "disk_blocks").expect("write key");
                 write_u32(out, blocks.disk_blocks).expect("write disk_blocks");
+                write_str(out, "cpu_local_blocks").expect("write key");
+                write_u32(out, blocks.cpu_local_blocks).expect("write cpu_local_blocks");
+                write_str(out, "cpu_remote_blocks").expect("write key");
+                write_u32(out, blocks.cpu_remote_blocks).expect("write cpu_remote_blocks");
             }
         }
     }
@@ -780,6 +930,7 @@ mod tests {
                 npu_blocks: 6,
                 cpu_blocks: 0,
                 disk_blocks: 0,
+                ..Default::default()
             },
         );
         imd.dp.insert(
@@ -789,6 +940,8 @@ mod tests {
                 npu_blocks: 0,
                 cpu_blocks: 4,
                 disk_blocks: 0,
+                cpu_local_blocks: 1,
+                cpu_remote_blocks: 3,
             },
         );
 
@@ -1027,6 +1180,7 @@ mod tests {
                 npu_blocks: 3,
                 cpu_blocks: 0,
                 disk_blocks: 0,
+                ..Default::default()
             },
         );
         dp.insert(
@@ -1036,6 +1190,9 @@ mod tests {
                 npu_blocks: 1,
                 cpu_blocks: 3,
                 disk_blocks: 0,
+                // 2 of the 3 pooled blocks are on this DP's own machine.
+                cpu_local_blocks: 2,
+                cpu_remote_blocks: 1,
             },
         );
         instances.insert(

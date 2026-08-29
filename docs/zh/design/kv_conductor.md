@@ -84,7 +84,7 @@ Coordinator 调度器（`kv_cache_affinity`）按 `*_blocks` 与配置项
    └─────────────────────────────────────────────────────┘
 ```
 
-- 上层介质命中后，下层介质**从上层断点续查**；同时对拥有首边的 worker **无条件 root 走查**，与续接链并列，取绝对终点最远者（如实报告更长副本）
+- 上层介质命中后，下层介质**从本 DP 自己的上层断点续查**（断点不跨 DP 共享）；同时对拥有首边的 worker **无条件 root 走查**，与续接链并列，取绝对终点最远者（如实报告更长副本）
 - HBM 是前缀树（从 root 走）；CPU/Disk 是 continuation-edge 图（断点续查 + root 走查）
 - 同一 `(instance_id, dp_rank)` 的跨介质命中在响应中聚合到同一个 DP 条目
 
@@ -166,6 +166,7 @@ CPU/DISK 不使用完整 RadixTree，而是轻量的 **continuation-edge 图**�
   HBM tree returns: W1 depth=2, last_seq=seq200
 
   Candidate a) breakpoint resume from (seq200, H2):
+    // only granted to W1's own (instance_id, dp_rank)
     edge(seq200, H2) -> seq300  OK
     edge(seq300, H3) -> seq400  OK
     edge(seq400, H4) -> ???     MISSING -> stop
@@ -180,6 +181,56 @@ CPU/DISK 不使用完整 RadixTree，而是轻量的 **continuation-edge 图**�
   matched_tokens = (npu + cpu + disk) × block_size   // unweighted coverage
   // Coordinator affinity: round((npu×w_npu + cpu×w_cpu + disk×w_disk) × block_size)
 ```
+
+### 下层走查忽略 owner：报"能免重算服务多长"而非"本地有多长"
+
+池化块通过后端传输协议（`device_rdma` / `device_sdma` / `device_urma`，见
+`mmc-local-*.conf` 的 `ock.mmc.local_service.protocol`）**任意节点可取**，所以别的 DP
+持有的块同样能让本 DP 跳过重算。下层走查因此**不校验 owner**，只在边不存在时停止。
+
+**关键的介质不对称**：
+
+| 介质 | 跨节点可取? | 走查语义 |
+|------|------------|---------|
+| HBM | ❌ 设备显存，取不到别人的 | `find_matches_detailed` 逐层求交，**严格按 owner** |
+| CPU / Disk | ✅ 池化，任意节点可取 | `reachable_from` **忽略 owner** |
+
+那各 DP 的结果凭什么还不同?两处，都是 per-DP 的：
+
+1. **走查起点**。每个 DP 从**自己的**上层断点续接；自己上层没命中就从 root 走。因为 HBM
+   取不到别人的，只有持有那些块的 DP 能用它们跨过池链中的缺口。
+2. **归属切分**。互斥切分把 `[0, npu_end)` 记为 NPU（本地、免费）、其余记为 CPU/Disk
+   （需搬运），于是 `kv_affinity.w_cpu` / `w_disk` 成为"优先选本地已有的节点"的旋钮。
+
+```text
+  池链: [0,2) 存在，位置 2 缺失，[3,5) 锚在位置 2 的 block_hash 之后
+  inst-a HBM: [0,3)     inst-b DRAM: [0,2) 与 [3,5)
+
+  inst-a: 自己断点 pos=3 -> reachable_from(3, seq102) -> 取到 inst-b 的 [3,5) -> 终点 5
+          npu_blocks=3（本地）+ cpu_blocks=2（搬运）= 5 块
+  inst-b: 无 HBM 命中 -> root 走查 -> [0,2) 后位置 2 缺失 -> 终点 2
+          npu_blocks=0 + cpu_blocks=2 = 2 块
+
+  => inst-a 靠自己的 HBM 桥接缺口而走得更远；亲和信号未被抹平
+```
+
+**断点仍只归产生它的 DP**：`edge_owners` 返回该边的全部 owner，若允许借用别的 DP 的断点，
+只持有中间段的 worker 会跨过自己**取不到**的空洞谎报前缀——因为空洞那一段在别人的 HBM 里：
+
+```text
+  inst-a HBM: [0,2)            -> breakpoint (end_pos=2, last_seq=seq200)
+  inst-b DRAM: [2,3) only
+
+  借用 inst-a 断点：inst-b 从 pos=2 起跑 -> 终点 3 -> npu=0, cpu=3
+    声称能服务 3 块，但位置 0..2 只在 inst-a 的 HBM 里，inst-b 取不到 -> 实际得全量重算
+  按 DP 索引断点后：inst-b 无起点，不进 medium_ends
+    而 inst-a 从自己断点起跑、取到 inst-b 的池块 -> npu=2 + cpu=1 = 3 块（正确）
+```
+
+root 走查不依赖任何上层覆盖，所以「HBM 全被驱逐、池中保有完整根链」这一池化核心场景仍能
+如实报告。**所有已知 DP 都参与下层走查**（`known_dps()`：HBM lookups ∪ 各 tier 的
+`worker_keys()`），本地什么都没有的 DP 也能从池子取，报 0 会高估它的 prefill 代价。root
+走查忽略 owner，因此对所有 DP 结果相同，只计算一次后复用。
 
 ---
 
@@ -247,6 +298,108 @@ CPU/DISK 不使用完整 RadixTree，而是轻量的 **continuation-edge 图**�
 - 注销会停止该实例/DP 的全部 subscriber，删除 HBM IP 映射及三层索引；删除最后一个 DP
   时，使用**注册记录中的** model/tenant 回收空 `IndexerEntry`，不信任注销请求里的同名字段。
 - `POST /events` 的 `shutdown=true` 当前只记录日志，完整释放仍需显式调用 `/unregister`。
+
+### 节点拓扑：`dp → node` 与 `pod_ip → node`
+
+`/register` 的可选字段 `node_id` 表示该 endpoint 所在的**机器**（K8s `status.hostIP`，
+即 Pod 的宿主 Node）。注意与 `medium_endpoints` 里的 **Pod IP** 分属两个层级：
+
+```text
+  Node（一台机器，status.hostIP）
+   ├── Pod（status.podIP）── DP 0, DP 1 ...
+   └── Pod（另一个 podIP）── DP 0 ...
+```
+
+带上 `node_id` 后，`NodeTopology` 维护两张表（同一把锁，避免解析到半更新状态）。
+**两张表的方向都是「指向 node」**：
+
+| 表 | 键 → 值 | 用途 |
+|----|---------|------|
+| `dp_to_node` | `(instance_id, dp_rank)` → `{pod_ip, node_id}` | 给一个 DP（边的 owner），问它在哪台机器 |
+| `pod_to_node` | Pod IP → node 标识 | 给一个 Pod IP（池事件的 `backend_id`），问它在哪台机器 |
+
+**为什么是这个方向**：消费者要回答的问题是「这个池块的 owner 和我是不是同一台机器」，
+用 `dp → node` 是两次 O(1) 查表加一次比较；反向的 `node → dps` 每次都要扫列表，而且
+没有对应的消费场景（原本设想的「扇出到同机所有 DP」在走查改为忽略 owner 后已无效果——
+走查不再读 owner，扇出只会让每条边的 owner 集合变大而不改变任何上报数字）。
+
+`same_node(dp_a, dp_b)` 封装了这个判断。**任一方位置未知时返回 `false`** —— 位置不明
+绝不能当作同机，否则远端块会被算成本地、低估搬运成本。
+
+**生命周期**：写入时机完全跟随注册——`/register` 写、`/unregister` 删、后端类型变化的
+重注册先删再写；**没有轮询也没有刷新**。因为 Pod 与机器的绑定是静态的（Pod 不迁移宿主机，
+重调度产生的是新 Pod、新 IP），所以每个 Pod 只在注册时写一次。DP 条目在注销时立即删除；
+`pod_to_node` 因为可能被同 Pod 的其他 DP 共用，只在该 Pod 最后一个 DP 离开后才删（DP 表
+的条目里带着自己的 `pod_ip`，扫一遍即可判断，注销是低频操作，比维护单独的计数更简单）。
+
+**只记录 HBM endpoint 的 IP**：`cpu` / `disk` endpoint 可能指向别处的池服务，其 IP 不是
+本引擎的 Pod IP。这也保证 `pod_to_node` 与 `hbm_ip_index` 的键来自同一处
+（`extract_ip_from_endpoint(medium_endpoints["npu"])`），两张索引对得上。
+
+**当前状态**：Coordinator **尚未下发** `node_id`，因此两张表默认为空、行为与之前完全一致；
+表也**尚未接入任何匹配或打分逻辑**，仅通过 `GET /workers` 的 `topology` 字段暴露，供外部
+客户端和排查使用。
+
+要让 Coordinator 填上这个字段，**不需要改 K8s 部署**：`engine_template.yaml` 已经通过
+downward API 把 `status.hostIP` 注入成 `HOST_IP` 环境变量（与 `POD_IP` 并排），只是 Python
+运行时从不读它（目前只有 HCCL 启动脚本在用）。缺的是数据透传，路径与 `pod_ip` 完全相同：
+
+```text
+  status.podIP  -> POD_IP  -> Env.pod_ip -> RegisterMsg.pod_ip
+                -> Endpoint.ip -> InsEventMsg -> ConductorApiClient    已通
+  status.hostIP -> HOST_IP -> ??? -> ??? -> ???                        缺中间四环
+```
+
+中间四环（`Env.host_ip`、`RegisterMsg`、`Endpoint`/`NodeManagerInfo`、
+`instance_assembler` 组装，最后 `ConductorApiClient` 填字段）都只是加字段加赋值。
+
+另一条路是复用 Controller 容错模块已有的 `K8sClient.get_node_hostname_by_pod_ip()`——它
+已经在遍历 `instance.get_node_managers()` 建 `pod_ip → node_name` 映射（RBAC 里 `pods` /
+`nodes` 的 list 权限也齐），只是结果留在 `NodeMetadata` 里，不进 `Instance`、不传 Coordinator。
+这条能省掉 NodeManager 那两环，但有三个前提：`K8sClient` 现在挂在 `FaultManager` 上，
+`enable_fault_tolerance=False` 时整个能力不存在，得先提级；解析只在 `INSTANCE_INITIAL`
+触发，可能晚于首次 conductor 注册（靠定时重注册补，`NodeTopology::record` 是幂等覆盖的）；
+标识格式变成 K8s node name 而非 hostIP，**必须全局统一**，conductor 只做字符串相等比较，
+两种格式混用会把同一台机器认成两台。
+
+注意：`NodeManagerInfo` 本身**没有**机器字段——它的 `pod_ip` 与 `Endpoint.ip` 来自同一个
+`msg.pod_ip`（`instance_assembler` 里 `add_node_mgr` 与 `add_endpoints` 相邻两行），所以
+`node_managers` 只是一份 per-Pod 列表，机器信息得靠外部查询才能得到。另外部分测试已经在
+构造 `NodeManagerInfo(..., host_ip=...)` 和引用 `api_config.host_ip`，但生产模型里没有这些
+字段，Pydantic 静默忽略了它们——动手前先确认这些测试的意图。
+
+### 池命中的本地/远端拆分
+
+池块任意节点可取，但**搬运代价不同**：本机 DRAM 几乎免费，跨机要走
+`device_rdma` / `device_sdma` / `device_urma`。原先所有池命中都统一记作 `cpu_blocks`，
+调度器看不出这个差异。
+
+判断依据是**边的 owner**：一条池事件会广播给上报它的那个 Pod 里的所有 DP，所以「owner 里
+有当前 DP」等价于「这块在当前 DP 自己的 Pod 里」，而同 Pod 必然同机 —— 于是这就是一次
+免搬运的本地读。查询侧不需要任何拓扑信息：
+
+```text
+  走查覆盖 [start, end)，逐块问 owner 里有没有自己
+    有   -> cpu_local_blocks  += 1     本 Pod DRAM
+    没有 -> cpu_remote_blocks += 1     需要传输
+
+  只统计 exclusive_from 之后的位置（CPU 层取 npu_end，Disk 层取 max(npu_end, cpu_end)）：
+  之前的块已被更高优先级介质本地覆盖，不需要搬运
+  => cpu_local_blocks + cpu_remote_blocks == cpu_blocks（不变式，有测试守护）
+```
+
+实现上，走查对所有 DP 相同（忽略 owner），所以只走一次并顺手收下经过的块标识
+（`reachable_chain`）；每个 DP 再拿这串标识去查已有的 per-worker 反查表
+（`count_owned`，这张表本来是为 O(1) 删除建的，这里白嫖），而不是每个 DP 各走一遍。
+
+**这个拆分是刻意保守的**：同机不同 Pod 的块其实也是便宜的本地读，但 conductor 没有机器
+标识就看不出来，只能记作远端。所以 `cpu_local_blocks` 是共置的**下界** —— 只会低估，不会
+高估。方向很重要：高估会告诉调度器「这次搬运免费」，而实际要跨机，直接打在 TTFT 上。
+
+要把「同 Pod」升级成「同机」，需要让广播覆盖整台机器上的所有 DP（跨 Pod），这依赖上面
+`node_id` 那条尚未打通的链路；而且**在一机一 Pod 的部署下没有任何收益**（那时 Pod 级广播
+已经等价于机器级）。是否值得做，取决于 `*_pod_npu_num` 与单机卡数的比值，以及本地与远端
+池命中的实测 TTFT 差距。
 
 ---
 
@@ -379,8 +532,11 @@ CPU/DISK 不使用完整 RadixTree，而是轻量的 **continuation-edge 图**�
 | | HBM RadixTree | CPU/Disk Continuation |
 |---|---|---|
 | 匹配方式 | root 出发，树遍历 | 边遍历：断点续接链 + root 链并列候选 |
-| 缺失处理 | 第一个缺失即停 | 第一个缺失边/缺失 Worker 即停 |
-| root 走查条件 | 总是 | **无条件**（拥有首边即走；与续接链取绝对终点最远者） |
+| 缺失处理 | 第一个缺失即停 | 第一个缺失**边**即停（不因边属于别人而停） |
+| 是否校验 owner | ✅ 逐层求交（HBM 跨节点取不到） | ❌ 忽略（池块任意节点可取） |
+| root 走查条件 | 总是 | **无条件**，且对所有 DP 相同（只算一次） |
+| 断点作用域 | 不适用 | **仅本 `(instance_id, dp_rank)`**，不跨 DP 借用 |
+| 报的是什么 | 该 worker 本地持有的前缀 | 该 DP **能免重算服务**的前缀 |
 | 保证 | 匹配的块形成合法前缀链 | 与 HBM 衔接的续接链 + 本层更长副本均可如实报告 |
 
 断点续查保证三层命中块是**同一条连续前缀**，与 vLLM prefix cache 的查找语义

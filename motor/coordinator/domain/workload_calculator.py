@@ -12,12 +12,11 @@
 
 from __future__ import annotations
 
+from motor.common.logger import get_logger
 from motor.common.resources.endpoint import Workload
 from motor.common.resources.instance import PDRole
-from motor.common.logger import get_logger
-from motor.coordinator.models.request import RequestInfo
 from motor.common.utils.image_utils import get_mul_token
-
+from motor.coordinator.models.request import RequestInfo
 
 logger = get_logger(__name__)
 

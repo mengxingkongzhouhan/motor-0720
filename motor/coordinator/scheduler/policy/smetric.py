@@ -18,14 +18,17 @@ from motor.common.logger import get_logger
 from motor.common.resources.endpoint import Endpoint
 from motor.common.resources.instance import Instance, PDRole
 from motor.coordinator.api_client.conductor_api_client import (
-    ConductorApiClient,
     TENANT_ID,
+    ConductorApiClient,
     conductor_instance_id,
 )
 from motor.coordinator.domain import InstanceProvider
 from motor.coordinator.models.constants import DEFAULT_REQUEST_ID, OpenAIField
 from motor.coordinator.models.request import RequestInfo
-from motor.coordinator.scheduler.policy.base import BaseSchedulingPolicy, WorkloadLedgerMixin
+from motor.coordinator.scheduler.policy.base import (
+    BaseSchedulingPolicy,
+    WorkloadLedgerMixin,
+)
 
 logger = get_logger(__name__)
 
@@ -57,10 +60,7 @@ def _prompt_token_ids(req_info: RequestInfo) -> list[int]:
         prompt = req_data.get(OpenAIField.PROMPT, None)
         if prompt is not None:
             encoded_ids = TokenizerManager().encode(prompt)
-    try:
-        req_info.token_ids = encoded_ids
-    except Exception as e:  # pragma: no cover - req_info may be immutable in some callers
-        logger.debug("Could not cache token_ids on req_info: %s", e)
+    req_info.token_ids = encoded_ids
     return encoded_ids
 
 
@@ -249,10 +249,9 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         """Cache per-endpoint prefill_cost on ``req_info.smetric_debug``. Never fail selection."""
         if req_info is None:
             return
-        try:
-            req_info.smetric_debug = {(instance.id, ep.id): cost for (cost, _iid, _eid, instance, ep) in scored}
-        except Exception as e:  # pragma: no cover
-            logger.debug("Could not cache smetric_debug on req_info: %s", e)
+        req_info.smetric_debug = {
+            (instance.id, ep.id): cost for (cost, _iid, _eid, instance, ep) in scored
+        }
 
     def _select_instance(self, _: PDRole = None) -> Instance | None:
         return None

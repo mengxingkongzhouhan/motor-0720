@@ -143,6 +143,17 @@ struct WorkerTier {
     chain_refs: FxHashMap<PrefixChainHash, u32>,
 }
 
+/// A block hash's mapping, plus how many workers hold it.
+///
+/// Kept alongside the per-worker indexes so resolving a block hash is one
+/// lookup rather than a scan over every worker. That path is hot: placing a
+/// pooled chain resolves each block against its predecessor.
+#[derive(Debug, Clone, Copy)]
+struct SharedRecord {
+    record: BlockRecord,
+    holders: u32,
+}
+
 /// Result of a contiguous pooled walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContiguousHit {
@@ -164,6 +175,8 @@ impl ContiguousHit {
 pub struct LowerTierIndexer {
     /// Content position → the workers holding a copy.
     positions: RwLock<FxHashMap<PrefixChainHash, Owners>>,
+    /// Engine block hash → its mapping, across all workers.
+    blocks: RwLock<FxHashMap<SequenceBlockHash, SharedRecord>>,
     /// Per-worker reverse lookup for O(1) removal by engine block hash.
     workers: RwLock<FxHashMap<WorkerKey, WorkerTier>>,
 }
@@ -181,6 +194,7 @@ impl LowerTierIndexer {
         let mut workers = self.workers.write();
         let tier = workers.entry(worker.clone()).or_default();
         let mut positions = self.positions.write();
+        let mut shared = self.blocks.write();
 
         for block in blocks {
             let record = BlockRecord {
@@ -188,18 +202,44 @@ impl LowerTierIndexer {
                 parent_hash: block.parent_hash,
                 tokens_hash: block.tokens_hash,
             };
-            if let Some(previous) = tier.by_block.insert(block.block_hash, record) {
-                if previous.prefix_chain == block.prefix_chain {
-                    continue;
+            match tier.by_block.insert(block.block_hash, record) {
+                Some(previous) if previous.prefix_chain == block.prefix_chain => continue,
+                Some(previous) => {
+                    // Re-anchored to a different prefix: release the old position.
+                    Self::release(&mut positions, tier, worker, previous.prefix_chain);
+                    shared
+                        .entry(block.block_hash)
+                        .and_modify(|entry| entry.record = record);
                 }
-                // Re-anchored to a different prefix: release the old position.
-                Self::release(&mut positions, tier, worker, previous.prefix_chain);
+                None => {
+                    shared
+                        .entry(block.block_hash)
+                        .and_modify(|entry| {
+                            entry.record = record;
+                            entry.holders += 1;
+                        })
+                        .or_insert(SharedRecord { record, holders: 1 });
+                }
             }
             *tier.chain_refs.entry(block.prefix_chain).or_insert(0) += 1;
             positions
                 .entry(block.prefix_chain)
                 .and_modify(|owners| owners.insert(worker.clone()))
                 .or_insert_with(|| Owners::One(worker.clone()));
+        }
+    }
+
+    /// Drop one holder of `block_hash`, forgetting the mapping at zero.
+    fn forget(
+        shared: &mut FxHashMap<SequenceBlockHash, SharedRecord>,
+        block_hash: SequenceBlockHash,
+    ) {
+        let Some(entry) = shared.get_mut(&block_hash) else {
+            return;
+        };
+        entry.holders = entry.holders.saturating_sub(1);
+        if entry.holders == 0 {
+            shared.remove(&block_hash);
         }
     }
 
@@ -233,12 +273,15 @@ impl LowerTierIndexer {
             return;
         };
         let mut positions = self.positions.write();
+        let mut shared = self.blocks.write();
 
         for &h in block_hashes {
-            let Some(record) = tier.by_block.remove(&SequenceBlockHash(h)) else {
+            let block_hash = SequenceBlockHash(h);
+            let Some(record) = tier.by_block.remove(&block_hash) else {
                 continue;
             };
             Self::release(&mut positions, tier, worker, record.prefix_chain);
+            Self::forget(&mut shared, block_hash);
         }
 
         if tier.by_block.is_empty() {
@@ -260,6 +303,10 @@ impl LowerTierIndexer {
                 }
             }
         }
+        let mut shared = self.blocks.write();
+        for block_hash in tier.by_block.into_keys() {
+            Self::forget(&mut shared, block_hash);
+        }
     }
 
     /// Look up `(parent_hash, tokens_hash)` for an engine `block_hash` held by
@@ -279,20 +326,17 @@ impl LowerTierIndexer {
     }
 
     fn record_of(&self, block_hash: u64) -> Option<BlockRecord> {
-        let seq = SequenceBlockHash(block_hash);
-        self.workers
+        self.blocks
             .read()
-            .values()
-            .find_map(|tier| tier.by_block.get(&seq).copied())
+            .get(&SequenceBlockHash(block_hash))
+            .map(|entry| entry.record)
     }
 
     /// Whether any worker currently holds ``block_hash``.
     pub fn contains_block(&self, block_hash: u64) -> bool {
-        let seq = SequenceBlockHash(block_hash);
-        self.workers
+        self.blocks
             .read()
-            .values()
-            .any(|tier| tier.by_block.contains_key(&seq))
+            .contains_key(&SequenceBlockHash(block_hash))
     }
 
     /// Number of blocks tracked for ``worker``.
@@ -538,6 +582,27 @@ mod tests {
         assert!(idx.contains_block(0x501));
         assert_eq!(idx.worker_block_count(&w), 1);
         assert!(idx.lookup_block(0x999).is_none());
+    }
+
+    #[test]
+    fn block_mapping_outlives_all_but_the_last_holder() {
+        // The pool fanout records one block for every DP of a Pod, and resolving
+        // the next block in a chain looks that mapping up. It must stay until the
+        // last of them drops it.
+        let idx = LowerTierIndexer::new();
+        let a = worker("a");
+        let b = worker("b");
+        let chain = chain_of(&[11]);
+        idx.store_blocks(&a, &placements(&chain, 0, &[101]));
+        idx.store_blocks(&b, &placements(&chain, 0, &[101]));
+
+        idx.remove_blocks(&a, &[101]);
+        assert!(idx.contains_block(101));
+        assert_eq!(idx.prefix_chain_of(101), Some(chain[0]));
+
+        idx.clear_worker(&b);
+        assert!(!idx.contains_block(101));
+        assert!(idx.prefix_chain_of(101).is_none());
     }
 
     #[test]

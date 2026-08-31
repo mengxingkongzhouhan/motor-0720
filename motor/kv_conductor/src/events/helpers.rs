@@ -40,7 +40,7 @@ pub(super) fn resolve_workers(
     target_media: &[StorageMedium],
 ) -> Vec<WorkerKey> {
     if match_mode == MatchMode::None {
-        target_media
+        return target_media
             .iter()
             .map(|&medium| WorkerKey {
                 instance_id: backend_id.to_string(),
@@ -48,8 +48,21 @@ pub(super) fn resolve_workers(
                 dp_rank,
                 medium,
             })
-            .collect()
-    } else {
-        match_mode.resolve_workers(hbm_ip_index.as_ref(), backend_id, dp_rank, target_media)
+            .collect();
     }
+
+    let workers =
+        match_mode.resolve_workers(hbm_ip_index.as_ref(), backend_id, dp_rank, target_media);
+    if workers.is_empty() {
+        // The event names a node with no HBM-registered DP, so it has nowhere to
+        // land. Silence here reads as "the pool never reported that block", which
+        // is what makes a truncated pooled prefix hard to explain.
+        tracing::debug!(
+            %backend_id,
+            dp_rank,
+            reason = "backend_id_not_in_hbm_ip_index",
+            "kv_event dropped"
+        );
+    }
+    workers
 }

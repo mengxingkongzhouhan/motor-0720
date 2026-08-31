@@ -1080,6 +1080,251 @@ fn test_hbm_breakpoint_not_shared_across_dp_ranks() {
     assert_eq!(imd.longest_matched, 3 * 4);
 }
 
+/// Block size used by the reported production traces, so the token counts in
+/// the tests below are the ones that appeared in the `/query` response.
+const REPORTED_BLOCK_SIZE: u32 = 128;
+
+/// `count` engine sequence hashes in one engine's own hash space.
+///
+/// vLLM seeds its rolling `block_hash` chain with a per-process random value
+/// unless `PYTHONHASHSEED` is pinned, so every engine numbers the same content
+/// differently. `space` stands in for that seed.
+fn engine_hashes(space: u64, count: usize) -> Vec<u64> {
+    (0..count as u64).map(|i| space + i).collect()
+}
+
+/// Store an HBM prefix of `depth` blocks for one DP, in its own hash space.
+fn store_hbm_prefix(
+    entry: &IndexerEntry,
+    instance_id: &str,
+    dp_rank: u32,
+    space: u64,
+    hashes: &[LocalBlockHash],
+    depth: usize,
+) {
+    let seq = engine_hashes(space, depth);
+    let blocks: Vec<(u64, u64)> = (0..depth).map(|i| (seq[i], hashes[i].0)).collect();
+    store_chain(
+        entry,
+        &worker_of(instance_id, dp_rank, StorageMedium::Npu),
+        None,
+        &blocks,
+    );
+}
+
+/// Pool one contiguous range `[from, to)` of the prefix, as the two-phase
+/// offload/pool match ends up applying it: one `Stored` per block, chained on
+/// the offloading engine's own hashes, broadcast to every DP of the Pod that
+/// reported it.
+fn pool_range(
+    entry: &IndexerEntry,
+    dps_in_pod: &[(&str, u32)],
+    space: u64,
+    hashes: &[LocalBlockHash],
+    from: usize,
+    to: usize,
+    anchor: Option<u64>,
+) {
+    let seq = engine_hashes(space, hashes.len());
+    for &(instance_id, dp_rank) in dps_in_pod {
+        let worker = worker_of(instance_id, dp_rank, StorageMedium::Cpu);
+        let mut parent = if from == 0 { None } else { anchor };
+        for pos in from..to {
+            store_chain(entry, &worker, parent, &[(seq[pos], hashes[pos].0)]);
+            parent = Some(seq[pos]);
+        }
+    }
+}
+
+/// The reported trace: HBM matched 94 blocks (12032 tokens) while every DP
+/// reported the same 896-token pooled hit, including the DPs with no HBM at all
+/// and a whole second instance.
+///
+/// The pool held the full prefix. Keying pooled blocks by the offloading
+/// engine's rolling `block_hash` hid it: the first engine to report block 0
+/// owned the chain's root, a second engine's differing hash for the same
+/// content was rejected, and its 94-block copy was left dangling. The walk from
+/// position 0 then measured the *short* chain — 7 blocks — for everybody.
+#[test]
+fn test_pooled_prefix_is_not_truncated_by_a_shorter_foreign_chain() {
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-report", "default");
+
+    let blocks = 94usize;
+    let tokens: Vec<i64> = (0..(blocks as i64 * REPORTED_BLOCK_SIZE as i64)).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, REPORTED_BLOCK_SIZE);
+    assert_eq!(hashes.len(), blocks);
+
+    let pod_3: Vec<(&str, u32)> = (0..8).map(|dp| ("vllm-prefill-3", dp)).collect();
+    let pod_4: Vec<(&str, u32)> = (0..8).map(|dp| ("vllm-prefill-4", dp)).collect();
+
+    // HBM as reported: prefill-3 holds decreasing prefixes on some DPs, nothing
+    // on the rest; prefill-4 is cold. Each DP is its own engine process, so each
+    // numbers the same content differently.
+    for (dp, depth) in [(0u32, 94usize), (2, 82), (4, 44)] {
+        store_hbm_prefix(
+            &entry,
+            "vllm-prefill-3",
+            dp,
+            0x3_0000 + u64::from(dp) * 0x1000,
+            &hashes,
+            depth,
+        );
+    }
+    for &(instance_id, dp_rank) in pod_4.iter() {
+        // Registered and reachable, but holding an unrelated prefix.
+        store_chain(
+            &entry,
+            &worker_of(instance_id, dp_rank, StorageMedium::Npu),
+            None,
+            &[(
+                0x4_F000 + u64::from(dp_rank),
+                0xDEAD_0000 + u64::from(dp_rank),
+            )],
+        );
+    }
+
+    // An earlier short request pooled only the first 7 blocks.
+    pool_range(&entry, &pod_4, 0x9_0000, &hashes, 0, 7, None);
+    // prefill-3/dp0 then pooled the whole prefix, under its own hashes.
+    pool_range(&entry, &pod_3, 0x3_0000, &hashes, 0, blocks, None);
+
+    let resp = indexer
+        .query("model-report", "default", &tokens, REPORTED_BLOCK_SIZE)
+        .unwrap();
+    let tenant = &resp.tenants["default"];
+    let full_prefix = blocks as u32 * REPORTED_BLOCK_SIZE;
+
+    for instance_id in ["vllm-prefill-3", "vllm-prefill-4"] {
+        let imd = &tenant[instance_id];
+        assert_eq!(
+            imd.longest_matched, full_prefix,
+            "{instance_id} can serve the whole pooled prefix"
+        );
+        for (dp_rank, dp) in &imd.dp {
+            assert_eq!(
+                dp.matched_tokens, full_prefix,
+                "{instance_id}/dp{dp_rank} must reach the full pooled prefix, not \
+                 the 896 tokens of the shorter foreign chain: {dp:?}"
+            );
+            assert_eq!(
+                dp.npu_blocks + dp.cpu_blocks,
+                blocks as u32,
+                "{instance_id}/dp{dp_rank}: {dp:?}"
+            );
+            assert_eq!(dp.cpu_local_blocks + dp.cpu_remote_blocks, dp.cpu_blocks);
+        }
+    }
+
+    // The deepest HBM hit gains nothing extra — the pool covers the same
+    // prefix, so it is credited to NPU and CPU adds zero.
+    let dp0 = &tenant["vllm-prefill-3"].dp["0"];
+    assert_eq!(dp0.npu_blocks, 94);
+    assert_eq!(dp0.cpu_blocks, 0);
+
+    // A DP with no HBM of its own fetches all of it.
+    let dp7 = &tenant["vllm-prefill-3"].dp["7"];
+    assert_eq!(dp7.npu_blocks, 0);
+    assert_eq!(dp7.cpu_blocks, 94);
+    assert_eq!(
+        dp7.cpu_local_blocks, 94,
+        "its own Pod reported the offload, so nothing has to travel"
+    );
+
+    // prefill-4's Pod only reported the first 7 blocks, so the rest is remote.
+    let other = &tenant["vllm-prefill-4"].dp["0"];
+    assert_eq!(other.cpu_local_blocks, 7);
+    assert_eq!(other.cpu_remote_blocks, 87);
+}
+
+/// A pooled range chained onto an engine's own HBM block is reachable from
+/// position 0 by every DP, as long as the earlier positions are pooled by
+/// anyone.
+///
+/// This is the normal shape of a repeat request: the engine only saves the
+/// blocks it just computed, so its offload event is anchored mid-sequence.
+#[test]
+fn test_pooled_tail_anchored_on_own_hbm_extends_the_shared_walk() {
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-anchored-tail", "t1");
+
+    let tokens: Vec<i64> = (0..32).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+    assert_eq!(hashes.len(), 8);
+
+    // inst-a pooled the head [0,4) and holds nothing in HBM.
+    pool_range(&entry, &[("inst-a", 0)], 0xA_0000, &hashes, 0, 4, None);
+
+    // inst-b computed [0,8) in HBM and pooled only the tail [4,8), anchored on
+    // its own block 3.
+    let b_space = 0xB_0000;
+    store_hbm_prefix(&entry, "inst-b", 0, b_space, &hashes, 8);
+    pool_range(
+        &entry,
+        &[("inst-b", 0)],
+        b_space,
+        &hashes,
+        4,
+        8,
+        Some(engine_hashes(b_space, 8)[3]),
+    );
+
+    let resp = indexer
+        .query("model-anchored-tail", "t1", &tokens, 4)
+        .unwrap();
+    let tenant = &resp.tenants["t1"];
+
+    // inst-a holds no HBM, so it may only use the pooled chain — which now runs
+    // the whole way because the tail is placed by content, not by whose hash
+    // chained it.
+    let dp_a = &tenant["inst-a"].dp["0"];
+    assert_eq!(dp_a.npu_blocks, 0);
+    assert_eq!(dp_a.cpu_blocks, 8, "head and tail join into one chain");
+    assert_eq!(dp_a.cpu_local_blocks, 4, "it only reported the head itself");
+    assert_eq!(dp_a.cpu_remote_blocks, 4);
+
+    let dp_b = &tenant["inst-b"].dp["0"];
+    assert_eq!(dp_b.npu_blocks, 8);
+    assert_eq!(dp_b.cpu_blocks, 0, "all of it is already local in HBM");
+}
+
+/// Pooled blocks whose prefix cannot be placed are dropped and counted, not
+/// indexed at a guessed position.
+#[test]
+fn test_unanchored_pooled_blocks_are_counted_and_not_reported() {
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-unanchored", "t1");
+
+    let tokens: Vec<i64> = (0..8).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+
+    // Give the index a DP so the query has someone to answer for.
+    store_chain(
+        &entry,
+        &worker_of("inst-a", 0, StorageMedium::Npu),
+        None,
+        &[(0x100, hashes[0].0)],
+    );
+    // A pooled chain anchored on a block nobody has ever reported.
+    store_chain(
+        &entry,
+        &worker_of("inst-a", 0, StorageMedium::Cpu),
+        Some(0xDEAD_BEEF),
+        &[(0x200, hashes[1].0)],
+    );
+
+    assert_eq!(entry.unanchored_pooled_blocks(), 1);
+    assert_eq!(entry.cpu_tiers.total_blocks(), 0);
+
+    let resp = indexer.query("model-unanchored", "t1", &tokens, 4).unwrap();
+    let dp = &resp.tenants["t1"]["inst-a"].dp["0"];
+    assert_eq!(dp.npu_blocks, 1);
+    assert_eq!(
+        dp.cpu_blocks, 0,
+        "an unplaceable block must not be reported"
+    );
+}
+
 #[test]
 fn test_disk_continuation_from_hbm_when_cpu_miss() {
     // vLLM lookup: after NPU hit, Disk can hit even if CPU miss (then promote).

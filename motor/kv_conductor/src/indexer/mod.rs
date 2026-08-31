@@ -12,24 +12,28 @@
 //!
 //! Each `IndexerEntry` manages:
 //!
-//! - **HBM tree** (`hbm_tree`) — prefix-chain radix tree for NPU blocks.
-//! - **CPU / Disk continuation indexes** (`cpu_tiers` / `disk_tiers`) —
-//!   ``(parent_seq_hash, tokens_hash) → child`` edges (see `lower_tier`
-//!   and `THIRD_PARTY_NOTICES.md`). CPU continues from the same DP's HBM
-//!   breakpoint; Disk continues from that DP's ``max(HBM, CPU)`` (CPU
-//!   preferred when it extends further) — a breakpoint is never shared
-//!   across DPs. Root chains are walked unconditionally so longer
-//!   lower-tier replicas are never hidden by shorter upstream hits.
+//! - **HBM tree** (`hbm_tree`) — content-addressed radix tree of NPU blocks.
+//!   Every node also carries the [`PrefixChainHash`] of its path, which is what
+//!   lets a pooled block chained onto an engine's HBM block be placed in the
+//!   shared pooled index.
+//! - **CPU / Disk pooled indexes** (`cpu_tiers` / `disk_tiers`) — pooled blocks
+//!   keyed by [`PrefixChainHash`], i.e. by content position rather than by the
+//!   offloading engine's rolling `block_hash` (see `lower_tier` and
+//!   `THIRD_PARTY_NOTICES.md`). Each DP walks the pooled chain from position 0
+//!   and, when it reaches further, from its own HBM coverage end; Disk resumes
+//!   after that DP's ``max(HBM, CPU)``. A resume point is never shared across
+//!   DPs, because HBM is not poolable.
 //! - **offload_pool_state** — bidirectional offload/pool event matching
-//!   (see [`OffloadPoolState`]). The `offload` side now also carries the
-//!   originating `parent_hash` so that lower-tier continuation edges are
-//!   correctly chained once the pool backend confirms placement.
+//!   (see [`OffloadPoolState`]). The `offload` side also carries the
+//!   originating `parent_hash`, which is how a pooled block's content position
+//!   is resolved once the pool backend confirms placement.
 //!
 //! Query results report exclusive per-medium matched blocks and unweighted
 //! coverage `matched_tokens` (sum of exclusive blocks × `block_size`).
 //! Tier affinity weights are applied by the Coordinator scheduler.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -38,10 +42,13 @@ use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 use serde::Serialize;
 
-use crate::concurrent_tree::{ConcurrentRadixTree, PrefixMatch, WorkerLookup};
+use crate::concurrent_tree::{ConcurrentRadixTree, WorkerLookup};
 use crate::error::KvConductorError;
-use crate::hashing::compute_block_hash_for_seq;
-use crate::lower_tier::LowerTierIndexer;
+use crate::hashing::{
+    compute_block_hash_for_seq, compute_prefix_chain_for_seq, extend_prefix_chain,
+    PREFIX_CHAIN_ROOT,
+};
+use crate::lower_tier::{LowerTierIndexer, PooledBlock};
 use crate::protocols::*;
 
 /// TTL for stale pending pool entries (60 seconds).
@@ -52,6 +59,11 @@ const PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// once the window closes.
 const CONTENT_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 const OFFLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How far back through the offload caches a pooled block's prefix is chased
+/// before giving up. Bounds the work a malformed `parent_hash` cycle can cause;
+/// a real chain is at most the request's block count.
+const MAX_OFFLOAD_CHAIN_WALK: usize = 8192;
 
 /// Retention limits for the asynchronous offload/pool matching caches.
 #[derive(Debug, Clone)]
@@ -94,15 +106,17 @@ struct MatchSink<'a> {
     medium_ends: &'a mut FxHashMap<(String, DpRank), MediumEnds>,
 }
 
-/// Upstream-tier match breakpoint used to continue into the next lower tier.
+/// Where one DP's upstream-tier coverage ends, so the next tier can resume
+/// there.
+///
+/// Only a position is needed: pooled blocks are keyed by content, so a walk
+/// resumes at an absolute index without an engine-supplied anchor.
 #[derive(Debug, Clone)]
 struct TierBreakpoint {
     instance_id: String,
     dp_rank: DpRank,
     /// Absolute index in the query hash sequence where the next tier starts.
     end_pos: usize,
-    /// Sequence hash of the last matched upstream block.
-    last_seq: SequenceBlockHash,
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +214,16 @@ pub(crate) struct OffloadPoolState {
     pub(crate) pending_pool: FxHashMap<u64, FxHashSet<PendingPoolEvent>>,
 }
 
+impl OffloadPoolState {
+    /// The content mapping known for `block_hash`, from either cache.
+    fn cached_content(&self, block_hash: u64) -> Option<BlockContent> {
+        self.offload
+            .get(&block_hash)
+            .map(|entry| entry.content)
+            .or_else(|| self.content.get(&block_hash).map(|entry| entry.content))
+    }
+}
+
 /// Key identifying a unique indexer instance: (model_name, tenant_id).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IndexerKey {
@@ -214,14 +238,18 @@ pub struct IndexerEntry {
     /// HBM per-worker reverse lookups: WorkerKey → WorkerLookup.
     pub lookups: Arc<RwLock<FxHashMap<WorkerKey, WorkerLookup>>>,
 
-    /// CPU continuation-edge index.
+    /// CPU pooled-block index.
     pub cpu_tiers: Arc<LowerTierIndexer>,
-    /// Disk continuation-edge index.
+    /// Disk pooled-block index.
     pub disk_tiers: Arc<LowerTierIndexer>,
 
     /// Bidirectional offload/pool event matching state.
     /// See [`OffloadPoolState`] for the invariant.
     pub(crate) offload_pool_state: Arc<RwLock<OffloadPoolState>>,
+
+    /// Pooled blocks dropped for want of a resolvable prefix. A non-zero value
+    /// means the pool holds content the index cannot report.
+    unanchored_pooled_blocks: AtomicU64,
 
     maintenance: CacheMaintenanceConfig,
 }
@@ -244,6 +272,7 @@ impl IndexerEntry {
             cpu_tiers: Arc::new(LowerTierIndexer::new()),
             disk_tiers: Arc::new(LowerTierIndexer::new()),
             offload_pool_state: Arc::new(RwLock::new(OffloadPoolState::default())),
+            unanchored_pooled_blocks: AtomicU64::new(0),
             maintenance,
         }
     }
@@ -287,50 +316,49 @@ impl IndexerEntry {
         let mut medium_ends: FxHashMap<(String, DpRank), MediumEnds> = FxHashMap::default();
 
         // 1) HBM prefix match.
-        let hbm: FxHashMap<WorkerKey, PrefixMatch> =
-            self.hbm_tree.find_matches_detailed(block_hashes);
-        for (worker, m) in &hbm {
-            if m.depth == 0 {
+        let hbm: FxHashMap<WorkerKey, u32> = self.hbm_tree.find_matches_detailed(block_hashes);
+        for (worker, &depth) in &hbm {
+            if depth == 0 {
                 continue;
             }
-            overlap.add_blocks(worker.clone(), m.depth);
+            overlap.add_blocks(worker.clone(), depth);
             Self::note_medium_end(
                 &mut medium_ends,
                 &worker.instance_id,
                 worker.dp_rank,
                 StorageMedium::Npu,
-                m.depth,
+                depth,
             );
         }
 
-        // Breakpoints need last_seq_hash for continuation.
         let hbm_breaks: Vec<TierBreakpoint> = hbm
             .iter()
-            .filter(|(_, m)| m.depth > 0)
-            .filter_map(|(w, m)| {
-                Some(TierBreakpoint {
-                    instance_id: w.instance_id.clone(),
-                    dp_rank: w.dp_rank,
-                    end_pos: m.depth as usize,
-                    last_seq: m.last_seq_hash?,
-                })
+            .filter(|(_, &depth)| depth > 0)
+            .map(|(w, &depth)| TierBreakpoint {
+                instance_id: w.instance_id.clone(),
+                dp_rank: w.dp_rank,
+                end_pos: depth as usize,
             })
             .collect();
 
         // Pooled blocks are reachable from any DP, so a DP holding nothing of
         // its own can still serve a pooled prefix — every known DP must be
-        // considered on the lower tiers, not just the ones owning edges.
+        // considered on the lower tiers, not just the ones holding blocks.
         let known_dps = self.known_dps();
+
+        // Content position of every block in the query. Pooled media are keyed
+        // by this, so the walk needs no anchor from the engines.
+        let prefix_chain = compute_prefix_chain_for_seq(block_hashes);
 
         let mut sink = MatchSink {
             overlap: &mut overlap,
             medium_ends: &mut medium_ends,
         };
 
-        // 2) CPU: each DP resumes from its own HBM breakpoint (or from root
-        //    when its HBM matched nothing) and then walks ownership-blind.
+        // 2) CPU: walk from position 0, and per DP also from its own HBM
+        //    coverage end, keeping whichever reaches further.
         let cpu_breaks = self.lower_tier_lookup(
-            block_hashes,
+            &prefix_chain,
             &hbm_breaks,
             &self.cpu_tiers,
             StorageMedium::Cpu,
@@ -342,7 +370,7 @@ impl IndexerEntry {
         //    extends further — matches vLLM lookup: CPU then Disk after NPU).
         let disk_breaks = Self::merge_tier_breakpoints(&hbm_breaks, &cpu_breaks);
         self.lower_tier_lookup(
-            block_hashes,
+            &prefix_chain,
             &disk_breaks,
             &self.disk_tiers,
             StorageMedium::Disk,
@@ -413,22 +441,17 @@ impl IndexerEntry {
             .cpu_local = local;
     }
 
-    /// Per `(instance_id, dp_rank)`, keep the farther breakpoint.
-    ///
-    /// `preferred` (CPU) overwrites `fallback` (HBM) when ``end_pos`` is
-    /// greater or equal — so Disk resumes after the longest upstream prefix.
+    /// Per `(instance_id, dp_rank)`, keep the farthest breakpoint across both
+    /// upstream tiers, so Disk resumes after the longest upstream prefix.
     fn merge_tier_breakpoints(
-        fallback: &[TierBreakpoint],
-        preferred: &[TierBreakpoint],
+        hbm: &[TierBreakpoint],
+        cpu: &[TierBreakpoint],
     ) -> Vec<TierBreakpoint> {
         let mut best: HashMap<(String, DpRank), TierBreakpoint> = HashMap::new();
-        for b in fallback {
-            best.insert((b.instance_id.clone(), b.dp_rank), b.clone());
-        }
-        for b in preferred {
+        for b in hbm.iter().chain(cpu) {
             let key = (b.instance_id.clone(), b.dp_rank);
             match best.get(&key) {
-                Some(existing) if b.end_pos < existing.end_pos => {}
+                Some(existing) if existing.end_pos >= b.end_pos => {}
                 _ => {
                     best.insert(key, b.clone());
                 }
@@ -437,7 +460,7 @@ impl IndexerEntry {
         best.into_values().collect()
     }
 
-    /// Per-DP reachable span on one lower tier, returning this tier's
+    /// Per-DP reachable span on one pooled tier, returning this tier's
     /// breakpoints for the next one.
     ///
     /// The walk is **ownership-blind**: pooled blocks are fetchable from any
@@ -449,35 +472,33 @@ impl IndexerEntry {
     /// Two things still make the answer differ between DPs, which is what keeps
     /// the affinity signal alive:
     ///
-    /// 1. **Where the walk starts.** A DP resumes from its *own* upstream
-    ///    breakpoint, or from root when its own upstream tier matched nothing.
-    ///    HBM is device memory and is *not* fetchable across nodes, so only the
-    ///    DP that holds those blocks can use them to bridge a gap in the pooled
-    ///    chain — a DP whose HBM covers the gap reaches further than one whose
-    ///    HBM does not.
+    /// 1. **Where the walk starts.** Every DP gets the walk from position 0, and
+    ///    a DP whose own upstream tier reaches further also gets a walk from
+    ///    there. HBM is device memory and is *not* fetchable across nodes, so
+    ///    only the DP that holds those blocks can use them to bridge a gap in
+    ///    the pooled chain.
     /// 2. **How the span is attributed.** The exclusive partition credits
     ///    `[0, npu_end)` to NPU (local, free) and the remainder to CPU/Disk
     ///    (fetched, transfer cost), so `kv_affinity.w_cpu` / `w_disk` are the
     ///    knob for "prefer the node that already has it locally".
     ///
-    /// The root walk is ownership-blind and therefore identical for every DP, so
-    /// it is computed once and reused.
+    /// The walk from position 0 is ownership-blind and therefore identical for
+    /// every DP, so it is computed once and reused.
     fn lower_tier_lookup(
         &self,
-        block_hashes: &[LocalBlockHash],
+        prefix_chain: &[PrefixChainHash],
         upstream_breaks: &[TierBreakpoint],
         tiers: &LowerTierIndexer,
         medium: StorageMedium,
         known_dps: &FxHashSet<(String, DpRank)>,
         sink: &mut MatchSink<'_>,
     ) -> Vec<TierBreakpoint> {
-        if block_hashes.is_empty() || known_dps.is_empty() {
+        if prefix_chain.is_empty() || known_dps.is_empty() {
             return Vec::new();
         }
 
-        // Same for everyone — one walk, reused for every DP below. The chain of
-        // block identities comes along so each DP can ask which of them it owns.
-        let root_chain = tiers.reachable_chain(block_hashes, 0, None);
+        // Same for everyone — one walk, reused for every DP below.
+        let from_root = tiers.reachable_span(prefix_chain, 0);
 
         // One breakpoint per DP, keeping the farthest.
         //
@@ -489,41 +510,29 @@ impl IndexerEntry {
         //
         // The key deliberately omits `backend_id`, which is what collapses
         // those duplicates onto one DP.
-        let mut own_break: FxHashMap<(String, DpRank), &TierBreakpoint> = FxHashMap::default();
+        let mut own_break: FxHashMap<(String, DpRank), usize> = FxHashMap::default();
         for b in upstream_breaks {
             let slot = own_break
                 .entry((b.instance_id.clone(), b.dp_rank))
-                .or_insert(b);
-            if slot.end_pos < b.end_pos {
-                *slot = b;
-            }
+                .or_insert(b.end_pos);
+            *slot = (*slot).max(b.end_pos);
         }
 
         let mut breaks = Vec::new();
         for dp in known_dps {
             let (instance_id, dp_rank) = dp;
 
-            // Own breakpoint beats the shared root walk when it reaches further.
-            let mut best = root_chain.as_ref();
+            // Resuming after the DP's own upstream coverage beats the shared
+            // walk from position 0 when it reaches further.
             let resumed = own_break
                 .get(dp)
-                .and_then(|b| tiers.reachable_chain(block_hashes, b.end_pos, Some(b.last_seq)));
-            if let Some(reached) = &resumed {
-                let farther = match best {
-                    Some(current) => reached.hit.end_pos() >= current.hit.end_pos(),
-                    None => true,
-                };
-                if farther {
-                    best = Some(reached);
-                }
-            }
-
-            let Some(reached) = best else {
-                continue;
+                .and_then(|&end_pos| tiers.reachable_span(prefix_chain, end_pos));
+            let reached = match (from_root, resumed) {
+                (Some(root), Some(resumed)) if resumed.end_pos() >= root.end_pos() => resumed,
+                (Some(root), _) => root,
+                (None, Some(resumed)) => resumed,
+                (None, None) => continue,
             };
-            if reached.hit.count == 0 {
-                continue;
-            }
 
             let worker = WorkerKey {
                 instance_id: instance_id.clone(),
@@ -532,7 +541,7 @@ impl IndexerEntry {
                 medium,
             };
 
-            // Blocks before this position are already covered by a
+            // Positions before this one are already covered by a
             // higher-priority medium and need no fetch, so they are excluded
             // from the local count — which is what makes it comparable with this
             // tier's exclusive block count.
@@ -541,25 +550,24 @@ impl IndexerEntry {
                 StorageMedium::Disk => ends.npu.max(ends.cpu),
                 _ => ends.npu,
             } as usize;
-            let local = tiers.count_owned(&worker, reached.blocks_from(exclusive_from));
+            let exclusive_from = exclusive_from.clamp(reached.start_pos, reached.end_pos());
+            let local =
+                tiers.count_owned(&worker, &prefix_chain[exclusive_from..reached.end_pos()]);
 
-            sink.overlap.add_blocks(worker, reached.hit.count as u32);
+            sink.overlap.add_blocks(worker, reached.count as u32);
             Self::note_medium_end(
                 sink.medium_ends,
                 instance_id,
                 *dp_rank,
                 medium,
-                reached.hit.end_pos() as u32,
+                reached.end_pos() as u32,
             );
             Self::note_local_hits(sink.medium_ends, instance_id, *dp_rank, medium, local);
-            if let Some(last_seq) = reached.hit.last_matched_hash {
-                breaks.push(TierBreakpoint {
-                    instance_id: instance_id.clone(),
-                    dp_rank: *dp_rank,
-                    end_pos: reached.hit.end_pos(),
-                    last_seq,
-                });
-            }
+            breaks.push(TierBreakpoint {
+                instance_id: instance_id.clone(),
+                dp_rank: *dp_rank,
+                end_pos: reached.end_pos(),
+            });
         }
 
         breaks
@@ -626,6 +634,117 @@ impl IndexerEntry {
             matched
         };
         matched
+    }
+
+    // -----------------------------------------------------------------------
+    // Placing pooled blocks in content space
+    // -----------------------------------------------------------------------
+
+    /// Content position of an engine `block_hash`, or `None` when the conductor
+    /// cannot tell which prefix it sits at.
+    ///
+    /// Sources, in order: a block already indexed (HBM path or either pooled
+    /// medium), then the offload / retained-content caches — walking their
+    /// `parent_hash` links, which is what lets a multi-chunk offload chain be
+    /// placed before any of it has been confirmed by the pool.
+    fn prefix_chain_of(&self, block_hash: u64) -> Option<PrefixChainHash> {
+        if let Some(chain) = self.indexed_prefix_chain_of(block_hash) {
+            return Some(chain);
+        }
+
+        let mut pending: Vec<LocalBlockHash> = Vec::new();
+        let mut anchor = None;
+        {
+            let state = self.offload_pool_state.read();
+            let mut cursor = block_hash;
+            loop {
+                let Some(content) = state.cached_content(cursor) else {
+                    anchor = Some(cursor);
+                    break;
+                };
+                if pending.len() >= MAX_OFFLOAD_CHAIN_WALK {
+                    return None;
+                }
+                pending.push(LocalBlockHash(content.tokens_hash));
+                match content.parent_hash {
+                    Some(parent) => cursor = parent,
+                    None => break,
+                }
+            }
+        }
+
+        let mut chain = match anchor {
+            None => PREFIX_CHAIN_ROOT,
+            // Nothing at all is known about this hash.
+            Some(unknown) if unknown == block_hash => return None,
+            Some(unknown) => self.indexed_prefix_chain_of(unknown)?,
+        };
+        for tokens_hash in pending.into_iter().rev() {
+            chain = extend_prefix_chain(chain, tokens_hash);
+        }
+        Some(chain)
+    }
+
+    /// Content position of a block that is already in one of the indexes.
+    fn indexed_prefix_chain_of(&self, block_hash: u64) -> Option<PrefixChainHash> {
+        let seq = SequenceBlockHash(block_hash);
+        let node = self
+            .lookups
+            .read()
+            .values()
+            .find_map(|lookup| lookup.get(&seq).cloned());
+        if let Some(node) = node {
+            return Some(node.read().prefix_chain);
+        }
+        self.cpu_tiers
+            .prefix_chain_of(block_hash)
+            .or_else(|| self.disk_tiers.prefix_chain_of(block_hash))
+    }
+
+    /// Place a pooled store event's blocks at their content positions.
+    ///
+    /// Returns empty when the event's parent cannot be placed: every block in
+    /// the chain hangs off it, and indexing them at a guessed prefix would
+    /// report cache hits for content the pool does not have. Such an event is
+    /// counted in [`Self::unanchored_pooled_blocks`] so the drop is visible.
+    fn resolve_pooled_blocks(&self, store_data: &KvCacheStoreData) -> Vec<PooledBlock> {
+        let mut chain = match store_data.parent_hash {
+            None => PREFIX_CHAIN_ROOT,
+            Some(parent) => match self.prefix_chain_of(parent) {
+                Some(chain) => chain,
+                None => {
+                    let dropped = store_data.blocks.len();
+                    self.unanchored_pooled_blocks
+                        .fetch_add(dropped as u64, Ordering::Relaxed);
+                    tracing::debug!(
+                        parent_hash = parent,
+                        num_blocks = dropped,
+                        reason = "parent_prefix_unknown",
+                        "kv_event unanchored"
+                    );
+                    return Vec::new();
+                }
+            },
+        };
+
+        let mut placements = Vec::with_capacity(store_data.blocks.len());
+        let mut parent_hash = store_data.parent_hash;
+        for block in &store_data.blocks {
+            chain = extend_prefix_chain(chain, LocalBlockHash(block.tokens_hash));
+            placements.push(PooledBlock {
+                block_hash: SequenceBlockHash(block.block_hash),
+                prefix_chain: chain,
+                parent_hash,
+                tokens_hash: block.tokens_hash,
+            });
+            parent_hash = Some(block.block_hash);
+        }
+        placements
+    }
+
+    /// Pooled blocks dropped because their prefix could not be placed.
+    pub fn unanchored_pooled_blocks(&self) -> u64 {
+        self.unanchored_pooled_blocks.load(Ordering::Relaxed)
     }
 
     /// Resolve `(parent_hash, tokens_hash)` from offload / retained content.
@@ -887,12 +1006,16 @@ impl IndexerEntry {
                         let lookup = lookups.entry(worker.clone()).or_default();
                         self.hbm_tree.apply_store(worker, lookup, store_data)
                     }
-                    StorageMedium::Cpu => {
-                        self.cpu_tiers.store_blocks(worker, store_data);
-                        Ok(())
-                    }
-                    StorageMedium::Disk => {
-                        self.disk_tiers.store_blocks(worker, store_data);
+                    StorageMedium::Cpu | StorageMedium::Disk => {
+                        // Pooled blocks are keyed by content position, which has
+                        // to be resolved from the engine's `parent_hash` first.
+                        let placements = self.resolve_pooled_blocks(store_data);
+                        let tiers = if worker.medium == StorageMedium::Cpu {
+                            &self.cpu_tiers
+                        } else {
+                            &self.disk_tiers
+                        };
+                        tiers.store_blocks(worker, &placements);
                         Ok(())
                     }
                 }
@@ -1221,6 +1344,7 @@ impl Indexer {
                     tenant_id: key.tenant_id.clone(),
                     worker_count: value.worker_keys().len(),
                     total_blocks: value.total_blocks(),
+                    unanchored_pooled_blocks: value.unanchored_pooled_blocks(),
                 }
             })
             .collect()
@@ -1239,6 +1363,9 @@ pub struct IndexerSummary {
     pub tenant_id: String,
     pub worker_count: usize,
     pub total_blocks: usize,
+    /// Pooled blocks the index had to drop because their prefix could not be
+    /// placed. Non-zero means query results under-report pooled coverage.
+    pub unanchored_pooled_blocks: u64,
 }
 
 #[cfg(test)]

@@ -154,16 +154,22 @@ Engine Worker           Pool Master               KV Conductor
       │                      │                      │   tier remove) -> Disk index
 ```
 
-- **索引结构**：`LowerTierIndexer`，按 `(parent_seq_hash, tokens_hash)` 记录 continuation edge
+- **索引结构**：`LowerTierIndexer`，池化块按 `PrefixChainHash` 落位——`tokens_hash` 的滚动前缀
+  哈希（`chain(i) = fold(chain(i-1), tokens_hash(i))`），只由 token 内容决定
+- **为什么不用引擎的 `block_hash`**：vLLM 未固定 `PYTHONHASHSEED` 时 `NONE_HASH` 每进程随机，
+  同一份内容在不同引擎里编号完全不同。池化块是跨引擎共享的，按引擎私有链建边会把一份池化前缀
+  拆成互不连通的多条链：先写者独占根边、后来者被拒，走查只能沿先写者那条走，量到的往往是别人
+  留下的一小段。按内容落位后，多个引擎的同一份前缀合并成一条链，彼此都算 owner
 - **走查忽略 owner**：池化块通过后端传输协议（`device_rdma` / `device_sdma` / `device_urma`，见
   `mmc-local-*.conf` 的 `ock.mmc.local_service.protocol`）**任意节点可取**，所以别的 DP 持有的块
-  同样能让本 DP 跳过重算。走查只在**边不存在**时停止，不因为边属于别人而停
+  同样能让本 DP 跳过重算。走查只在**该位置没有任何副本**时停止，不因为副本属于别人而停
 - **每个 DP 报的是"我能免重算地服务多长前缀"**，不是"我本地有多长"
 
 那为什么各 DP 的结果还会不同?两处:
 
-1. **起点是 per-DP 的**。每个 DP 从**自己的**上层断点续接;自己上层没命中就从 root 走。
-   **HBM 是设备显存、跨节点取不到**,所以只有持有那些块的 DP 能用它们跨过池链中的缺口
+1. **起点是 per-DP 的**。所有 DP 都会走一遍位置 0 起的池链;自己上层断点更远的 DP 额外从断点
+   再走一遍，取终点更远者。**HBM 是设备显存、跨节点取不到**,所以只有持有那些块的 DP 能用它们
+   跨过池链中的缺口
 2. **归属是 per-DP 的**。互斥切分把 `[0, npu_end)` 记为 NPU(本地、免费)、其余记为 CPU/Disk
    (需搬运),于是 `kv_affinity.w_cpu` / `w_disk` 就是"优先选本地已有的节点"这个旋钮
 
@@ -184,9 +190,13 @@ Engine Worker           Pool Master               KV Conductor
   「`[0, 终点)` 对该 DP 都可用」；这只有在 `[0, 起点)` 由该 DP **自己的**上层介质覆盖时才成立
   （上层是 HBM，取不到别人的）。若允许借用其他 DP 的断点，只持有中间段的 worker 会跨过自己
   取不到的空洞谎报前缀
-- **所有已知 DP 都参与**：本地什么都没有的 DP 也能从池子取,因此同样会得到 root 走查的结果——
+- **所有已知 DP 都参与**：本地什么都没有的 DP 也能从池子取,因此同样会得到位置 0 起的走查结果——
   否则会高估它的 prefill 代价。「已知」指该索引见过其事件的 DP
-- **连续匹配**：走到第一个缺失边即停；候选（root + 自己的断点）取绝对终点最远者
+- **连续匹配**：走到第一个没有池化副本的位置即停；候选（位置 0 + 自己的断点）取绝对终点最远者
+- **定位不了前缀的池化块会被丢弃并计数**：事件里的 `parent_hash` 需要能解析成内容位置（顺序为
+  HBM 节点 → 池化反查表 → offload/content 缓存链）。解析不出来时宁可不收，避免把块记在错误的
+  前缀上谎报命中；丢弃量累计在 `GET /workers` 的 `unanchored_pooled_blocks`，非 0 说明池子里有
+  索引报不出来的内容
 - **content 保留**：pool 确认后始终保留 `(tokens_hash, parent_hash)`（无需配置），跨 tier 移除存活，CPU 已驱逐后、保留窗口（300s TTL）内仍可解析 Disk store；窗口关闭自动清除，内存有界（条目为 tier 数据拷贝 + 短暂迁移残留）。未确认的 offload **无 TTL、无硬容量上限**，随未确认块增长，仅在匹配成功或引擎驱逐时清除
 
 各后端的 CPU/Disk 适配差异：

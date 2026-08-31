@@ -119,6 +119,9 @@ Two distinct hash types serve different purposes:
 |------|------|-----------|
 | `LocalBlockHash(u64)` | XXH3 of token bytes in a block | Content-addressed radix tree key | Primary — determines tree position |
 | `SequenceBlockHash(u64)` | Engine-provided rolling hash (includes parent context) | Reverse lookup by engine sequence hash | Secondary — stored in `Block.block_hash` for O(1) removal |
+| `PrefixChainHash(u64)` | Conductor's rolling fold over `LocalBlockHash` values | Pooled (CPU/Disk) index key; also cached on each HBM node as `Block.prefix_chain` | Identifies "this block reached through exactly this prefix", identically for every engine |
+
+`SequenceBlockHash` is **engine-private** — never use it as a shared identity across instances.
 
 `block_size` is passed by the caller per-query, not stored in the tree. Hashes computed at different `block_size` values coexist safely — they are distinct `u64` values. **The Coordinator must use the same `block_size` the engine uses for KV event publishing.**
 
@@ -179,16 +182,20 @@ Each `Block` node:
 
 **Memory reclamation:** When the last worker is removed from a block, `drop_worker()` clears `self.children` so the subtree is dropped. Orphan nodes (from worker disconnection) are cleaned up by `sweep_stale_nodes()` triggered every 1000 HBM removals.
 
-### CPU/Disk: FxHashMap (Flat)
+### CPU/Disk: position map keyed by content prefix chain
 
-**Why flat:** Pool blocks (CPU/Disk) are isolated single blocks — there is no chain relationship between consecutive blocks. The only question is "does any worker have this block cached?" A flat `tokens_hash → {workers}` map suffices and avoids tree overhead.
+**Why not a tree:** pooled block counts dwarf HBM (tens of millions), so a materialised trie is too expensive. One `FxHashMap<PrefixChainHash, Owners>` is enough, because the key already encodes the whole prefix:
 
-```rust
-cpu_blocks:  Arc<RwLock<FxHashMap<LocalBlockHash, FxHashSet<WorkerKey>>>>
-disk_blocks: Arc<RwLock<FxHashMap<LocalBlockHash, FxHashSet<WorkerKey>>>>
+```text
+chain(i) = fold(chain(i-1), tokens_hash(i)),  chain(-1) = PREFIX_CHAIN_ROOT
+positions: chain(i) → {owner workers}     // Owners::One / Owners::Many
 ```
 
-**Parallel optimization:** When query hashes exceed `FLAT_PAR_THRESHOLD` (4096), CPU and Disk lookups run in parallel via `rayon::join`.
+A query recomputes `chain[]` from its own token sequence (`compute_prefix_chain_for_seq`) and walks positions until one has no pooled replica. Contiguity is guaranteed by construction, and a walk can start at any absolute position — no engine-supplied anchor.
+
+**Why content, not the engine's `block_hash`:** vLLM seeds its rolling `block_hash` chain with a per-process random `NONE_HASH` unless `PYTHONHASHSEED` is pinned, so the same content is numbered differently by every engine. Pooled blocks are shared across engines. Keying edges on `(parent_seq_hash, tokens_hash)` (the pre-2026-08 design) therefore split one pooled prefix into disconnected per-engine chains: the first writer owned the root edge, a second engine's differing child hash was rejected and its whole chain left dangling, and mid-sequence offload fragments were unreachable by anyone. Symptom in production: HBM matched 94 blocks while every DP reported the same 896-token pooled hit. See `bug-fix-history/kv_conductor/pooled-index-engine-hash-keys.md`.
+
+**Placing an event:** `IndexerEntry::resolve_pooled_blocks` turns the event's `parent_hash` into a content position, trying the HBM node's `prefix_chain`, then each pooled tier's reverse index, then the `offload` / `content` caches (walking their `parent_hash` links). When none resolves, the blocks are dropped and counted in `unanchored_pooled_blocks` (exposed by `GET /workers`) rather than indexed at a guessed prefix.
 
 ### Scoring Model
 

@@ -54,3 +54,4 @@
 | 2026-08-24 | coordinator | 实例注册接受 ID 碰撞和不完整引擎就绪 | [instance-registration-validation.md](coordinator/instance-registration-validation.md) | CRC32 collision, instance ID, Endpoint extra fields, empty models |
 | 2026-08-24 | coordinator | Coordinator models 与 domain 包循环导入 | [domain-model-circular-import.md](coordinator/domain-model-circular-import.md) | circular import, domain __init__, models.request, lazy exports |
 | 2026-08-25 | controller | 增量实例刷新失败后未及时收敛 | [incremental-refresh-set-fallback.md](controller/incremental-refresh-set-fallback.md) | EventPusher, incremental refresh, SET reconciliation, fingerprint |
+| 2026-08-31 | kv_conductor | 池化索引按引擎私有 block_hash 建边，CPU 命中被外来短链截断 | [pooled-index-engine-hash-keys.md](kv_conductor/pooled-index-engine-hash-keys.md) | lower_tier, PrefixChainHash, cpu_blocks 偏低, PYTHONHASHSEED, NONE_HASH |

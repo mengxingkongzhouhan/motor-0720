@@ -818,6 +818,24 @@ impl IndexerEntry {
         state.offload.len() + state.pending_pool.len() + state.content.len()
     }
 
+    /// Per-medium tree sizes plus two-phase matching cache sizes.
+    ///
+    /// `(hbm, cpu, disk, offload, pending_pool, content)`. Used by `/stats`
+    /// so a dump can answer "is the CPU hole missing index entries or still
+    /// sitting in pending_pool?" without grepping event traces.
+    pub fn cache_breakdown(&self) -> (usize, usize, usize, usize, usize, usize) {
+        let hbm = self.lookups.read().values().map(|l| l.len()).sum();
+        let state = self.offload_pool_state.read();
+        (
+            hbm,
+            self.cpu_tiers.total_blocks(),
+            self.disk_tiers.total_blocks(),
+            state.offload.len(),
+            state.pending_pool.len(),
+            state.content.len(),
+        )
+    }
+
     /// Sweep stale matching-cache entries that exceed
     /// their TTLs, returning the total number of entries evicted.
     ///
@@ -858,9 +876,15 @@ impl IndexerEntry {
         });
         let expired_pending = before_pending - state.pending_pool.len();
         if expired_pending > 0 {
-            tracing::debug!(
+            // Pool-first events wait only `pending_ttl` (default 60s). If the
+            // matching vLLM offload is later than that, the block never
+            // enters the CPU index — the same symptom as a truncated root
+            // walk. This used to be debug-only and disappeared from
+            // production dumps.
+            tracing::info!(
                 expired = expired_pending,
                 pending_ttl_secs = pending_ttl.as_secs(),
+                remaining_pending_keys = state.pending_pool.len(),
                 "kv_event pending_expired"
             );
         }
@@ -1238,11 +1262,19 @@ impl Indexer {
             .map(|entry| {
                 let key = entry.key();
                 let value = entry.value();
+                let (hbm_blocks, cpu_blocks, disk_blocks, offload, pending_pool, content) =
+                    value.cache_breakdown();
                 IndexerSummary {
                     model_name: key.model_name.clone(),
                     tenant_id: key.tenant_id.clone(),
                     worker_count: value.worker_keys().len(),
                     total_blocks: value.total_blocks(),
+                    hbm_blocks,
+                    cpu_blocks,
+                    disk_blocks,
+                    offload,
+                    pending_pool,
+                    content,
                 }
             })
             .collect()
@@ -1261,6 +1293,15 @@ pub struct IndexerSummary {
     pub tenant_id: String,
     pub worker_count: usize,
     pub total_blocks: usize,
+    pub hbm_blocks: usize,
+    pub cpu_blocks: usize,
+    pub disk_blocks: usize,
+    /// Unconfirmed engine offloads waiting for a pool stored event.
+    pub offload: usize,
+    /// Pool-first hashes waiting for a vLLM offload (default TTL 60s).
+    pub pending_pool: usize,
+    /// Confirmed content retained for a later pool medium.
+    pub content: usize,
 }
 
 #[cfg(test)]

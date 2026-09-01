@@ -505,9 +505,10 @@ impl IndexerEntry {
 
             // Own breakpoint beats the shared root walk when it reaches further.
             let mut best = root_chain.as_ref();
-            let resumed = own_break
-                .get(dp)
-                .and_then(|b| tiers.reachable_chain(block_hashes, b.end_pos, Some(b.last_seq)));
+            let own = own_break.get(dp).copied();
+            let resumed =
+                own.and_then(|b| tiers.reachable_chain(block_hashes, b.end_pos, Some(b.last_seq)));
+            let mut selected_source = if best.is_some() { "root" } else { "none" };
             if let Some(reached) = &resumed {
                 let farther = match best {
                     Some(current) => reached.hit.end_pos() >= current.hit.end_pos(),
@@ -515,8 +516,29 @@ impl IndexerEntry {
                 };
                 if farther {
                     best = Some(reached);
+                    selected_source = "breakpoint";
                 }
             }
+
+            // Print both candidates even when neither matches. This makes a
+            // lower-tier hole directly visible: root_end shows where the pool
+            // prefix stops, while breakpoint_end shows whether this DP's own
+            // HBM/CPU coverage can bridge that hole.
+            tracing::info!(
+                instance_id = %instance_id,
+                dp_rank,
+                medium = %medium.log_str(),
+                breakpoint_kind = if medium == StorageMedium::Cpu { "hbm" } else { "hbm_or_cpu" },
+                root_count = ?root_chain.as_ref().map(|r| r.hit.count),
+                root_end = ?root_chain.as_ref().map(|r| r.hit.end_pos()),
+                breakpoint_start = ?own.map(|b| b.end_pos),
+                breakpoint_parent = ?own.map(|b| b.last_seq.0),
+                breakpoint_count = ?resumed.as_ref().map(|r| r.hit.count),
+                breakpoint_end = ?resumed.as_ref().map(|r| r.hit.end_pos()),
+                selected_source,
+                selected_end = ?best.map(|r| r.hit.end_pos()),
+                "lower_tier query candidates"
+            );
 
             let Some(reached) = best else {
                 continue;

@@ -21,8 +21,8 @@
        |                │    │  HBM Tree    │  │  CPU/Disk    ││
    Coordinator          │    │ (RadixTree)  │  │ (LowerTier)  ││
        |                │    │              │  │              ││
-       |  200 OK        │    │ prefix chain │  │ prefix-chain ││
-       <----------------│    │ matched      │  │ positions    ││
+       |  200 OK        │    │ prefix chain │  │ continuation ││
+       <----------------│    │ matched      │  │ edges        ││
                         │    │ block counts │  │ matched      ││
                         │    └──────────────┘  │ block counts ││
                         │                      └──────────────┘│
@@ -37,7 +37,7 @@
 | Worker Registry | `registry.rs` | 注册/注销，事件/查询路由，ZMQ 订阅管理 |
 | Indexer | `indexer/mod.rs` | Per-(model, tenant) 索引生命周期、两阶段缓存、三层匹配聚合与维护 |
 | HBM Tree | `concurrent_tree.rs` | 并发 Radix Tree，前缀链匹配 |
-| CPU/Disk Index | `lower_tier.rs` | 按内容前缀哈希落位的池化块索引，位置 0 走查 + 断点续查 |
+| CPU/Disk Index | `lower_tier.rs` | Continuation-edge 图，断点续查 + root 走查 |
 | Hashing | `hashing.rs` | XXH3 token → LocalBlockHash |
 | Backend | `backend.rs` | 多后端适配（Mooncake/Memcache/YuanRong） |
 | ZMQ | `zmq_subscriber.rs` | ZMQ SUB 事件接入 |
@@ -84,8 +84,8 @@ Coordinator 调度器（`kv_cache_affinity`）按 `*_blocks` 与配置项
    └─────────────────────────────────────────────────────┘
 ```
 
-- 下层介质对每个 DP **无条件从位置 0 走查**；上层断点更远的 DP 额外从断点再走一遍（断点不跨 DP 共享），取绝对终点最远者（如实报告更长副本）
-- HBM 是前缀树（从 root 走）；CPU/Disk 是按内容前缀哈希索引的位置集合（位置 0 走查 + 断点续查）
+- 上层介质命中后，下层介质**从本 DP 自己的上层断点续查**（断点不跨 DP 共享）；同时对拥有首边的 worker **无条件 root 走查**，与续接链并列，取绝对终点最远者（如实报告更长副本）
+- HBM 是前缀树（从 root 走）；CPU/Disk 是 continuation-edge 图（断点续查 + root 走查）
 - 同一 `(instance_id, dp_rank)` 的跨介质命中在响应中聚合到同一个 DP 条目
 
 ### HBM 索引：ConcurrentRadixTree
@@ -133,67 +133,47 @@ HBM 使用前缀链 Radix Tree，每个节点以 `LocalBlockHash`（XXH3 token-c
 
 ### CPU/Disk 索引：LowerTierIndexer
 
-CPU/DISK 不使用完整 RadixTree，而是把每个池化块登记在它的**内容前缀位置**上：
+CPU/DISK 不使用完整 RadixTree，而是轻量的 **continuation-edge 图**：
 
 ```text
-  PrefixChainHash: chain(i) = fold(chain(i-1), tokens_hash(i)),  chain(-1) = ROOT
+  TransitionKey: (parent_seq_hash, local_hash) -> child_seq_hash
 
-  positions: chain(i) -> {owner workers}
-
-  Example (query [H0, H1, H2]):
-    chain0 = fold(ROOT,   H0)   -> {inst-a/dp0, inst-a/dp1}
-    chain1 = fold(chain0, H1)   -> {inst-a/dp0, inst-a/dp1}
-    chain2 = fold(chain1, H2)   -> {inst-b/dp0}
+  Example:
+    (None,    H0)  --> seq100    <- from root
+    (seq100,  H1)  --> seq200    <- continue
+    (seq200,  H2)  --> seq300    <- continue
 ```
 
 **为什么不用 RadixTree？**
 
 - CPU/Disk block 数量远大于 HBM（可能千万级），完整树内存开销过大
-- 一层 `chain → owners` 哈希表就够：`chain` 本身已经编码了整条前缀，
-  查询侧从自己的 token 序列直接算出每个位置的 `chain`，逐位查表到第一个缺失即停，
-  连续性由构造保证，不需要物化前缀树，也不需要引擎给锚点
+- Continuation-edge 图只存 `(parent, local_hash) → child` 边，内存高效；首边
+  `(None, H₀)` 即 root 入口，断点处的边则可直接续接，无需物化整棵前缀树
+- 查询时对拥有首边的 worker **无条件做 root 走查**，并与上游断点续查并列，
+  每 worker 取绝对终点最远者——更长副本不被上游较短命中掩盖（旧 `skip_root`
+  语义已弃用，见下文「匹配逻辑与查询流程」）
+- 边以 `(parent_seq_hash, tokens_hash)` 双键定位——`parent_hash` 保证续接自正确的
+  上游块，`tokens_hash` 保证命中相同内容（见 commit 29157f9）
 
-**为什么按内容而不是按引擎的 `block_hash`？**
+**边所有权**：每条边有一个或多个 owner Worker（`Single` / `Multi` 双形态存储），
+同一 block 被多个 Worker 共享时边自动升级为 `Multi`。查询要求走查路径上**每个 block
+都由该 Worker 持有**——与 HBM 树的"Worker 集合逐层求交"语义一致。
 
-vLLM 的 `block_hash` 是引擎私有的滚动哈希：未固定 `PYTHONHASHSEED` 时 `NONE_HASH`
-每进程随机，同一份内容在不同引擎里编号完全不同。池化块是跨引擎共享的，按
-`(parent_seq_hash, tokens_hash)` 建边会导致：
-
-- 根边 `(None, H₀)` 先写者独占，后来引擎对同一内容给出的 child 不同而被拒，它那条
-  链整条悬空；从位置 0 走查只能沿先写者的哈希空间前进
-- 中途 offload 的片段锚在引擎私有的 parent 上，除非该引擎自己从 0 号位起的整条链都在池中，
-  否则任何 DP 都走不到
-- 于是"HBM 命中 94 块、池化只报 7 块"这种明显不对的结果会稳定出现（见回归测试
-  `test_pooled_prefix_is_not_truncated_by_a_shorter_foreign_chain`）
-
-按 `PrefixChainHash` 落位后，同一份前缀在所有引擎里落在同一批位置：副本自动去重合并，
-彼此都算 owner，片段按内容拼接。与 HBM 树一样，它忽略 vLLM 的 `extra_keys`
-（LoRA / 多模态 / cache salt）。
-
-**位置所有权**：每个位置有一个或多个 owner Worker（`One` / `Many` 双形态存储，
-省掉单 owner 的集合分配）。走查**不校验 owner**（池化块任意节点可取），owner 只用来把
-命中拆成本地/远端。
-
-**事件侧落位**：事件里的 `parent_hash` 需要解析成内容位置，顺序为 HBM 节点上记录的
-`prefix_chain` → 池化反查表 → offload/content 缓存链（沿 `parent_hash` 回溯，
-这样多段 offload 链在任何一段被 pool 确认之前也能定位）。解析不出来时该事件的块被丢弃
-并计入 `unanchored_pooled_blocks`（`GET /workers` 暴露），而不是记在猜测的前缀上。
-
-**续查语义**（位置 0 走查与断点续查并列，取绝对终点最远者）：
+**续查语义**（断点续查与 root 走查并列，取绝对终点最远者）：
 
 ```text
-  query: [H0, H1, H2, H3, H4]  ->  chain0..chain4
-  HBM tree returns: W1 depth=2
+  query: [H0, H1, H2, H3, H4]
+  HBM tree returns: W1 depth=2, last_seq=seq200
 
-  Candidate a) resume from position 2:
+  Candidate a) breakpoint resume from (seq200, H2):
     // only granted to W1's own (instance_id, dp_rank)
-    chain2 present  OK
-    chain3 present  OK
-    chain4 missing  -> stop
+    edge(seq200, H2) -> seq300  OK
+    edge(seq300, H3) -> seq400  OK
+    edge(seq400, H4) -> ???     MISSING -> stop
     -> absolute end = 4
 
-  Candidate b) walk from position 0 (always, shared by every DP):
-    chain0 -> ... walk until the first position with no pooled replica
+  Candidate b) root walk (always, if W1 owns edge (None, H0)):
+    edge(None, H0) -> ... walk until first missing edge
     -> compare with a); keep farther absolute end
 
   Absolute ends: npu_end=2, cpu_end=<farthest absolute end>
@@ -206,40 +186,39 @@ vLLM 的 `block_hash` 是引擎私有的滚动哈希：未固定 `PYTHONHASHSEED
 
 池化块通过后端传输协议（`device_rdma` / `device_sdma` / `device_urma`，见
 `mmc-local-*.conf` 的 `ock.mmc.local_service.protocol`）**任意节点可取**，所以别的 DP
-持有的块同样能让本 DP 跳过重算。下层走查因此**不校验 owner**，只在某个位置没有任何池化副本
-时停止。
+持有的块同样能让本 DP 跳过重算。下层走查因此**不校验 owner**，只在边不存在时停止。
 
 **关键的介质不对称**：
 
 | 介质 | 跨节点可取? | 走查语义 |
 |------|------------|---------|
 | HBM | ❌ 设备显存，取不到别人的 | `find_matches_detailed` 逐层求交，**严格按 owner** |
-| CPU / Disk | ✅ 池化，任意节点可取 | `reachable_span` **忽略 owner** |
+| CPU / Disk | ✅ 池化，任意节点可取 | `reachable_from` **忽略 owner** |
 
 那各 DP 的结果凭什么还不同?两处，都是 per-DP 的：
 
-1. **走查起点**。所有 DP 都走一遍位置 0 起的池链；自己上层断点更远的 DP 额外从断点再走一遍。
-   因为 HBM 取不到别人的，只有持有那些块的 DP 能用它们跨过池链中的缺口。
+1. **走查起点**。每个 DP 从**自己的**上层断点续接；自己上层没命中就从 root 走。因为 HBM
+   取不到别人的，只有持有那些块的 DP 能用它们跨过池链中的缺口。
 2. **归属切分**。互斥切分把 `[0, npu_end)` 记为 NPU（本地、免费）、其余记为 CPU/Disk
    （需搬运），于是 `kv_affinity.w_cpu` / `w_disk` 成为"优先选本地已有的节点"的旋钮。
 
 ```text
-  池链: [0,2) 存在，位置 2 缺失，[3,5) 存在
+  池链: [0,2) 存在，位置 2 缺失，[3,5) 锚在位置 2 的 block_hash 之后
   inst-a HBM: [0,3)     inst-b DRAM: [0,2) 与 [3,5)
 
-  inst-a: 自己断点 pos=3 -> reachable_span(chain, 3) -> 取到 inst-b 的 [3,5) -> 终点 5
+  inst-a: 自己断点 pos=3 -> reachable_from(3, seq102) -> 取到 inst-b 的 [3,5) -> 终点 5
           npu_blocks=3（本地）+ cpu_blocks=2（搬运）= 5 块
-  inst-b: 无 HBM 命中 -> 位置 0 走查 -> [0,2) 后位置 2 缺失 -> 终点 2
+  inst-b: 无 HBM 命中 -> root 走查 -> [0,2) 后位置 2 缺失 -> 终点 2
           npu_blocks=0 + cpu_blocks=2 = 2 块
 
   => inst-a 靠自己的 HBM 桥接缺口而走得更远；亲和信号未被抹平
 ```
 
-**断点仍只归产生它的 DP**：若允许借用别的 DP 的断点，只持有中间段的 worker 会跨过自己
-**取不到**的空洞谎报前缀——因为空洞那一段在别人的 HBM 里：
+**断点仍只归产生它的 DP**：`edge_owners` 返回该边的全部 owner，若允许借用别的 DP 的断点，
+只持有中间段的 worker 会跨过自己**取不到**的空洞谎报前缀——因为空洞那一段在别人的 HBM 里：
 
 ```text
-  inst-a HBM: [0,2)            -> breakpoint end_pos=2
+  inst-a HBM: [0,2)            -> breakpoint (end_pos=2, last_seq=seq200)
   inst-b DRAM: [2,3) only
 
   借用 inst-a 断点：inst-b 从 pos=2 起跑 -> 终点 3 -> npu=0, cpu=3
@@ -248,9 +227,9 @@ vLLM 的 `block_hash` 是引擎私有的滚动哈希：未固定 `PYTHONHASHSEED
     而 inst-a 从自己断点起跑、取到 inst-b 的池块 -> npu=2 + cpu=1 = 3 块（正确）
 ```
 
-位置 0 起的走查不依赖任何上层覆盖，所以「HBM 全被驱逐、池中保有完整前缀」这一池化核心场景仍能
+root 走查不依赖任何上层覆盖，所以「HBM 全被驱逐、池中保有完整根链」这一池化核心场景仍能
 如实报告。**所有已知 DP 都参与下层走查**（`known_dps()`：HBM lookups ∪ 各 tier 的
-`worker_keys()`），本地什么都没有的 DP 也能从池子取，报 0 会高估它的 prefill 代价。位置 0
+`worker_keys()`），本地什么都没有的 DP 也能从池子取，报 0 会高估它的 prefill 代价。root
 走查忽略 owner，因此对所有 DP 结果相同，只计算一次后复用。
 
 ---
@@ -496,38 +475,42 @@ downward API 把 `status.hostIP` 注入成 `HOST_IP` 环境变量（与 `POD_IP`
   │                                                          │
   │  root -> H0 -> H1 -> H2 -> (H3 missing)                  │
   │                                                          │
-  │  Result: { W1: depth 3, W2: depth 1 }                    │
+  │  Result: {                                               │
+  │    W1: PrefixMatch { depth: 3, last_seq_hash: seq300 }   │
+  │    W2: PrefixMatch { depth: 1, last_seq_hash: seq100 }   │
+  │  }                                                       │
   │  -> overlap.npu_blocks[worker] = depth                   │
   │  -> collect TierBreakpoint {instance, dp_rank,           │
-  │       end_pos: depth}                                    │
+  │       end_pos: depth, last_seq: last_seq_hash}           │
   └──────────────────────────────────────────────────────────┘
                            │
                            ▼
   ┌─ Phase 2: CPU Continuation ──────────────────────────────┐
-  │  chain = compute_prefix_chain_for_seq(hashes)            │
-  │  lower_tier_lookup(chain, hbm_breaks, cpu_tiers)         │
+  │  lower_tier_lookup(hashes, hbm_breaks, cpu_tiers)        │
   │                                                          │
-  │  Candidates per DP:                                      │
-  │    a) resume at its own end_pos (only when < N)          │
-  │    b) walk from position 0: always, shared by every      │
-  │       DP (longer pooled replicas are never masked by     │
+  │  Continuation sources:                                   │
+  │    a) breakpoint resume: edge(seq300, H3) -> ...         │
+  │       (only when end_pos < N)                            │
+  │    b) root walk: always (report first-block              │
+  │       replicas; longer replicas not masked by            │
   │       shorter upstream hits)                             │
   │                                                          │
-  │  reachable_span: walk positions until the first with     │
-  │    no pooled replica; keep the farthest absolute end     │
+  │  query_contiguous_hits: per worker, walk each            │
+  │    candidate chain (root + breakpoints); stop at         │
+  │    first missing edge; keep farthest absolute end        │
   │  -> overlap.cpu_blocks[worker] = winning length          │
-  │    (a position-0 win = full span, may overlap NPU;       │
-  │     not "tail continuation only")                        │
+  │    (root win = full span, may overlap NPU; not           │
+  │     "tail continuation only")                            │
   └──────────────────────────────────────────────────────────┘
                            │
                            ▼
   ┌─ Phase 3: Disk Continuation ─────────────────────────────┐
   │  disk_breaks = merge_tier_breakpoints(hbm_breaks,        │
   │                                      cpu_breaks)         │
-  │  # per (instance, dp_rank): keep farther end_pos         │
-  │  # -> resume from max(HBM, CPU)                          │
+  │  # per (instance, dp_rank): keep farther end_pos;        │
+  │  # prefer CPU on tie -> resume from max(HBM, CPU)        │
   │                                                          │
-  │  lower_tier_lookup(chain, disk_breaks, disk_tiers)       │
+  │  lower_tier_lookup(hashes, disk_breaks, disk_tiers)      │
   │  -> overlap.disk_blocks[worker] = winning length         │
   └──────────────────────────────────────────────────────────┘
                            │
@@ -546,26 +529,25 @@ downward API 把 `status.hostIP` 注入成 `HOST_IP` 环境变量（与 `POD_IP`
 
 ### 为什么用 "断点续查" 而不是每层独立从 root 走？
 
-| | HBM RadixTree | CPU/Disk 池化索引 |
+| | HBM RadixTree | CPU/Disk Continuation |
 |---|---|---|
-| 匹配方式 | root 出发，树遍历 | 位置查表：位置 0 起 + 自己断点起，并列候选 |
-| 缺失处理 | 第一个缺失即停 | 第一个**无池化副本的位置**即停（不因副本属于别人而停） |
+| 匹配方式 | root 出发，树遍历 | 边遍历：断点续接链 + root 链并列候选 |
+| 缺失处理 | 第一个缺失即停 | 第一个缺失**边**即停（不因边属于别人而停） |
 | 是否校验 owner | ✅ 逐层求交（HBM 跨节点取不到） | ❌ 忽略（池块任意节点可取） |
-| 位置 0 走查条件 | 总是 | **无条件**，且对所有 DP 相同（只算一次） |
+| root 走查条件 | 总是 | **无条件**，且对所有 DP 相同（只算一次） |
 | 断点作用域 | 不适用 | **仅本 `(instance_id, dp_rank)`**，不跨 DP 借用 |
 | 报的是什么 | 该 worker 本地持有的前缀 | 该 DP **能免重算服务**的前缀 |
-| 保证 | 匹配的块形成合法前缀链 | 同上：`PrefixChainHash` 本身编码整条前缀 |
+| 保证 | 匹配的块形成合法前缀链 | 与 HBM 衔接的续接链 + 本层更长副本均可如实报告 |
 
-两层都保证三层命中块是**同一条连续前缀**，与 vLLM prefix cache 的查找语义
-（NPU → CPU → Disk 依次续接）一致。位置 0 起的走查无条件并行进行，是为了发现下层更长副本
+断点续查保证三层命中块是**同一条连续前缀**，与 vLLM prefix cache 的查找语义
+（NPU → CPU → Disk 依次续接）一致。root 链无条件并行走查是为了发现下层更长根副本
 或仅下层命中；响应侧再按绝对终点做互斥切分，同前缀副本不会重复计入 `*_blocks` /
 加权 `matched_tokens`——这正是弃用旧 `skip_root` 规则的原因（旧规则只会制造低估）。
 
 ### 为什么是连续匹配而不是平铺索引？
 
-如果不做连续匹配而只用平铺 `tokens_hash → workers`（更早实现），会出现"block 0, 1, 3, 4
-命中，block 2 缺失"的虚高计数，而且同一段内容出现在不同前缀下时会互相冒认。
-`PrefixChainHash` 把整条前缀折进键里，位置查表因此天然只认同一条连续前缀。
+如果不做连续匹配而只用平铺 HashMap（更早实现），会出现"block 0, 1, 3, 4 命中，
+block 2 缺失"的虚高计数。`LowerTierIndexer` 的边图和 HBM 树遍历共同保证了连续匹配。
 
 ---
 
@@ -625,9 +607,8 @@ pub struct OffloadPoolState {
   `parent_hash` 缓存到 `offload` → 等待 Pool 确认。
 - **Phase 2 先到**：Pool store 事件到达 → 排入 `pending_pool`（按 Worker 去重）→ 等待
   引擎 offload 事件。
-- **双方到齐**：使用 block hash 关联两侧事件，取得 `tokens_hash` + `parent_hash` → 把
-  `parent_hash` 解析成内容位置、算出该块的 `PrefixChainHash` → 插入 CPU/Disk 索引，
-  同时将映射迁入 `content`。
+- **双方到齐**：使用 block hash 关联两侧事件，取得 `tokens_hash` + `parent_hash` → 构建
+  continuation edge → 插入 CPU/Disk 索引，同时将映射迁入 `content`。
 
 **content 保留（无需配置，始终生效）**：
 
@@ -642,12 +623,8 @@ pub struct OffloadPoolState {
 
 Phase 1 的 offload 事件是一条链（引擎一次 offload 多个连续块）。首个块的 parent 是
 事件携带的 `parent_block_hash`，其后每块的 parent 是链中前一个块的 `block_hash`。
-携带 parent_hash 后，Phase 2 的确认事件才能算出每个块**在序列中的真实位置**，而不是统一
-当成 0 号位——位置错了就等于把块记在了别的前缀上。
-
-解析顺序：HBM 节点上记录的 `prefix_chain` → 池化反查表 → `offload` / `content` 缓存链
-（沿 `parent_hash` 回溯，因此多段 offload 链在任何一段被 pool 确认之前也能定位）。三者都
-解析不出来时该事件的块被丢弃并计入 `unanchored_pooled_blocks`。
+携带 parent_hash 后，Phase 2 的确认事件能把每个块**从正确的父块续接**，而不是统一从
+root 挂接——否则 continuation-edge 图会丢失链式关系，CPU/Disk 断点续查无法工作。
 
 **匹配后的应用**：命中条目**逐 block** 构造 `Stored` 事件（每个 block 自带
 `parent_hash`）应用，绝不批量合并成单个 `parent_hash: None` 的事件——批量会静默丢失
@@ -756,7 +733,7 @@ Coordinator 侧通过 `kv_conductor_config.query_encoding`（默认 `"msgpack"`�
 |------|------|
 | `motor/kv_conductor/src/indexer/mod.rs` | 顶层索引、两阶段缓存和 maintenance |
 | `motor/kv_conductor/src/concurrent_tree.rs` | HBM 并发 Radix Tree |
-| `motor/kv_conductor/src/lower_tier.rs` | CPU/Disk 池化块索引（按内容前缀哈希落位） |
+| `motor/kv_conductor/src/lower_tier.rs` | CPU/Disk continuation-edge 索引 |
 | `motor/kv_conductor/src/registry.rs` | Worker 注册生命周期与 subscriber 管理 |
 | `motor/kv_conductor/src/main.rs` | CLI、后台 maintenance 和 HTTP 服务启动 |
 | `motor/kv_conductor/__init__.py` | Python 包入口，`is_available()`, `start()` |

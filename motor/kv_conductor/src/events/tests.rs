@@ -740,6 +740,96 @@ fn test_memcache_batch_parse_and_apply_ip_only() {
     }
 }
 
+/// A memcache stored event whose `backend_id` is not in `hbm_ip_index`
+/// must not enter `pending_pool`. This is the silent-drop path that made
+/// "356 parsed, N queued" look like the pool never reported those blocks.
+#[test]
+fn test_memcache_unknown_backend_id_does_not_queue() {
+    use crate::indexer::Indexer;
+    use crate::protocols::HbmIpIndex;
+
+    let indexer = Indexer::new();
+    let ip_index = HbmIpIndex::default();
+    ip_index
+        .write()
+        .entry("10.244.0.99".to_string())
+        .or_default()
+        .push(("vllm-prefill-1".to_string(), 0));
+
+    let token_ids = vec![1i64, 2, 3, 4];
+    let block_size = 4u32;
+    let hash = compute_block_hash_for_seq(&token_ids, block_size)[0].0;
+
+    let packed = rmp_serde::to_vec(&memcache_wire_batch(hash)).unwrap();
+    let parsed: MemcacheEventBatch = from_slice(&packed).unwrap();
+    let event = &parsed.events[0];
+    assert_eq!(event.backend_id.as_deref(), Some("10.244.0.5"));
+
+    apply_pool_event(
+        &indexer,
+        event,
+        "test-model",
+        "default",
+        "memcache-pool",
+        0,
+        &[StorageMedium::Npu, StorageMedium::Cpu, StorageMedium::Disk],
+        MatchMode::IpOnly,
+        &Some(ip_index),
+    )
+    .unwrap();
+
+    let entry = indexer.get_or_create("test-model", "default");
+    {
+        let state = entry.offload_pool_state.read();
+        assert!(
+            state.pending_pool.is_empty(),
+            "unknown event backend_id must not queue a pending_pool entry"
+        );
+    }
+    assert_eq!(entry.cpu_tiers.total_blocks(), 0);
+    assert_eq!(entry.pending_count(), 0);
+}
+
+/// `MatchMode::IpOnly` with no HBM IP index at all is the same drop: the
+/// event is parsed but never queued.
+#[test]
+fn test_ip_only_without_hbm_index_does_not_queue() {
+    use crate::indexer::Indexer;
+
+    let indexer = Indexer::new();
+    let store_ev = PoolEvent {
+        event_id: 1,
+        timestamp: None,
+        event_type: Some("stored".into()),
+        legacy_type: None,
+        model_name: Some("m".into()),
+        tenant_id: Some("t".into()),
+        backend_id: Some("10.0.0.1".into()),
+        medium: Some("cpu".into()),
+        dp_rank: Some(0),
+        seq_hashes: Some(vec![FlexHash(0xFEED)]),
+        block_hashes: None,
+    };
+    apply_pool_event(
+        &indexer,
+        &store_ev,
+        "m",
+        "t",
+        "memcache-pool",
+        0,
+        &[StorageMedium::Cpu],
+        MatchMode::IpOnly,
+        &None,
+    )
+    .unwrap();
+
+    let entry = indexer.get_or_create("m", "t");
+    assert!(
+        entry.offload_pool_state.read().pending_pool.is_empty(),
+        "IpOnly without hbm_ip_index must not queue"
+    );
+}
+
 #[test]
 fn test_pool_backend_remove_evicts_cache() {
     use crate::indexer::Indexer;

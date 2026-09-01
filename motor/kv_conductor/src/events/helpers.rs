@@ -40,7 +40,7 @@ pub(super) fn resolve_workers(
     target_media: &[StorageMedium],
 ) -> Vec<WorkerKey> {
     if match_mode == MatchMode::None {
-        target_media
+        return target_media
             .iter()
             .map(|&medium| WorkerKey {
                 instance_id: backend_id.to_string(),
@@ -48,8 +48,44 @@ pub(super) fn resolve_workers(
                 dp_rank,
                 medium,
             })
-            .collect()
-    } else {
-        match_mode.resolve_workers(hbm_ip_index.as_ref(), backend_id, dp_rank, target_media)
+            .collect();
     }
+
+    let workers =
+        match_mode.resolve_workers(hbm_ip_index.as_ref(), backend_id, dp_rank, target_media);
+    if workers.is_empty() {
+        // IpOnly / IpAndDpRank look up `backend_id` in `hbm_ip_index`. A miss
+        // used to return an empty worker list and let the caller skip the
+        // event with no log — identical to "the pool never reported this
+        // block", which is what made the 356-parsed vs N-queued gap
+        // impossible to explain from production logs.
+        let (index_present, indexed_ip_count, ip_known) = match hbm_ip_index.as_ref() {
+            Some(idx) => {
+                let guard = idx.read();
+                (true, guard.len(), guard.contains_key(backend_id))
+            }
+            None => (false, 0, false),
+        };
+        let reason = if !index_present {
+            "hbm_ip_index_absent"
+        } else if indexed_ip_count == 0 {
+            "hbm_ip_index_empty"
+        } else if !ip_known {
+            "backend_id_not_in_hbm_ip_index"
+        } else {
+            "no_matching_dp"
+        };
+        tracing::info!(
+            %backend_id,
+            dp_rank,
+            ?match_mode,
+            index_present,
+            indexed_ip_count,
+            ip_known,
+            media = ?target_media.iter().map(|m| m.log_str()).collect::<Vec<_>>(),
+            reason,
+            "kv_event dropped"
+        );
+    }
+    workers
 }

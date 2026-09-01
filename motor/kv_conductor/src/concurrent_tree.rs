@@ -14,8 +14,8 @@
 //
 // Modified by Huawei Technologies Co., Ltd. for MindIE-PyMotor KV Conductor
 // (WorkerKey + Arc<FxHashSet> COW workers; lookup owned by Indexer;
-// find_matches_detailed; per-node prefix_chain; sweep_stale_nodes; no
-// CleanupState / metrics / early_exit path). Huawei modifications are also available under
+// find_matches_detailed / PrefixMatch; sweep_stale_nodes; no CleanupState /
+// metrics / early_exit path). Huawei modifications are also available under
 // Mulan PSL v2 (http://license.coscl.org.cn/MulanPSL2). Redistribution of
 // this file must still comply with Apache License 2.0.
 

@@ -17,8 +17,8 @@ remains subject to its original license.
 
 | Local file | Upstream path | Summary of Huawei modifications |
 |------------|---------------|----------------------------------|
-| `src/lower_tier.rs` | `lib/kv-router/src/indexer/lower_tier.rs` | `RwLock` + `FxHashMap` instead of `DashMap`; content-addressed `PrefixChainHash` positions instead of engine-hash continuation edges; per-worker reverse index; `ContiguousHit` API; `WorkerKey` / medium integration |
-| `src/concurrent_tree.rs` | `lib/kv-router/src/indexer/concurrent_radix_tree.rs` | `WorkerKey` + `Arc<FxHashSet>` COW workers; lookup owned by `Indexer`; `find_matches_detailed`; per-node `prefix_chain`; `sweep_stale_nodes`; no `CleanupState` / metrics / `early_exit` |
+| `src/lower_tier.rs` | `lib/kv-router/src/indexer/lower_tier.rs` | `RwLock` + `FxHashMap` instead of `DashMap`; embedded `worker_blocks` reverse index; `ContiguousHit` API; `WorkerKey` / medium integration |
+| `src/concurrent_tree.rs` | `lib/kv-router/src/indexer/concurrent_radix_tree.rs` | `WorkerKey` + `Arc<FxHashSet>` COW workers; lookup owned by `Indexer`; `find_matches_detailed` / `PrefixMatch`; `sweep_stale_nodes`; no `CleanupState` / metrics / `early_exit` |
 | `src/hashing.rs` | `lib/kv-router/src/protocols.rs` (XXH3 / `compute_block_hash*`) | `i64` token input; per-chunk conversion; rayon parallel batching; include partial trailing block (`div_ceil`) |
 | `src/protocols.rs` (portions) | `lib/kv-router/src/protocols.rs` | Retained hash newtypes / KV event store payloads / overlap-match types; added MindIE HTTP API, `WorkerKey`, `StorageMedium` parsing, thinner `u64` fields |
 

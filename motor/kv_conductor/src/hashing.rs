@@ -27,46 +27,11 @@
 
 use xxhash_rust::xxh3;
 
-use crate::protocols::{LocalBlockHash, PrefixChainHash};
+use crate::protocols::LocalBlockHash;
 
 /// Seed for XXH3 hashing (same value as NVIDIA Dynamo kv-router for wire
 /// interoperability).
 pub const XXH3_SEED: u64 = 1337;
-
-/// Chain value standing in for "no prefix" — the parent of block 0.
-pub const PREFIX_CHAIN_ROOT: PrefixChainHash = PrefixChainHash(XXH3_SEED);
-
-/// Extend a prefix chain by one block.
-///
-/// Seeding XXH3 with the parent chain makes the result depend on every
-/// preceding block, so a chain value identifies "this block reached through
-/// exactly this prefix" — see [`PrefixChainHash`].
-#[inline]
-pub fn extend_prefix_chain(
-    parent: PrefixChainHash,
-    tokens_hash: LocalBlockHash,
-) -> PrefixChainHash {
-    PrefixChainHash(xxh3::xxh3_64_with_seed(
-        &tokens_hash.0.to_le_bytes(),
-        parent.0,
-    ))
-}
-
-/// The prefix chain of every position in a query sequence.
-///
-/// `out[i]` identifies the block at position `i` together with blocks
-/// `0..i`, so the pooled index can be walked by position with no help from
-/// the engines.
-pub fn compute_prefix_chain_for_seq(block_hashes: &[LocalBlockHash]) -> Vec<PrefixChainHash> {
-    let mut chain = PREFIX_CHAIN_ROOT;
-    block_hashes
-        .iter()
-        .map(|&tokens_hash| {
-            chain = extend_prefix_chain(chain, tokens_hash);
-            chain
-        })
-        .collect()
-}
 
 /// Compute the hash of arbitrary data.
 #[inline]
@@ -267,35 +232,5 @@ mod tests {
         let h4 = hash_u32_chunk(&chunk4);
         // Different token sequences → different hashes
         assert_ne!(h, h4);
-    }
-
-    #[test]
-    fn test_prefix_chain_is_incremental() {
-        // Walking the sequence one block at a time must land on the same values
-        // as hashing it in one call — that equivalence is what lets an event
-        // extend a chain that a query later recomputes from scratch.
-        let hashes: Vec<LocalBlockHash> = (1..=4).map(LocalBlockHash).collect();
-        let chain = compute_prefix_chain_for_seq(&hashes);
-
-        let mut cur = PREFIX_CHAIN_ROOT;
-        for (pos, &tokens_hash) in hashes.iter().enumerate() {
-            cur = extend_prefix_chain(cur, tokens_hash);
-            assert_eq!(chain[pos], cur);
-        }
-    }
-
-    #[test]
-    fn test_prefix_chain_depends_on_the_whole_prefix() {
-        let a = compute_prefix_chain_for_seq(&[LocalBlockHash(1), LocalBlockHash(2)]);
-        let b = compute_prefix_chain_for_seq(&[LocalBlockHash(9), LocalBlockHash(2)]);
-        // Same block content at position 1, different prefix → different identity.
-        assert_ne!(a[1], b[1]);
-        // ... and the same tokens at position 0 do share one.
-        assert_eq!(a[0], compute_prefix_chain_for_seq(&[LocalBlockHash(1)])[0]);
-    }
-
-    #[test]
-    fn test_prefix_chain_of_empty_sequence() {
-        assert!(compute_prefix_chain_for_seq(&[]).is_empty());
     }
 }

@@ -38,14 +38,13 @@ use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::KvConductorError;
-use crate::hashing::{extend_prefix_chain, PREFIX_CHAIN_ROOT};
 use crate::protocols::*;
 
 /// Thread-safe shared reference to a Block node.
 pub type SharedBlock = Arc<RwLock<Block>>;
 
 /// A node in the concurrent radix tree.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Block {
     /// Child blocks keyed by their local block hash (token-content hash).
     pub children: FxHashMap<LocalBlockHash, SharedBlock>,
@@ -56,24 +55,6 @@ pub struct Block {
     pub workers: Arc<FxHashSet<WorkerKey>>,
     /// The sequence-level block hash for this node (None for root).
     pub block_hash: Option<SequenceBlockHash>,
-    /// Content prefix chain of the path from root to this node.
-    ///
-    /// The tree already positions a node by content, so this is just that
-    /// position folded into one value. It is what lets a pooled block chained
-    /// onto an engine's HBM block be placed in the shared, content-addressed
-    /// pooled index — see [`PrefixChainHash`].
-    pub prefix_chain: PrefixChainHash,
-}
-
-impl Default for Block {
-    fn default() -> Self {
-        Self {
-            children: FxHashMap::default(),
-            workers: Arc::new(FxHashSet::default()),
-            block_hash: None,
-            prefix_chain: PREFIX_CHAIN_ROOT,
-        }
-    }
 }
 
 impl Block {
@@ -81,12 +62,11 @@ impl Block {
         Self::default()
     }
 
-    pub fn with_hash(block_hash: SequenceBlockHash, prefix_chain: PrefixChainHash) -> Self {
+    pub fn with_hash(block_hash: SequenceBlockHash) -> Self {
         Self {
             children: FxHashMap::default(),
             workers: Arc::new(FxHashSet::default()),
             block_hash: Some(block_hash),
-            prefix_chain,
         }
     }
 
@@ -128,6 +108,16 @@ impl Default for ConcurrentRadixTree {
     }
 }
 
+/// Per-worker HBM prefix match: depth + last engine sequence hash.
+///
+/// ``last_seq_hash`` is the breakpoint used to continue into the CPU
+/// continuation-edge index.
+#[derive(Debug, Clone, Copy)]
+pub struct PrefixMatch {
+    pub depth: u32,
+    pub last_seq_hash: Option<SequenceBlockHash>,
+}
+
 impl ConcurrentRadixTree {
     /// Create a new empty concurrent radix tree.
     pub fn new() -> Self {
@@ -145,18 +135,22 @@ impl ConcurrentRadixTree {
     /// Returns per-worker matched block counts indicating the depth of the
     /// longest matching prefix for each worker.
     pub fn find_matches(&self, sequence: &[LocalBlockHash]) -> OverlapBlocks {
+        let detailed = self.find_matches_detailed(sequence);
         let mut overlap = OverlapBlocks::default();
-        for (worker, depth) in self.find_matches_detailed(sequence) {
-            overlap.update_blocks(worker, depth);
+        for (worker, m) in detailed {
+            overlap.update_blocks(worker, m.depth);
         }
         overlap
     }
 
-    /// Like [`find_matches`], but keyed per worker so callers can use each
-    /// worker's own match depth as the start of a lower-tier walk.
-    pub fn find_matches_detailed(&self, sequence: &[LocalBlockHash]) -> FxHashMap<WorkerKey, u32> {
+    /// Like [`find_matches`], but also returns the last matched sequence hash
+    /// so callers can continue into lower-tier indexes.
+    pub fn find_matches_detailed(
+        &self,
+        sequence: &[LocalBlockHash],
+    ) -> FxHashMap<WorkerKey, PrefixMatch> {
         let t0 = std::time::Instant::now();
-        let mut results: FxHashMap<WorkerKey, u32> = FxHashMap::default();
+        let mut results: FxHashMap<WorkerKey, PrefixMatch> = FxHashMap::default();
 
         if sequence.is_empty() {
             return results;
@@ -197,6 +191,8 @@ impl ConcurrentRadixTree {
                 break;
             };
 
+            let last_seq = { current.read().block_hash };
+
             // Short-circuit: if only 1 worker remains, just check whether
             // this single worker is in the child's set.
             if active.len() == 1 {
@@ -210,7 +206,13 @@ impl ConcurrentRadixTree {
                     matched_depth += 1;
                     continue;
                 } else {
-                    results.insert(w, matched_depth);
+                    results.insert(
+                        w,
+                        PrefixMatch {
+                            depth: matched_depth,
+                            last_seq_hash: last_seq,
+                        },
+                    );
                     active.clear();
                     break;
                 }
@@ -222,7 +224,13 @@ impl ConcurrentRadixTree {
                 if guard.workers.contains(w) {
                     true
                 } else {
-                    results.insert(w.clone(), matched_depth);
+                    results.insert(
+                        w.clone(),
+                        PrefixMatch {
+                            depth: matched_depth,
+                            last_seq_hash: last_seq,
+                        },
+                    );
                     false
                 }
             });
@@ -236,8 +244,15 @@ impl ConcurrentRadixTree {
             matched_depth += 1;
         }
 
+        let last_seq = { current.read().block_hash };
         for worker in active.drain() {
-            results.insert(worker, matched_depth);
+            results.insert(
+                worker,
+                PrefixMatch {
+                    depth: matched_depth,
+                    last_seq_hash: last_seq,
+                },
+            );
         }
 
         tracing::debug!(
@@ -303,8 +318,6 @@ impl ConcurrentRadixTree {
                 }
                 needs_worker_insert = true;
 
-                let child_chain = extend_prefix_chain(parent_mut.prefix_chain, tokens_hash);
-
                 match parent_mut.children.get(&tokens_hash) {
                     Some(existing) => {
                         // A self-referencing block (existing == current) would
@@ -330,23 +343,15 @@ impl ConcurrentRadixTree {
                     }
                     None => {
                         // Try to find existing block in lookup, or create new
-                        match lookup.get(&seq_hash).cloned() {
-                            Some(reused) => {
-                                // Reattached under a new parent, so its chain
-                                // describes the old path; re-anchor it here.
-                                reused.write().prefix_chain = child_chain;
-                                parent_mut.children.insert(tokens_hash, Arc::clone(&reused));
-                                reused
-                            }
-                            None => {
-                                let new_block =
-                                    Arc::new(RwLock::new(Block::with_hash(seq_hash, child_chain)));
-                                parent_mut
-                                    .children
-                                    .insert(tokens_hash, Arc::clone(&new_block));
-                                new_block
-                            }
-                        }
+                        let new_block = lookup
+                            .get(&seq_hash)
+                            .cloned()
+                            .unwrap_or_else(|| Arc::new(RwLock::new(Block::with_hash(seq_hash))));
+
+                        parent_mut
+                            .children
+                            .insert(tokens_hash, Arc::clone(&new_block));
+                        new_block
                     }
                 }
             };

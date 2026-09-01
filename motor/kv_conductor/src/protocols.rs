@@ -175,26 +175,6 @@ pub struct LocalBlockHash(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct SequenceBlockHash(pub u64);
 
-/// Conductor-computed rolling hash of a block **and its whole prefix**:
-/// `chain(i) = fold(chain(i-1), tokens_hash(i))`, `chain(-1) = PREFIX_CHAIN_ROOT`.
-///
-/// This is the identity the pooled (CPU / Disk) index is keyed by. It answers
-/// the same question as [`SequenceBlockHash`] — "this block, reached through
-/// exactly this prefix" — but derives it from token content only, so every
-/// engine that caches the same prefix produces the same value.
-///
-/// [`SequenceBlockHash`] cannot serve that purpose: vLLM seeds its chain with a
-/// per-process random `NONE_HASH` unless `PYTHONHASHSEED` is pinned, so two
-/// engines holding the same prefix report unrelated hashes. Pooled blocks are
-/// shared across engines, so keying them by an engine-private chain splits one
-/// pooled prefix into per-engine chains that cannot be walked or deduplicated.
-///
-/// Like the HBM radix tree — which is keyed on [`LocalBlockHash`] paths — this
-/// ignores vLLM's `extra_keys` (LoRA / multimodal / cache salt). Two prefixes
-/// with identical tokens but different extra keys share an identity here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
-pub struct PrefixChainHash(pub u64);
-
 impl Serialize for LocalBlockHash {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

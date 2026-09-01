@@ -396,7 +396,13 @@ impl WorkerRegistry {
             }
         }
 
-        self.indexer.get_or_create(&req.modelname, &req.tenant_id);
+        let indexer_entry = self.indexer.get_or_create(&req.modelname, &req.tenant_id);
+        // Pool subscribers (memcache-pool) are not routing targets. Engine
+        // DPs must be recorded so a prefill with no HBM of its own still
+        // sees decode-hosted pool blocks on query.
+        if !is_pool {
+            indexer_entry.note_registered_dp(&req.instance_id, req.dp_rank);
+        }
 
         let mut instances = self.instances.write().await;
         let entry = instances
@@ -536,6 +542,7 @@ impl WorkerRegistry {
         // cleanup targets the correct indexer entry.
         let indexer_entry = self.indexer.get(&entry.model_name, &entry.tenant_id);
         if let Some(ie) = &indexer_entry {
+            ie.forget_registered_dp(&req.instance_id, req.dp_rank);
             ie.remove_worker_all_media(&req.instance_id, req.dp_rank);
         }
 

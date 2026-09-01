@@ -223,6 +223,12 @@ pub struct IndexerEntry {
     /// See [`OffloadPoolState`] for the invariant.
     pub(crate) offload_pool_state: Arc<RwLock<OffloadPoolState>>,
 
+    /// Engine DPs that have `/register`'d for this model/tenant. Query
+    /// walks pooled edges for every registered DP, even when that DP has
+    /// no HBM of its own — otherwise decode-only pool capacity would be
+    /// invisible to a prefill that never stored NPU blocks.
+    registered_dps: RwLock<FxHashSet<(String, DpRank)>>,
+
     maintenance: CacheMaintenanceConfig,
 }
 
@@ -244,6 +250,7 @@ impl IndexerEntry {
             cpu_tiers: Arc::new(LowerTierIndexer::new()),
             disk_tiers: Arc::new(LowerTierIndexer::new()),
             offload_pool_state: Arc::new(RwLock::new(OffloadPoolState::default())),
+            registered_dps: RwLock::new(FxHashSet::default()),
             maintenance,
         }
     }
@@ -353,19 +360,44 @@ impl IndexerEntry {
         (overlap, medium_ends)
     }
 
-    /// Every `(instance_id, dp_rank)` this index has seen, across all media.
+    /// Engine DPs that should see pooled coverage on query.
+    ///
+    /// Registered prefills are always included (they may hold no HBM of
+    /// their own). Tree keys are unioned so tests / replay without an
+    /// explicit `/register` still work. `pool:<ip>` placeholders are
+    /// skipped — they own decode-store edges but are not routing targets.
     fn known_dps(&self) -> FxHashSet<(String, DpRank)> {
-        let mut dps: FxHashSet<(String, DpRank)> = FxHashSet::default();
+        let mut dps = self.registered_dps.read().clone();
         for wk in self.lookups.read().keys() {
-            dps.insert((wk.instance_id.clone(), wk.dp_rank));
+            if !is_pool_location_instance(&wk.instance_id) {
+                dps.insert((wk.instance_id.clone(), wk.dp_rank));
+            }
         }
         for wk in self.cpu_tiers.worker_keys() {
-            dps.insert((wk.instance_id, wk.dp_rank));
+            if !is_pool_location_instance(&wk.instance_id) {
+                dps.insert((wk.instance_id, wk.dp_rank));
+            }
         }
         for wk in self.disk_tiers.worker_keys() {
-            dps.insert((wk.instance_id, wk.dp_rank));
+            if !is_pool_location_instance(&wk.instance_id) {
+                dps.insert((wk.instance_id, wk.dp_rank));
+            }
         }
         dps
+    }
+
+    /// Record that an engine DP is registered and should receive pooled coverage.
+    pub fn note_registered_dp(&self, instance_id: &str, dp_rank: u32) {
+        self.registered_dps
+            .write()
+            .insert((instance_id.to_string(), dp_rank));
+    }
+
+    /// Drop a registered DP when the worker unregisters.
+    pub fn forget_registered_dp(&self, instance_id: &str, dp_rank: u32) {
+        self.registered_dps
+            .write()
+            .remove(&(instance_id.to_string(), dp_rank));
     }
 
     #[inline]

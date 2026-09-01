@@ -686,28 +686,19 @@ impl IndexerEntry {
     }
 
     /// Content position of a block that is already in one of the indexes.
-    ///
-    /// The pooled indexes answer in one lookup and are checked first: placing a
-    /// pooled chain resolves each block against its predecessor, which the
-    /// previous block of the same event just put there. The HBM path needs a
-    /// pass over the per-worker tables, and only anchors a chain's first block.
-    /// A block present in both yields the same position either way.
     fn indexed_prefix_chain_of(&self, block_hash: u64) -> Option<PrefixChainHash> {
-        if let Some(chain) = self
-            .cpu_tiers
-            .prefix_chain_of(block_hash)
-            .or_else(|| self.disk_tiers.prefix_chain_of(block_hash))
-        {
-            return Some(chain);
-        }
-
         let seq = SequenceBlockHash(block_hash);
         let node = self
             .lookups
             .read()
             .values()
             .find_map(|lookup| lookup.get(&seq).cloned());
-        node.map(|node| node.read().prefix_chain)
+        if let Some(node) = node {
+            return Some(node.read().prefix_chain);
+        }
+        self.cpu_tiers
+            .prefix_chain_of(block_hash)
+            .or_else(|| self.disk_tiers.prefix_chain_of(block_hash))
     }
 
     /// Place a pooled store event's blocks at their content positions.

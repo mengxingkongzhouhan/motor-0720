@@ -377,16 +377,23 @@ impl IndexerEntry {
     }
 
     /// Every `(instance_id, dp_rank)` this index has seen, across all media.
+    /// `pool:<ip>` placeholders own store edges but are never routing targets.
     fn tree_known_dps(&self) -> FxHashSet<(String, DpRank)> {
         let mut dps: FxHashSet<(String, DpRank)> = FxHashSet::default();
         for wk in self.lookups.read().keys() {
-            dps.insert((wk.instance_id.clone(), wk.dp_rank));
+            if !is_pool_location_instance(&wk.instance_id) {
+                dps.insert((wk.instance_id.clone(), wk.dp_rank));
+            }
         }
         for wk in self.cpu_tiers.worker_keys() {
-            dps.insert((wk.instance_id, wk.dp_rank));
+            if !is_pool_location_instance(&wk.instance_id) {
+                dps.insert((wk.instance_id, wk.dp_rank));
+            }
         }
         for wk in self.disk_tiers.worker_keys() {
-            dps.insert((wk.instance_id, wk.dp_rank));
+            if !is_pool_location_instance(&wk.instance_id) {
+                dps.insert((wk.instance_id, wk.dp_rank));
+            }
         }
         dps
     }
@@ -1248,6 +1255,9 @@ impl Indexer {
         let mut instance_data: HashMap<String, InstanceMatchData> = HashMap::new();
 
         for ((instance_id, dp_rank), ends) in medium_ends {
+            if is_pool_location_instance(instance_id) {
+                continue;
+            }
             let npu = ends.npu;
             let cpu = ends.cpu.saturating_sub(ends.npu);
             let disk = ends.disk.saturating_sub(ends.npu.max(ends.cpu));

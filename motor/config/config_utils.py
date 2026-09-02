@@ -27,6 +27,7 @@ MINDIE_MOTOR_CONFIG_FILENAME = "config_sample.json"
 MOTOR_DEPLOY_CONFIG = "motor_deploy_config"
 MOTOR_ENGINE_PREFILL_CONFIG = "motor_engine_prefill_config"
 MOTOR_ENGINE_UNION_CONFIG = "motor_engine_union_config"
+MOTOR_ENGINE_DECODE_CONFIG = "motor_engine_decode_config"
 DEFAULT_KV_CONDUCTOR_HTTP_PORT = 13333
 TLS_CONFIG = "tls_config"
 MGMT_TLS_CONFIG = "mgmt_tls_config"
@@ -261,16 +262,29 @@ def _is_context_budget_enabled(user_config_data: dict[str, Any]) -> bool:
     return coordinator_config.get(CONTEXT_BUDGET_MODE) == CONTEXT_BUDGET_ON
 
 
+def _engine_section_has_kv_events(section: dict[str, Any]) -> bool:
+    engine_config = section.get(ENGINE_CONFIG)
+    if not isinstance(engine_config, dict):
+        return False
+    return isinstance(engine_config.get(KV_EVENTS_CONFIG), dict)
+
+
 def _select_kv_event_engine_section(user_config_data: dict[str, Any]) -> dict[str, Any] | None:
-    if MOTOR_ENGINE_PREFILL_CONFIG in user_config_data:
-        prefill_section = user_config_data.get(MOTOR_ENGINE_PREFILL_CONFIG)
-        if isinstance(prefill_section, dict):
-            return prefill_section
-    if MOTOR_ENGINE_UNION_CONFIG in user_config_data:
-        union_section = user_config_data.get(MOTOR_ENGINE_UNION_CONFIG)
-        if isinstance(union_section, dict):
-            return union_section
-    return None
+    """Pick the engine section Coordinator uses to derive kv-event ports.
+
+    Prefill, then union, then decode. A section that actually contains
+    ``kv-events-config`` wins over an earlier empty section so decode-only
+    event config still populates ``kv_conductor_config.endpoint``.
+    """
+    sections: list[dict[str, Any]] = []
+    for key in (MOTOR_ENGINE_PREFILL_CONFIG, MOTOR_ENGINE_UNION_CONFIG, MOTOR_ENGINE_DECODE_CONFIG):
+        section = user_config_data.get(key)
+        if isinstance(section, dict):
+            sections.append(section)
+    for section in sections:
+        if _engine_section_has_kv_events(section):
+            return section
+    return sections[0] if sections else None
 
 
 KV_CONDUCTOR_CONFIG = "kv_conductor_config"

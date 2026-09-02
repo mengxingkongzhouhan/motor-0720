@@ -23,8 +23,11 @@ from motor.config.coordinator import CoordinatorConfig
 
 TENANT_ID = "default"
 logger = get_logger(__name__)
-# Roles whose KV events should be registered with the conductor.
-_KVA_ROLES = frozenset({PDRole.ROLE_P, PDRole.ROLE_U})
+# Roles whose KV events / pool-store IPs should be registered with the
+# conductor. ROLE_D is included so a decode node's Pod IP lands in
+# ``hbm_ip_index`` (memcache LocalService ``backend_id`` is the store
+# Pod IP). Affinity *selection* stays on P/U — see ``_KVA_SELECT_ROLES``.
+_KVA_ROLES = frozenset({PDRole.ROLE_P, PDRole.ROLE_U, PDRole.ROLE_D})
 
 # Canonical store_backend names. Input config is matched case-insensitively
 # (same as kv-conductor's StoreBackend::parse).
@@ -55,6 +58,8 @@ def conductor_instance_id(instance: Instance) -> str:
     """Return the Conductor tenant key for a KVA-eligible instance."""
     if instance.role == PDRole.ROLE_U:
         return f"vllm-union-{instance.id}"
+    if instance.role == PDRole.ROLE_D:
+        return f"vllm-decode-{instance.id}"
     return f"vllm-prefill-{instance.id}"
 
 

@@ -53,6 +53,46 @@ def test_conductor_instance_id_role_p() -> None:
     assert conductor_instance_id(instance) == "vllm-prefill-3"
 
 
+def test_conductor_instance_id_role_d() -> None:
+    instance = _build_instance(PDRole.ROLE_D)
+    instance.id = 4
+    assert conductor_instance_id(instance) == "vllm-decode-4"
+
+
+def test_register_post_uses_decode_conductor_id_for_role_d() -> None:
+    instance = _build_instance(PDRole.ROLE_D)
+    instance.id = 5
+    instance.model_name = "qwen3-8B"
+    endpoint = Mock()
+    endpoint.id = 0
+    endpoint.ip = "10.244.59.1"
+
+    mock_config = Mock()
+    mock_config.scheduler_config.kv_conductor_config.engine_type = "vLLM"
+    mock_config.scheduler_config.kv_conductor_config.block_size = 128
+    mock_config.scheduler_config.kv_conductor_config.conductor_service = "kv-conductor"
+    mock_config.scheduler_config.kv_conductor_config.http_server_port = 13333
+    mock_config.scheduler_config.kv_conductor_config.endpoint = "tcp://*:5557"
+    mock_config.scheduler_config.kv_conductor_config.npu_endpoint = ""
+    mock_config.scheduler_config.kv_conductor_config.xpu_endpoint = ""
+    mock_config.scheduler_config.kv_conductor_config.cpu_endpoint = ""
+    mock_config.scheduler_config.kv_conductor_config.disk_endpoint = ""
+    mock_config.scheduler_config.kv_conductor_config.replay_endpoint = "tcp://*:6667"
+    mock_config.scheduler_config.kv_conductor_config.store_backend = "Memcache"
+
+    with (
+        patch.object(ConductorApiClient, "coordinator_config", mock_config),
+        patch("motor.coordinator.api_client.conductor_api_client.SafeHTTPSClient") as mock_http_client,
+    ):
+        mock_http_client.return_value.__enter__.return_value.post.return_value = None
+        ConductorApiClient.register_post(instance, endpoint)
+
+    register_payload = mock_http_client.return_value.__enter__.return_value.post.call_args[0][1]
+    assert register_payload["instance_id"] == "vllm-decode-5"
+    assert register_payload["medium_endpoints"]["npu"] == "tcp://10.244.59.1:5557"
+    assert register_payload["replay_endpoint"] == "tcp://10.244.59.1:6667"
+
+
 def test_register_post_uses_union_conductor_id_for_role_u() -> None:
     instance = _build_instance(PDRole.ROLE_U)
     instance.id = 2
@@ -144,9 +184,9 @@ def test_register_kv_instance_supports_role_u() -> None:
     # Signature: _register_*_dp(cls, reg, store_backend, instance, endpoint)
     # call.args excludes cls, so instance is at index 2.
     registered_method = mock_hbm_dp if mock_hbm_dp.call_count else mock_yuanrong_dp
-    assert registered_method.call_count == 2
+    assert registered_method.call_count == 3
     called_roles = {call.args[2].role for call in registered_method.call_args_list}
-    assert called_roles == {PDRole.ROLE_P, PDRole.ROLE_U}
+    assert called_roles == {PDRole.ROLE_P, PDRole.ROLE_U, PDRole.ROLE_D}
 
 
 def test_unregister_kv_instance_supports_role_u() -> None:
@@ -158,9 +198,9 @@ def test_unregister_kv_instance_supports_role_u() -> None:
     with patch.object(ConductorApiClient, "unregister_post") as mock_unregister_post:
         ConductorApiClient.unregister_kv_instance(instances)
 
-    assert mock_unregister_post.call_count == 2
+    assert mock_unregister_post.call_count == 3
     called_roles = {call.args[0].role for call in mock_unregister_post.call_args_list}
-    assert called_roles == {PDRole.ROLE_P, PDRole.ROLE_U}
+    assert called_roles == {PDRole.ROLE_P, PDRole.ROLE_U, PDRole.ROLE_D}
 
 
 def test_kv_cache_affinity_uses_kva_for_role_u() -> None:

@@ -520,6 +520,8 @@ OnCircuitBreakerChangeNotify = Callable[[int, str], Awaitable[None]]
 # ZMQ PUB does not queue; SUB must be ready before PUB sends. Short delay after connect.
 _INSTANCE_PUB_SUB_SETTLE_MS = 150
 # Roles that should use kv_cache_affinity scheduling.
+# ROLE_D is registered with the conductor (pool-store IP mapping) but is
+# never an affinity *target* — the next prefill is still P or U.
 _KVA_SELECT_ROLES = frozenset({PDRole.ROLE_P, PDRole.ROLE_U})
 # Roles that should use smetric scheduling (prefill_cost ranking).
 _SMETRIC_SELECT_ROLES = frozenset({PDRole.ROLE_P, PDRole.ROLE_U})

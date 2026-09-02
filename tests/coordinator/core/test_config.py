@@ -928,6 +928,64 @@ def test_from_json_prefill_kv_event_prefers_prefill_over_union(_temp_json_file):
     assert kr.model_path == "/prefill/model"
 
 
+def test_from_json_maps_decode_kv_events_when_prefill_has_none(_temp_json_file):
+    """PD separate: decode kv-events-config is used when prefill has none."""
+    user_config = {
+        "motor_engine_prefill_config": {
+            "engine_type": "vllm",
+            "engine_config": {
+                "model": "/prefill/model",
+            },
+        },
+        "motor_engine_decode_config": {
+            "engine_type": "vllm",
+            "engine_config": {
+                "model": "/decode/model",
+                "kv-events-config": {
+                    "endpoint": "tcp://*:5557",
+                    "replay_endpoint": "tcp://*:6667",
+                },
+            },
+        },
+        "kv_conductor_config": {"http_server_port": 13333},
+    }
+    with open(_temp_json_file, "w", encoding="utf-8") as f:
+        json.dump(user_config, f)
+
+    config = CoordinatorConfig.from_json(_temp_json_file)
+    kr = config.scheduler_config.kv_conductor_config
+
+    assert kr.endpoint == "tcp://*:5557"
+    assert kr.replay_endpoint == "tcp://*:6667"
+    assert kr.model_path == "/decode/model"
+
+
+def test_from_json_decode_only_kv_events_populate_conductor_ports(_temp_json_file):
+    """Decode-only engine section still derives kv_conductor_config ports."""
+    user_config = {
+        "motor_engine_decode_config": {
+            "engine_type": "vllm",
+            "engine_config": {
+                "model": "/decode/model",
+                "kv-events-config": {
+                    "endpoint": "tcp://*:5557",
+                    "replay_endpoint": "tcp://*:6667",
+                },
+            },
+        },
+        "kv_conductor_config": {"http_server_port": 13333},
+    }
+    with open(_temp_json_file, "w", encoding="utf-8") as f:
+        json.dump(user_config, f)
+
+    config = CoordinatorConfig.from_json(_temp_json_file)
+    kr = config.scheduler_config.kv_conductor_config
+
+    assert kr.endpoint == "tcp://*:5557"
+    assert kr.replay_endpoint == "tcp://*:6667"
+    assert kr.model_path == "/decode/model"
+
+
 def test_from_json_union_without_kv_events_skips_auto_merge(_temp_json_file):
     """Union without kv-events-config does not populate prefill_kv_event_config."""
     user_config = {

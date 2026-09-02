@@ -107,9 +107,9 @@ class TestConductorInstanceId:
         inst = _make_instance(inst_id=5, role=PDRole.ROLE_E)
         assert conductor_instance_id(inst) == "vllm-prefill-5"
 
-    def test_role_d_falls_to_prefill_prefix(self):
+    def test_role_d_returns_decode_prefix(self):
         inst = _make_instance(inst_id=9, role=PDRole.ROLE_D)
-        assert conductor_instance_id(inst) == "vllm-prefill-9"
+        assert conductor_instance_id(inst) == "vllm-decode-9"
 
 
 # ------------------------------------------------------------------
@@ -402,10 +402,10 @@ class TestReRegisterKvInstances:
         mock_register.assert_not_called()
 
     def test_skip_non_kva_roles(self):
-        """ROLE_D and ROLE_E are not in _KVA_ROLES → skipped."""
+        """ROLE_E is not in _KVA_ROLES → skipped. ROLE_D is registered."""
         inst_d = _make_instance(inst_id=1, role=PDRole.ROLE_D)
         inst_e = _make_instance(inst_id=2, role=PDRole.ROLE_E)
-        cfg = _mock_config()
+        cfg = _mock_config(npu_endpoint="tcp://*:5557")
 
         with (
             patch.object(ConductorApiClient, "coordinator_config", cfg),
@@ -414,7 +414,9 @@ class TestReRegisterKvInstances:
         ):
             ConductorApiClient.re_register_kv_instances([inst_d, inst_e])
 
-        mock_register.assert_not_called()
+        mock_register.assert_called_once()
+        called_inst = mock_register.call_args[0][0]
+        assert called_inst.role == PDRole.ROLE_D
 
     def test_skip_when_no_endpoints_configured(self):
         """No endpoint patterns → _build_register_payload returns {} → skip."""

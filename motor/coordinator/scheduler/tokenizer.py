@@ -103,7 +103,7 @@ class TokenizerManager(ThreadSafeSingleton):
                     messages, tools, req_data
                 )
             return self._apply_chat_template_standard(messages, tools, req_data)
-        except Exception as exc:  # noqa: BLE001 - tokenizer backends raise heterogeneous errors
+        except Exception as exc:
             if self._is_dsv4:
                 logger.error("dsv4 tokenize failed; returning []: %s", exc)
                 return []
@@ -236,7 +236,7 @@ class TokenizerManager(ThreadSafeSingleton):
                     messages, tools, req_data
                 )
             return self._apply_chat_template_standard(messages, tools, req_data)
-        except Exception as exc:  # noqa: BLE001 - fallback must contain backend-specific failures
+        except Exception as exc:
             logger.error(
                 "tokenize failed on both primary and fallback paths; returning []: %s",
                 exc,

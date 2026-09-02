@@ -20,7 +20,10 @@ import pytest
 import motor.coordinator.scheduler.policy.smetric as smetric_module
 from motor.common.resources.instance import PDRole
 from motor.config.coordinator import SchedulerType
-from motor.coordinator.api_client.conductor_api_client import TENANT_ID, conductor_instance_id
+from motor.coordinator.api_client.conductor_api_client import (
+    TENANT_ID,
+    conductor_instance_id,
+)
 from motor.coordinator.domain.scheduling_pin import select_endpoint_for_instance
 from motor.coordinator.scheduler.policy.factory import create
 from motor.coordinator.scheduler.policy.smetric import (

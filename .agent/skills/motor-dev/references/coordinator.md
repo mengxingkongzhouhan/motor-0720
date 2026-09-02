@@ -127,9 +127,6 @@ Located in `scheduler/policy/`, each policy implements `BaseSchedulingPolicy`:
 | `KvCacheAffinityPolicy` | Queries KV Conductor (via `ConductorApiClient`) for prefix match; prefers endpoints with cached blocks | High prefix reuse, PD disaggregation |
 | `SMetricPolicy` | Queries KV Conductor and ranks by remaining prefill cost; the central Scheduler gates request-cost ranking against its shared running average and the scored endpoints' ledgers | Prefill routing driven by uncached prompt cost |
 
-SMetric does not import or invoke another policy. Tokenization lives in the policy-neutral
-`scheduler/tokenizer.py`; load-balance fallback is owned by the scheduler/client orchestrators.
-
 **Conductor `/query` wire encoding** (`ConductorApiClient.query_conductor`):
 `kv_conductor_config.query_encoding` (default `"msgpack"`) selects the wire
 format. MessagePack requests are sent via `SafeHTTPSClient.post_bytes()`

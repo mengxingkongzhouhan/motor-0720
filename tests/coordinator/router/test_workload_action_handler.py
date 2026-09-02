@@ -14,9 +14,10 @@ from unittest.mock import AsyncMock, MagicMock
 from motor.common.resources.endpoint import Workload, WorkloadAction
 from motor.common.resources.instance import PDRole, Instance, InsStatus, ParallelConfig
 from motor.coordinator.domain.workload_calculator import (
+    affinity_prefill_cost,
+    allocated_prefill_cost,
     calculate_committed_workload,
     calculate_demand_workload,
-    smetric_prefill_cost,
 )
 from motor.coordinator.router.workload import WorkloadActionHandler
 from motor.coordinator.domain import ScheduledResource
@@ -143,18 +144,19 @@ class TestCalculateDemandWorkload:
         )
         assert w.active_tokens == 200.0
 
-    def test_smetric_prefill_cost_reads_smetric_debug(self):
+    def test_allocated_prefill_cost_prefers_smetric_debug(self):
         req_info = MagicMock()
         req_info.smetric_debug = {(1, 10): 12.5}
         req_info.kv_affinity_debug = {(1, 10): (8, 1.0, 99)}
-        assert smetric_prefill_cost(req_info, 1, 10) == 12.5
-        assert smetric_prefill_cost(req_info, 2, 20) == 0.0
+        assert allocated_prefill_cost(req_info, 1, 10) == 12.5
+        assert allocated_prefill_cost(req_info, 2, 20) == 0.0
 
-    def test_smetric_prefill_cost_ignores_other_policy_debug(self):
+    def test_affinity_prefill_cost_reads_third_tuple_slot(self):
         req_info = MagicMock()
         req_info.kv_affinity_debug = {(2, 20): (8, 1.0, 42)}
         req_info.smetric_debug = None
-        assert smetric_prefill_cost(req_info, 2, 20) == 0
+        assert affinity_prefill_cost(req_info, 2, 20) == 42
+        assert allocated_prefill_cost(req_info, 2, 20) == 42
 
 
 class TestWorkloadActionHandler:

@@ -11,7 +11,6 @@
 """Tests for SMetricPolicy: rank by prefill_cost with overlap_credit fixed at 1."""
 
 import logging
-import inspect
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -21,7 +20,7 @@ from motor.common.resources.instance import PDRole
 from motor.config.coordinator import SchedulerType
 from motor.coordinator.api_client.conductor_api_client import TENANT_ID, conductor_instance_id
 from motor.coordinator.scheduler.policy.factory import create
-import motor.coordinator.scheduler.policy.smetric as smetric_module
+from motor.coordinator.scheduler.policy.kv_cache_affinity import KvCacheAffinityPolicy
 from motor.coordinator.scheduler.policy.smetric import (
     SMetricPolicy,
     SMetricPrefillCostTracker,
@@ -33,7 +32,6 @@ from motor.coordinator.scheduler.runtime.scheduler_client import (
     AsyncSchedulerClient,
     SchedulerClientConfig,
 )
-from motor.coordinator.scheduler.scheduler import Scheduler
 from motor.coordinator.scheduler.runtime.zmq_protocol import (
     SchedulerResponse,
     SchedulerResponseType,
@@ -93,7 +91,7 @@ class TestPrefillCostFormula:
     def test_dp_blocks_format_reads_matched_tokens(self):
         assert _matched_tokens({"npu_blocks": 2, "matched_tokens": 64}) == 64
 
-    @patch("motor.coordinator.scheduler.policy.smetric.TokenizerManager")
+    @patch("motor.coordinator.scheduler.policy.kv_cache_affinity.TokenizerManager")
     def test_empty_cached_tokens_are_retokenized(self, mock_tokenizer_manager):
         req_info = SimpleNamespace(token_ids=[], req_data={"prompt": "hello"})
         mock_tokenizer_manager.return_value.encode.return_value = [1, 2, 3]
@@ -229,10 +227,32 @@ class TestSMetricPolicyRanking:
         assert ranked is not None
         assert [(ep.id, cost) for _instance, ep, cost in ranked] == [(7, 20.0), (8, 80.0)]
 
-    def test_module_does_not_import_other_policies(self):
-        source = inspect.getsource(smetric_module)
-        assert "policy.kv_cache_affinity" not in source
-        assert "policy.load_balance" not in source
+    @patch(
+        "motor.coordinator.scheduler.policy.kv_cache_affinity.KvCacheAffinityPolicy.select_endpoint_candidates_from_list"
+    )
+    @patch("motor.coordinator.scheduler.policy.kv_cache_affinity.KvCacheAffinityPolicy.select_endpoint_from_list")
+    @patch("motor.coordinator.scheduler.policy.kv_cache_affinity.KvCacheAffinityPolicy._collect_load_candidates")
+    @patch("motor.coordinator.scheduler.policy.kv_cache_affinity.KvCacheAffinityPolicy._stash_affinity_debug")
+    @patch("motor.coordinator.scheduler.policy.smetric.ConductorApiClient.query_conductor")
+    def test_does_not_call_kv_affinity_ranking(
+        self,
+        mock_query,
+        mock_stash,
+        mock_collect,
+        mock_select,
+        mock_candidates,
+    ):
+        inst = _instance(1, (10,))
+        req_info = _req_info(16)
+        mock_query.return_value = _conductor_tenant(inst, matched={(1, 10): 4})
+
+        result = SMetricPolicy.select_endpoint_from_list([inst], req_info)
+
+        assert result is not None
+        mock_candidates.assert_not_called()
+        mock_select.assert_not_called()
+        mock_collect.assert_not_called()
+        mock_stash.assert_not_called()
 
     @patch("motor.coordinator.scheduler.policy.smetric.ConductorApiClient.query_conductor")
     def test_no_tenant_returns_none(self, mock_query):
@@ -240,14 +260,21 @@ class TestSMetricPolicyRanking:
         mock_query.return_value = {}
         assert SMetricPolicy.select_endpoint_candidates_from_list([inst], _req_info()) is None
 
-    def test_decode_returns_none_for_orchestrator_fallback(self):
+    def test_decode_falls_back_to_load_balance(self):
         policy = SMetricPolicy(MockInstanceProvider())
         instances = [_instance(1, (10,))]
         req_info = _req_info()
-        with patch.object(SMetricPolicy, "select_endpoint_from_list") as mock_smetric:
+        with (
+            patch.object(SMetricPolicy, "select_endpoint_from_list") as mock_smetric,
+            patch(
+                "motor.coordinator.scheduler.policy.load_balance.LoadBalancePolicy.select_endpoint_from_list",
+                return_value=(instances[0], instances[0].get_all_endpoints()[0]),
+            ) as mock_lb,
+        ):
             selected = policy.select_instance_and_endpoint_from_list(instances, role=PDRole.ROLE_D, req_info=req_info)
         mock_smetric.assert_not_called()
-        assert selected is None
+        mock_lb.assert_called_once()
+        assert selected[0].id == 1
 
 
 class TestSMetricFactoryAndPin:
@@ -265,27 +292,12 @@ class TestSMetricFactoryAndPin:
                 "motor.coordinator.domain.scheduling_pin.LoadBalancePolicy.select_endpoint_from_instance",
                 return_value=ep,
             ) as mock_lb,
+            patch.object(KvCacheAffinityPolicy, "select_endpoint_from_list") as mock_kva,
         ):
             got = select_endpoint_for_instance(inst, scheduler_type="smetric")
         assert got is ep
         mock_lb.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_scheduler_owns_load_balance_fallback(self):
-        instance = _instance(1, (10,), role=PDRole.ROLE_D)
-        endpoint = instance.get_all_endpoints()[0]
-        provider = MockInstanceProvider({PDRole.ROLE_D: {instance.id: instance}})
-        scheduler = Scheduler(provider, SchedulerType.SMETRIC)
-        scheduler._scheduling_policy.select_instance_and_endpoint_from_list = Mock(return_value=None)
-        scheduler._fallback_policy.select_instance_and_endpoint_from_list = Mock(
-            return_value=(instance, endpoint)
-        )
-        scheduler._allocate_selected = AsyncMock(return_value=(instance, endpoint, Mock()))
-
-        result = await scheduler.select_and_allocate(PDRole.ROLE_D, SimpleNamespace(req_id="fallback"))
-
-        assert result[:2] == (instance, endpoint)
-        scheduler._fallback_policy.select_instance_and_endpoint_from_list.assert_called_once()
+        mock_kva.assert_not_called()
 
 
 def _build_smetric_client() -> AsyncSchedulerClient:
@@ -306,6 +318,10 @@ class TestSMetricClientDispatch:
                 "select_endpoint_candidates_from_list",
                 return_value=ranked,
             ) as mock_smetric,
+            patch.object(
+                KvCacheAffinityPolicy,
+                "select_endpoint_candidates_from_list",
+            ) as mock_kva,
             patch.object(client, "_select_endpoint_candidates_by_load_balance") as mock_lb,
         ):
             candidates, candidate_policy = client._select_endpoint_candidates_from_list_with_policy(
@@ -315,6 +331,7 @@ class TestSMetricClientDispatch:
         assert candidates == ranked
         assert candidate_policy == "smetric"
         mock_smetric.assert_called_once()
+        mock_kva.assert_not_called()
         mock_lb.assert_not_called()
 
     def test_role_d_skips_smetric(self):
@@ -369,13 +386,14 @@ class TestSMetricClientDispatch:
         mock_smetric.assert_called_once()
         mock_lb.assert_called_once_with([instance], PDRole.ROLE_P, 1)
 
-    def test_smetric_candidate_payload_reads_own_costs(self):
-        from motor.coordinator.scheduler.runtime.scheduler_client import _smetric_candidate_payload
+    def test_candidate_payload_reads_smetric_debug_not_affinity_tuple(self):
+        from motor.coordinator.scheduler.runtime.scheduler_client import _candidate_endpoint_payload
 
-        payload = _smetric_candidate_payload(
+        payload = _candidate_endpoint_payload(
             1,
             10,
-            costs={(1, 10): 12},
+            affinity_debug={(1, 10): (8, 1.0, 99)},
+            smetric_debug={(1, 10): 12},
         )
         assert payload == {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 12}
 

@@ -29,7 +29,6 @@ from motor.coordinator.scheduler.policy.base import (
     BaseSchedulingPolicy,
     WorkloadLedgerMixin,
 )
-from motor.coordinator.scheduler.tokenizer import TokenizerManager
 
 logger = get_logger(__name__)
 
@@ -51,6 +50,11 @@ def _prompt_token_ids(req_info: RequestInfo) -> list[int]:
     req_data = getattr(req_info, "req_data", None) or {}
     messages = req_data.get(OpenAIField.MESSAGES, None)
     tools = req_data.get(OpenAIField.TOOLS, None)
+    # TokenizerManager is the process-wide tokenizer singleton (lives next to KV affinity for
+    # historical reasons). SMetric only uses it to encode the prompt; it does not call any
+    # KvCacheAffinityPolicy ranking/stash helpers.
+    from motor.coordinator.scheduler.policy.kv_cache_affinity import TokenizerManager
+
     if messages is not None:
         encoded_ids = TokenizerManager().apply_chat_template(messages, tools, req_data=req_data)
     else:
@@ -146,7 +150,7 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
     vs picking the endpoint with the lowest current ``workload.prefill_cost``. When the gate keeps
     SMetric and the worker's workload view is fresh, the worker top-1 is committed as-is.
 
-    Conductor lookup and ``smetric_debug`` are owned here; no other policy is called.
+    Conductor lookup and ``smetric_debug`` are owned here; KvCacheAffinityPolicy is not called.
     """
 
     def __init__(self, instance_provider: InstanceProvider):
@@ -264,5 +268,9 @@ class SMetricPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         req_info: RequestInfo | None = None,
     ):
         if role in (PDRole.ROLE_P, PDRole.ROLE_U) and req_info is not None:
-            return SMetricPolicy.select_endpoint_from_list(instances, req_info)
-        return None
+            selected = SMetricPolicy.select_endpoint_from_list(instances, req_info)
+            if selected is not None:
+                return selected
+        from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
+
+        return LoadBalancePolicy.select_endpoint_from_list(instances, role)

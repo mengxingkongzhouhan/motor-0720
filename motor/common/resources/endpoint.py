@@ -25,7 +25,7 @@ class Workload(BaseModel):
     active_tokens: float = Field(default=0, description="Active compute load in token units")
     prefill_cost: float = Field(
         default=0,
-        description="Remaining SMetric prefill cost on this endpoint; 0 for other policies",
+        description="Remaining prefill cost on this endpoint (KV affinity / SMetric); 0 for RR/LB",
     )
 
     def __iadd__(self, other):

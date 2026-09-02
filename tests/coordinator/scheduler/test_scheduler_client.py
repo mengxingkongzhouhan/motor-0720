@@ -491,8 +491,8 @@ class TestAsyncSchedulerClient:
         req_info.req_len = 100
         req_info.req_data = {}
         req_info.token_ids = list(range(100))
-        req_info.smetric_debug = {(instance.id, endpoint.id): 20.0}
-        req_info.kv_affinity_debug = None
+        req_info.smetric_debug = None
+        req_info.kv_affinity_debug = {(instance.id, endpoint.id): (80, 0.0, 20.0)}
         self._mock_send_request(
             SchedulerResponseType.SUCCESS,
             {
@@ -505,7 +505,7 @@ class TestAsyncSchedulerClient:
         with patch.object(
             self.client,
             "_select_endpoint_candidates_with_policy",
-            return_value=([(instance, endpoint, 20.0)], "smetric"),
+            return_value=([(instance, endpoint, 20.0)], "kv_cache_affinity"),
         ):
             result = await self.client.select_and_allocate(PDRole.ROLE_P, req_info)
 

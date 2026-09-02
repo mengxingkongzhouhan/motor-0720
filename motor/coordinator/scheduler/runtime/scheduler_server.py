@@ -717,8 +717,8 @@ class _SchedulerRequestDispatcher:
         # Worker-proposed alternates (affinity-ranked, best-first); the authoritative path may
         # re-pick among them by fresh load. Falls back to the single top-1 for legacy callers.
         selected_candidates = self._extract_allocate_candidates(request.data) or [selected_candidate]
-        # Per-endpoint prefill_cost from the worker (kv_cache_affinity unified, or smetric).
-        affinity_candidates = self._extract_affinity_candidates(request.data)
+        # Per-endpoint costs are protocol data; each policy interprets them independently.
+        prefill_candidates = self._extract_prefill_candidates(request.data)
         matched_tokens_map = self._extract_candidate_matched_tokens(request.data)
         fast_path = self._can_use_worker_top1_fast_path(
             worker_workload_sequence,
@@ -731,7 +731,7 @@ class _SchedulerRequestDispatcher:
             # fresh, honor that min-cost top-1. Otherwise pick min request-cost or min ledger cost.
             selected = self._select_smetric_hybrid(
                 selected_candidate,
-                affinity_candidates,
+                prefill_candidates,
                 role,
                 isl,
                 fast_path,
@@ -748,7 +748,7 @@ class _SchedulerRequestDispatcher:
                     selected_candidates,
                     role,
                     candidate_policy,
-                    affinity_candidates,
+                    prefill_candidates,
                     worker_prefill_load_scale,
                     worker_load_weight,
                     required_engine_type,
@@ -760,7 +760,7 @@ class _SchedulerRequestDispatcher:
                     selected_candidates,
                     role,
                     candidate_policy,
-                    affinity_candidates,
+                    prefill_candidates,
                     worker_prefill_load_scale,
                     worker_load_weight,
                     required_engine_type,
@@ -793,8 +793,14 @@ class _SchedulerRequestDispatcher:
             # Non-affinity path (and non-P/U roles, e.g. pinned decode allocation arriving with
             # the affinity policy attached): commit the worker-computed demand as-is.
             workload = worker_demand
-        # KV affinity / SMetric stamp the committed endpoint's prefill_cost; other policies leave 0.
-        workload.prefill_cost = self._lookup_candidate_prefill_cost(affinity_candidates, instance.id, endpoint.id)
+        # Selection costs are persisted only for SMetric. KV affinity may use
+        # the same wire field transiently for unified re-ranking.
+        if candidate_policy == CANDIDATE_POLICY_SMETRIC:
+            workload.prefill_cost = self._lookup_candidate_prefill_cost(
+                prefill_candidates,
+                instance.id,
+                endpoint.id,
+            )
         params = UpdateWorkloadParams(
             instance_id=instance.id,
             endpoint_id=endpoint.id,
@@ -862,13 +868,13 @@ class _SchedulerRequestDispatcher:
             return None
 
     @staticmethod
-    def _extract_affinity_candidates(data: dict) -> list[tuple[int, int, float]]:
+    def _extract_prefill_candidates(data: dict) -> list[tuple[int, int, float]]:
         """
         Parse worker-reported candidates that include a numeric ``prefill_cost``.
 
-        kv_cache_affinity unified and smetric forward every scored endpoint; load_gated forwards
-        its ranked set so the committed endpoint's cost can be stamped on the workload ledger.
-        Empty when the field is absent. Entries missing a numeric prefill_cost are skipped.
+        SMetric forwards every scored endpoint for its gate and ledger. KV affinity unified may
+        use the same protocol field transiently for global re-ranking. Empty when the field is
+        absent; entries missing a numeric prefill_cost are skipped.
         """
         raw = data.get(_KEY_CANDIDATES)
         result: list[tuple[int, int, float]] = []
@@ -956,7 +962,7 @@ class _SchedulerRequestDispatcher:
         candidates: list[tuple[int, int]],
         role: PDRole,
         candidate_policy: str | None,
-        affinity_candidates: list[tuple[int, int, float]] | None = None,
+        prefill_candidates: list[tuple[int, int, float]] | None = None,
         prefill_load_scale: float | None = None,
         load_weight: float | None = None,
         required_engine_type: str | None = None,
@@ -976,9 +982,9 @@ class _SchedulerRequestDispatcher:
             if selected is not None:
                 return selected
         if candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY:
-            if affinity_candidates and prefill_load_scale is not None:
+            if prefill_candidates and prefill_load_scale is not None:
                 selected = self._select_affinity_global(
-                    affinity_candidates, role, prefill_load_scale, load_weight, required_engine_type
+                    prefill_candidates, role, prefill_load_scale, load_weight, required_engine_type
                 )
                 if selected is not None:
                     return selected

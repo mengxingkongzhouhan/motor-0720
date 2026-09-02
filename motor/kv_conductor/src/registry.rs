@@ -189,6 +189,10 @@ pub struct WorkerRegistry {
     /// Built from HBM endpoint registrations; consumed by the pool subscriber
     /// to map `backend_id` in events to the correct DP(s).
     hbm_ip_index: HbmIpIndex,
+    /// Pod IP → DPs for every backend. This registration-only index is the
+    /// authoritative source of query candidates and is never used to fan out
+    /// backend events.
+    pod_dp_index: HbmIpIndex,
     /// Pod IP → node, and node → DPs. Built from `node_id` in registrations;
     /// empty when clients do not send it. Exposed via `GET /workers`.
     node_topology: SharedNodeTopology,
@@ -201,7 +205,7 @@ impl WorkerRegistry {
     /// registration. Unlike cache ownership, this includes DPs that have not
     /// emitted any KV event yet.
     fn global_dps(&self) -> FxHashSet<(InstanceId, DpRank)> {
-        self.hbm_ip_index
+        self.pod_dp_index
             .read()
             .values()
             .flatten()
@@ -283,6 +287,7 @@ impl WorkerRegistry {
             indexer: Arc::new(Indexer::with_config(config)),
             zmq_subscribers: tokio::sync::RwLock::new(HashMap::new()),
             hbm_ip_index: Arc::new(ParkingRwLock::new(HashMap::new())),
+            pod_dp_index: Arc::new(ParkingRwLock::new(HashMap::new())),
             node_topology: Arc::new(ParkingRwLock::new(NodeTopology::default())),
         }
     }
@@ -349,6 +354,16 @@ impl WorkerRegistry {
                 }
                 drop(subs);
 
+                // Query candidates follow registrations rather than cache
+                // ownership. Remove the old Pod mapping even when the backend
+                // is unchanged, because the endpoint may have moved.
+                remove_hbm_ip_index_entries(
+                    &self.pod_dp_index,
+                    &old_medium_endpoints,
+                    &req.instance_id,
+                    req.dp_rank,
+                );
+
                 // Drop radix tree data if backend changed.
                 if backend_changed {
                     let ie = self.indexer.get(&req.modelname, &req.tenant_id);
@@ -369,6 +384,17 @@ impl WorkerRegistry {
                     );
                 }
             }
+        }
+
+        // Every engine registration contributes to the authoritative global
+        // DP set, regardless of whether its backend uses IP-based auto-attach.
+        if !is_pool {
+            add_hbm_ip_index_entries(
+                &self.pod_dp_index,
+                &req.medium_endpoints,
+                &req.instance_id,
+                req.dp_rank,
+            );
         }
 
         // Index HBM endpoint IPs for pool backends.
@@ -518,6 +544,12 @@ impl WorkerRegistry {
                 if let Some(info) = entry.endpoints.get(&req.dp_rank) {
                     remove_hbm_ip_index_entries(
                         &self.hbm_ip_index,
+                        &info.medium_endpoints,
+                        &req.instance_id,
+                        req.dp_rank,
+                    );
+                    remove_hbm_ip_index_entries(
+                        &self.pod_dp_index,
                         &info.medium_endpoints,
                         &req.instance_id,
                         req.dp_rank,
@@ -812,9 +844,9 @@ mod tests {
     fn test_global_dps_are_deduplicated_from_pod_index() {
         let registry = WorkerRegistry::new();
         let endpoints = npu_endpoints("tcp://10.244.0.5:50090");
-        add_hbm_ip_index_entries(&registry.hbm_ip_index, &endpoints, "prefill-1", 0);
-        add_hbm_ip_index_entries(&registry.hbm_ip_index, &endpoints, "prefill-1", 0);
-        add_hbm_ip_index_entries(&registry.hbm_ip_index, &endpoints, "prefill-1", 1);
+        add_hbm_ip_index_entries(&registry.pod_dp_index, &endpoints, "prefill-1", 0);
+        add_hbm_ip_index_entries(&registry.pod_dp_index, &endpoints, "prefill-1", 0);
+        add_hbm_ip_index_entries(&registry.pod_dp_index, &endpoints, "prefill-1", 1);
 
         assert_eq!(
             registry.global_dps(),

@@ -12,8 +12,8 @@ import inspect
 import motor.coordinator.process.inference_manager as inference_manager
 
 
-def test_inference_worker_initializes_the_shared_kv_affinity_tokenizer():
-    """The worker uses the in-process KV-affinity tokenizer, not a sidecar."""
+def test_inference_worker_initializes_the_shared_scheduler_tokenizer():
+    """The worker initializes the policy-neutral in-process tokenizer."""
     assert hasattr(inference_manager, "TokenizerManager")
     source = inspect.getsource(inference_manager.run_inference_worker_proc)
     assert "TokenizerManager(config)" in source

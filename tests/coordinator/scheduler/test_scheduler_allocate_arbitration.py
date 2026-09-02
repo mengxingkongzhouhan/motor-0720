@@ -864,7 +864,7 @@ async def test_allocate_only_smetric_picks_lowest_cost_ignoring_load():
             "instance_version": workload_writer.instance_version,
             "workload_active_tokens": 3.0,
             "candidate_policy": CANDIDATE_POLICY_SMETRIC,
-            "isl": 20,  # min cost 12 / 20 > 0.5 so min-cost ranking applies (empty average)
+            "isl": 100,  # cached ratio (100 - 12) / 100 > 0.5, so min-cost ranking applies
         },
     )
 
@@ -942,7 +942,7 @@ def _smetric_allocate_dispatcher():
 
 @pytest.mark.asyncio
 async def test_allocate_only_smetric_low_ratio_picks_min_ledger_prefill_cost():
-    """First request with cost/isl <= 0.5 should pick the least remaining ledger prefill."""
+    """A low cached-prefix ratio should pick the least remaining ledger prefill."""
     config, instance_manager = _smetric_allocate_dispatcher()
     inst_a = _make_prefill_instance(1, (10, 11))
     inst_b = _make_prefill_instance(2, (20, 21))
@@ -974,7 +974,7 @@ async def test_allocate_only_smetric_low_ratio_picks_min_ledger_prefill_cost():
             "instance_version": workload_writer.instance_version,
             "workload_active_tokens": 3.0,
             "candidate_policy": CANDIDATE_POLICY_SMETRIC,
-            "isl": 100,  # 20/100 <= 0.5
+            "isl": 30,  # cached ratio (30 - 20) / 30 <= 0.5
         },
     )
 
@@ -1027,7 +1027,7 @@ async def test_allocate_only_smetric_average_is_shared_across_requests():
             "instance_version": workload_writer.instance_version,
             "workload_active_tokens": 3.0,
             "candidate_policy": CANDIDATE_POLICY_SMETRIC,
-            "isl": 20,  # 12/20 > 0.5, no history → min-cost
+            "isl": 100,  # cached ratio (100 - 12) / 100 > 0.5, no history → min-cost
         },
     )
     first_resp = await dispatcher.dispatch(first)
@@ -1051,7 +1051,7 @@ async def test_allocate_only_smetric_average_is_shared_across_requests():
             "instance_version": workload_writer.instance_version,
             "workload_active_tokens": 3.0,
             "candidate_policy": CANDIDATE_POLICY_SMETRIC,
-            "isl": 100,  # 80/100 > 0.5 but 80 > avg 12 → min ledger prefill_cost
+            "isl": 100,  # 80 > 2 * avg 12 → min ledger prefill_cost
         },
     )
     second_resp = await dispatcher.dispatch(second)
@@ -1095,7 +1095,7 @@ async def test_allocate_only_smetric_fast_path_honors_worker_min_cost_top1():
             "instance_version": workload_writer.instance_version,
             "workload_active_tokens": 3.0,
             "candidate_policy": CANDIDATE_POLICY_SMETRIC,
-            "isl": 20,  # min cost 12 / 20 > 0.5, empty average → SM
+            "isl": 100,  # cached ratio (100 - 12) / 100 > 0.5, empty average → SM
         },
     )
 
@@ -1114,7 +1114,7 @@ async def test_allocate_only_smetric_fast_path_honors_worker_min_cost_top1():
 
 @pytest.mark.asyncio
 async def test_allocate_only_smetric_matching_sequence_still_picks_min_ledger_when_gated():
-    """A fresh worker view does not skip the hybrid gate: cost/isl <= 0.5 still uses min ledger cost."""
+    """A fresh worker view does not skip the cached-prefix ratio gate."""
     config, instance_manager = _smetric_allocate_dispatcher()
     inst_a = _make_prefill_instance(1, (10, 11))
     inst_b = _make_prefill_instance(2, (20, 21))
@@ -1145,7 +1145,7 @@ async def test_allocate_only_smetric_matching_sequence_still_picks_min_ledger_wh
             "instance_version": workload_writer.instance_version,
             "workload_active_tokens": 3.0,
             "candidate_policy": CANDIDATE_POLICY_SMETRIC,
-            "isl": 100,  # 20/100 <= 0.5 → min ledger despite matching sequence
+            "isl": 30,  # cached ratio (30 - 20) / 30 <= 0.5 → min ledger
         },
     )
 

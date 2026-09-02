@@ -10,18 +10,19 @@
 
 """Tests for SMetricPolicy: rank by prefill_cost with overlap_credit fixed at 1."""
 
-import logging
 import inspect
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+import motor.coordinator.scheduler.policy.smetric as smetric_module
 from motor.common.resources.instance import PDRole
 from motor.config.coordinator import SchedulerType
 from motor.coordinator.api_client.conductor_api_client import TENANT_ID, conductor_instance_id
+from motor.coordinator.domain.scheduling_pin import select_endpoint_for_instance
 from motor.coordinator.scheduler.policy.factory import create
-import motor.coordinator.scheduler.policy.smetric as smetric_module
 from motor.coordinator.scheduler.policy.smetric import (
     SMetricPolicy,
     SMetricPrefillCostTracker,
@@ -32,13 +33,13 @@ from motor.coordinator.scheduler.policy.smetric import (
 from motor.coordinator.scheduler.runtime.scheduler_client import (
     AsyncSchedulerClient,
     SchedulerClientConfig,
+    _smetric_candidate_payload,
 )
-from motor.coordinator.scheduler.scheduler import Scheduler
 from motor.coordinator.scheduler.runtime.zmq_protocol import (
     SchedulerResponse,
     SchedulerResponseType,
 )
-from motor.coordinator.domain.scheduling_pin import select_endpoint_for_instance
+from motor.coordinator.scheduler.scheduler import Scheduler
 from tests.coordinator.scheduler.conftest import MockInstanceProvider
 
 
@@ -370,8 +371,6 @@ class TestSMetricClientDispatch:
         mock_lb.assert_called_once_with([instance], PDRole.ROLE_P, 1)
 
     def test_smetric_candidate_payload_reads_own_costs(self):
-        from motor.coordinator.scheduler.runtime.scheduler_client import _smetric_candidate_payload
-
         payload = _smetric_candidate_payload(
             1,
             10,

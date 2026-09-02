@@ -266,6 +266,25 @@ pub struct DpBlocks {
     pub cpu_blocks: u32,
     /// Exclusive Disk matched block count (beyond max(NPU, CPU) coverage).
     pub disk_blocks: u32,
+    /// How `cpu_blocks` splits by how far the block has to travel.
+    ///
+    /// A pool event fans out to every DP in the Pod that reported it, so "this DP
+    /// owns the block" means "the block is in this DP's own Pod" — and same Pod
+    /// implies same machine, i.e. a near-free DRAM read. Everything else is
+    /// counted remote and costs a transfer over `device_rdma` / `device_sdma` /
+    /// `device_urma`.
+    ///
+    /// Invariant: `cpu_local_blocks + cpu_remote_blocks == cpu_blocks`. Blocks
+    /// already covered by NPU are excluded from both — they need no fetch.
+    ///
+    /// The split is deliberately conservative: a block held by a *different* Pod
+    /// on the same machine is also a cheap read, but the conductor cannot see
+    /// that without a machine identity, so it counts as remote. `local` is
+    /// therefore a lower bound on co-location — never an over-count, which is the
+    /// safe direction (over-counting would tell the scheduler a fetch is free
+    /// when it is not).
+    pub cpu_local_blocks: u32,
+    pub cpu_remote_blocks: u32,
 }
 
 /// Per-instance match data returned in query response.
@@ -351,7 +370,9 @@ pub fn encode_query_response_msgpack(response: &QueryResponse, out: &mut Vec<u8>
                 .expect("write map len");
             for (rank, blocks) in &data.dp {
                 write_str(out, rank).expect("write rank");
-                write_map_len(out, 4).expect("blocks map len");
+                // Field count must match the `Serialize` derive on `DpBlocks`;
+                // the msgpack/JSON shape equality test guards the two together.
+                write_map_len(out, 6).expect("blocks map len");
                 write_str(out, "matched_tokens").expect("write key");
                 write_u32(out, blocks.matched_tokens).expect("write matched_tokens");
                 write_str(out, "npu_blocks").expect("write key");
@@ -360,6 +381,10 @@ pub fn encode_query_response_msgpack(response: &QueryResponse, out: &mut Vec<u8>
                 write_u32(out, blocks.cpu_blocks).expect("write cpu_blocks");
                 write_str(out, "disk_blocks").expect("write key");
                 write_u32(out, blocks.disk_blocks).expect("write disk_blocks");
+                write_str(out, "cpu_local_blocks").expect("write key");
+                write_u32(out, blocks.cpu_local_blocks).expect("write cpu_local_blocks");
+                write_str(out, "cpu_remote_blocks").expect("write key");
+                write_u32(out, blocks.cpu_remote_blocks).expect("write cpu_remote_blocks");
             }
         }
     }
@@ -780,6 +805,7 @@ mod tests {
                 npu_blocks: 6,
                 cpu_blocks: 0,
                 disk_blocks: 0,
+                ..Default::default()
             },
         );
         imd.dp.insert(
@@ -789,6 +815,8 @@ mod tests {
                 npu_blocks: 0,
                 cpu_blocks: 4,
                 disk_blocks: 0,
+                cpu_local_blocks: 1,
+                cpu_remote_blocks: 3,
             },
         );
 
@@ -1027,6 +1055,7 @@ mod tests {
                 npu_blocks: 3,
                 cpu_blocks: 0,
                 disk_blocks: 0,
+                ..Default::default()
             },
         );
         dp.insert(
@@ -1036,6 +1065,9 @@ mod tests {
                 npu_blocks: 1,
                 cpu_blocks: 3,
                 disk_blocks: 0,
+                // 2 of the 3 pooled blocks are on this DP's own machine.
+                cpu_local_blocks: 2,
+                cpu_remote_blocks: 1,
             },
         );
         instances.insert(

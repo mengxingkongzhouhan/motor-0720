@@ -84,7 +84,7 @@ Coordinator 调度器（`kv_cache_affinity`）按 `*_blocks` 与配置项
    └─────────────────────────────────────────────────────┘
 ```
 
-- 上层介质命中后，下层介质**从上层断点续查**；同时对拥有首边的 worker **无条件 root 走查**，与续接链并列，取绝对终点最远者（如实报告更长副本）
+- 上层介质命中后，下层介质**从本 DP 自己的上层断点续查**（断点不跨 DP 共享）；同时对拥有首边的 worker **无条件 root 走查**，与续接链并列，取绝对终点最远者（如实报告更长副本）
 - HBM 是前缀树（从 root 走）；CPU/Disk 是 continuation-edge 图（断点续查 + root 走查）
 - 同一 `(instance_id, dp_rank)` 的跨介质命中在响应中聚合到同一个 DP 条目
 
@@ -166,6 +166,7 @@ CPU/DISK 不使用完整 RadixTree，而是轻量的 **continuation-edge 图**�
   HBM tree returns: W1 depth=2, last_seq=seq200
 
   Candidate a) breakpoint resume from (seq200, H2):
+    // only granted to W1's own (instance_id, dp_rank)
     edge(seq200, H2) -> seq300  OK
     edge(seq300, H3) -> seq400  OK
     edge(seq400, H4) -> ???     MISSING -> stop
@@ -180,6 +181,57 @@ CPU/DISK 不使用完整 RadixTree，而是轻量的 **continuation-edge 图**�
   matched_tokens = (npu + cpu + disk) × block_size   // unweighted coverage
   // Coordinator affinity: round((npu×w_npu + cpu×w_cpu + disk×w_disk) × block_size)
 ```
+
+### 下层走查忽略 owner：报"能免重算服务多长"而非"本地有多长"
+
+池化块通过后端传输协议（`device_rdma` / `device_sdma` / `device_urma`，见
+`mmc-local-*.conf` 的 `ock.mmc.local_service.protocol`）**任意节点可取**，所以别的 DP
+持有的块同样能让本 DP 跳过重算。下层走查因此**不校验 owner**，只在边不存在时停止。
+
+**关键的介质不对称**：
+
+| 介质 | 跨节点可取? | 走查语义 |
+|------|------------|---------|
+| HBM | ❌ 设备显存，取不到别人的 | `find_matches_detailed` 逐层求交，**严格按 owner** |
+| CPU / Disk | ✅ 池化，任意节点可取 | `reachable_from` **忽略 owner** |
+
+那各 DP 的结果凭什么还不同?两处，都是 per-DP 的：
+
+1. **走查起点**。每个 DP 从**自己的**上层断点续接；自己上层没命中就从 root 走。因为 HBM
+   取不到别人的，只有持有那些块的 DP 能用它们跨过池链中的缺口。
+2. **归属切分**。互斥切分把 `[0, npu_end)` 记为 NPU（本地、免费）、其余记为 CPU/Disk
+   （需搬运），于是 `kv_affinity.w_cpu` / `w_disk` 成为"优先选本地已有的节点"的旋钮。
+
+```text
+  池链: [0,2) 存在，位置 2 缺失，[3,5) 锚在位置 2 的 block_hash 之后
+  inst-a HBM: [0,3)     inst-b DRAM: [0,2) 与 [3,5)
+
+  inst-a: 自己断点 pos=3 -> reachable_from(3, seq102) -> 取到 inst-b 的 [3,5) -> 终点 5
+          npu_blocks=3（本地）+ cpu_blocks=2（搬运）= 5 块
+  inst-b: 无 HBM 命中 -> root 走查 -> [0,2) 后位置 2 缺失 -> 终点 2
+          npu_blocks=0 + cpu_blocks=2 = 2 块
+
+  => inst-a 靠自己的 HBM 桥接缺口而走得更远；亲和信号未被抹平
+```
+
+**断点仍只归产生它的 DP**：`edge_owners` 返回该边的全部 owner，若允许借用别的 DP 的断点，
+只持有中间段的 worker 会跨过自己**取不到**的空洞谎报前缀——因为空洞那一段在别人的 HBM 里：
+
+```text
+  inst-a HBM: [0,2)            -> breakpoint (end_pos=2, last_seq=seq200)
+  inst-b DRAM: [2,3) only
+
+  借用 inst-a 断点：inst-b 从 pos=2 起跑 -> 终点 3 -> npu=0, cpu=3
+    声称能服务 3 块，但位置 0..2 只在 inst-a 的 HBM 里，inst-b 取不到 -> 实际得全量重算
+  按 DP 索引断点后：inst-b 无起点，不进 medium_ends
+    而 inst-a 从自己断点起跑、取到 inst-b 的池块 -> npu=2 + cpu=1 = 3 块（正确）
+```
+
+root 走查不依赖任何上层覆盖，所以「HBM 全被驱逐、池中保有完整根链」这一池化核心场景仍能
+如实报告。**所有已注册 DP 都参与下层走查**：查询从注册时维护的 Pod IP → DPs 索引汇总全局
+DP 集合，再按当前 model/tenant 过滤后传给 Indexer；不再从缓存 owner 反推 DP。本地尚未产生
+任何缓存事件的 DP 也能从池子取，报 0 会高估它的 prefill 代价。root 走查忽略 owner，因此对
+所有 DP 结果相同，只计算一次后复用。
 
 ---
 
@@ -247,6 +299,37 @@ CPU/DISK 不使用完整 RadixTree，而是轻量的 **continuation-edge 图**�
 - 注销会停止该实例/DP 的全部 subscriber，删除 HBM IP 映射及三层索引；删除最后一个 DP
   时，使用**注册记录中的** model/tenant 回收空 `IndexerEntry`，不信任注销请求里的同名字段。
 - `POST /events` 的 `shutdown=true` 当前只记录日志，完整释放仍需显式调用 `/unregister`。
+
+### 池命中的本地/远端拆分
+
+池块任意节点可取，但**搬运代价不同**：本机 DRAM 几乎免费，跨机要走
+`device_rdma` / `device_sdma` / `device_urma`。原先所有池命中都统一记作 `cpu_blocks`，
+调度器看不出这个差异。
+
+判断依据是**边的 owner**：一条池事件会广播给上报它的那个 Pod 里的所有 DP，所以「owner 里
+有当前 DP」等价于「这块在当前 DP 自己的 Pod 里」，而同 Pod 必然同机 —— 于是这就是一次
+免搬运的本地读。查询侧不需要任何拓扑信息：
+
+```text
+  走查覆盖 [start, end)，逐块问 owner 里有没有自己
+    有   -> cpu_local_blocks  += 1     本 Pod DRAM
+    没有 -> cpu_remote_blocks += 1     需要传输
+
+  只统计 exclusive_from 之后的位置（CPU 层取 npu_end，Disk 层取 max(npu_end, cpu_end)）：
+  之前的块已被更高优先级介质本地覆盖，不需要搬运
+  => cpu_local_blocks + cpu_remote_blocks == cpu_blocks（不变式，有测试守护）
+```
+
+实现上，走查对所有 DP 相同（忽略 owner），所以只走一次并顺手收下经过的块标识
+（`reachable_chain`）；每个 DP 再拿这串标识去查已有的 per-worker 反查表
+（`count_owned`，这张表本来是为 O(1) 删除建的，这里白嫖），而不是每个 DP 各走一遍。
+
+**这个拆分是刻意保守的**：同机不同 Pod 的块其实也是便宜的本地读，但 conductor 没有机器
+标识就看不出来，只能记作远端。所以 `cpu_local_blocks` 是共置的**下界** —— 只会低估，不会
+高估。方向很重要：高估会告诉调度器「这次搬运免费」，而实际要跨机，直接打在 TTFT 上。
+
+当前保持原始 Pod 粒度：同机不同 Pod 仍按远端命中处理；一机一 Pod 时 Pod 粒度等价于机器
+粒度。是否需要扩展到跨 Pod 共置识别，应另行设计，不属于当前接口。
 
 ---
 
@@ -379,8 +462,11 @@ CPU/DISK 不使用完整 RadixTree，而是轻量的 **continuation-edge 图**�
 | | HBM RadixTree | CPU/Disk Continuation |
 |---|---|---|
 | 匹配方式 | root 出发，树遍历 | 边遍历：断点续接链 + root 链并列候选 |
-| 缺失处理 | 第一个缺失即停 | 第一个缺失边/缺失 Worker 即停 |
-| root 走查条件 | 总是 | **无条件**（拥有首边即走；与续接链取绝对终点最远者） |
+| 缺失处理 | 第一个缺失即停 | 第一个缺失**边**即停（不因边属于别人而停） |
+| 是否校验 owner | ✅ 逐层求交（HBM 跨节点取不到） | ❌ 忽略（池块任意节点可取） |
+| root 走查条件 | 总是 | **无条件**，且对所有 DP 相同（只算一次） |
+| 断点作用域 | 不适用 | **仅本 `(instance_id, dp_rank)`**，不跨 DP 借用 |
+| 报的是什么 | 该 worker 本地持有的前缀 | 该 DP **能免重算服务**的前缀 |
 | 保证 | 匹配的块形成合法前缀链 | 与 HBM 衔接的续接链 + 本层更长副本均可如实报告 |
 
 断点续查保证三层命中块是**同一条连续前缀**，与 vLLM prefix cache 的查找语义

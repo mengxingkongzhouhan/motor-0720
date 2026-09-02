@@ -103,12 +103,12 @@ class TestPrefillCostFormula:
 class TestSMetricPrefillCostTracker:
     def test_first_request_ranks_when_ratio_above_half(self):
         tracker = SMetricPrefillCostTracker()
-        assert tracker.use_smetric_rank(req_cost=60, isl=100) is True
+        assert tracker.use_smetric_rank(req_cost=40, isl=100) is True
 
     def test_first_request_uses_lb_when_ratio_at_most_half(self):
         tracker = SMetricPrefillCostTracker()
         assert tracker.use_smetric_rank(req_cost=50, isl=100) is False
-        assert tracker.use_smetric_rank(req_cost=10, isl=100) is False
+        assert tracker.use_smetric_rank(req_cost=60, isl=100) is False
 
     def test_zero_isl_uses_lb(self):
         tracker = SMetricPrefillCostTracker()
@@ -121,11 +121,16 @@ class TestSMetricPrefillCostTracker:
         assert tracker.snapshot()[0] == 10
         assert tracker.use_smetric_rank(req_cost=60, isl=100) is False
 
+    def test_cost_at_twice_average_still_checks_ratio(self):
+        tracker = SMetricPrefillCostTracker()
+        tracker.record(10)
+        assert tracker.use_smetric_rank(req_cost=20, isl=100) is True
+
     def test_cost_at_average_still_checks_ratio(self):
         tracker = SMetricPrefillCostTracker()
         tracker.record(60)
-        assert tracker.use_smetric_rank(req_cost=60, isl=100) is True
-        assert tracker.use_smetric_rank(req_cost=40, isl=100) is False
+        assert tracker.use_smetric_rank(req_cost=60, isl=100) is False
+        assert tracker.use_smetric_rank(req_cost=40, isl=100) is True
 
 
 class TestSMetricPolicyRanking:

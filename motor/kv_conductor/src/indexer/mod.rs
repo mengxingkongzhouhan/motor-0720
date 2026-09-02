@@ -271,7 +271,9 @@ impl IndexerEntry {
     }
 
     pub fn find_matches_by_hash(&self, block_hashes: &[LocalBlockHash]) -> OverlapBlocks {
-        self.find_matches_with_coverage(block_hashes).0
+        let indexed_dps = self.indexed_dps();
+        self.find_matches_with_coverage(block_hashes, &indexed_dps)
+            .0
     }
 
     /// Query with per-DP absolute coverage ends per medium (in blocks).
@@ -282,6 +284,7 @@ impl IndexerEntry {
     fn find_matches_with_coverage(
         &self,
         block_hashes: &[LocalBlockHash],
+        known_dps: &FxHashSet<(String, DpRank)>,
     ) -> (OverlapBlocks, FxHashMap<(String, DpRank), MediumEnds>) {
         let mut overlap = OverlapBlocks::default();
         let mut medium_ends: FxHashMap<(String, DpRank), MediumEnds> = FxHashMap::default();
@@ -317,11 +320,6 @@ impl IndexerEntry {
             })
             .collect();
 
-        // Pooled blocks are reachable from any DP, so a DP holding nothing of
-        // its own can still serve a pooled prefix — every known DP must be
-        // considered on the lower tiers, not just the ones owning edges.
-        let known_dps = self.known_dps();
-
         let mut sink = MatchSink {
             overlap: &mut overlap,
             medium_ends: &mut medium_ends,
@@ -334,7 +332,7 @@ impl IndexerEntry {
             &hbm_breaks,
             &self.cpu_tiers,
             StorageMedium::Cpu,
-            &known_dps,
+            known_dps,
             &mut sink,
         );
 
@@ -346,15 +344,19 @@ impl IndexerEntry {
             &disk_breaks,
             &self.disk_tiers,
             StorageMedium::Disk,
-            &known_dps,
+            known_dps,
             &mut sink,
         );
 
         (overlap, medium_ends)
     }
 
-    /// Every `(instance_id, dp_rank)` this index has seen, across all media.
-    fn known_dps(&self) -> FxHashSet<(String, DpRank)> {
+    /// DPs inferred from cache ownership, used only by the standalone Indexer API.
+    ///
+    /// Production queries pass the registration-derived DP set explicitly so a
+    /// registered DP does not disappear merely because it has not emitted a
+    /// cache event yet.
+    fn indexed_dps(&self) -> FxHashSet<(String, DpRank)> {
         let mut dps: FxHashSet<(String, DpRank)> = FxHashSet::default();
         for wk in self.lookups.read().keys() {
             dps.insert((wk.instance_id.clone(), wk.dp_rank));
@@ -1085,6 +1087,35 @@ impl Indexer {
         token_ids: &[i64],
         block_size: u32,
     ) -> Result<QueryResponse, KvConductorError> {
+        self.query_with_dps(model_name, tenant_id, token_ids, block_size, None)
+    }
+
+    /// Query using the authoritative registration-derived DP set.
+    pub fn query_for_dps(
+        &self,
+        model_name: &str,
+        tenant_id: &str,
+        token_ids: &[i64],
+        block_size: u32,
+        registered_dps: &FxHashSet<(String, DpRank)>,
+    ) -> Result<QueryResponse, KvConductorError> {
+        self.query_with_dps(
+            model_name,
+            tenant_id,
+            token_ids,
+            block_size,
+            Some(registered_dps),
+        )
+    }
+
+    fn query_with_dps(
+        &self,
+        model_name: &str,
+        tenant_id: &str,
+        token_ids: &[i64],
+        block_size: u32,
+        registered_dps: Option<&FxHashSet<(String, DpRank)>>,
+    ) -> Result<QueryResponse, KvConductorError> {
         let t0 = std::time::Instant::now();
 
         let entry = self
@@ -1097,7 +1128,15 @@ impl Indexer {
         let t_hash = std::time::Instant::now();
         let block_hashes = compute_block_hash_for_seq(token_ids, block_size);
         let hash_us = t_hash.elapsed().as_micros();
-        let (overlap, medium_ends) = entry.find_matches_with_coverage(&block_hashes);
+        let indexed_dps;
+        let known_dps = match registered_dps {
+            Some(dps) => dps,
+            None => {
+                indexed_dps = entry.indexed_dps();
+                &indexed_dps
+            }
+        };
+        let (overlap, medium_ends) = entry.find_matches_with_coverage(&block_hashes, known_dps);
         tracing::debug!(
             num_tokens = token_ids.len(),
             block_size,
@@ -1142,6 +1181,27 @@ impl Indexer {
         tenant_id: &str,
         block_hashes: &[LocalBlockHash],
     ) -> Result<QueryResponse, KvConductorError> {
+        self.query_by_hash_with_dps(model_name, tenant_id, block_hashes, None)
+    }
+
+    /// Query pre-computed hashes using the authoritative registration-derived DP set.
+    pub fn query_by_hash_for_dps(
+        &self,
+        model_name: &str,
+        tenant_id: &str,
+        block_hashes: &[LocalBlockHash],
+        registered_dps: &FxHashSet<(String, DpRank)>,
+    ) -> Result<QueryResponse, KvConductorError> {
+        self.query_by_hash_with_dps(model_name, tenant_id, block_hashes, Some(registered_dps))
+    }
+
+    fn query_by_hash_with_dps(
+        &self,
+        model_name: &str,
+        tenant_id: &str,
+        block_hashes: &[LocalBlockHash],
+        registered_dps: Option<&FxHashSet<(String, DpRank)>>,
+    ) -> Result<QueryResponse, KvConductorError> {
         let entry = self
             .get(model_name, tenant_id)
             .ok_or_else(|| KvConductorError::NoIndexer {
@@ -1149,7 +1209,15 @@ impl Indexer {
                 tenant_id: tenant_id.to_string(),
             })?;
 
-        let (overlap, medium_ends) = entry.find_matches_with_coverage(block_hashes);
+        let indexed_dps;
+        let known_dps = match registered_dps {
+            Some(dps) => dps,
+            None => {
+                indexed_dps = entry.indexed_dps();
+                &indexed_dps
+            }
+        };
+        let (overlap, medium_ends) = entry.find_matches_with_coverage(block_hashes, known_dps);
         // Default to 1 token per hash (no scaling) since we don't know the
         // original block_size from the hash alone.
         self.build_response(&overlap, &medium_ends, model_name, tenant_id, 1)

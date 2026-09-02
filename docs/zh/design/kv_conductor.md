@@ -228,9 +228,10 @@ CPU/DISK 不使用完整 RadixTree，而是轻量的 **continuation-edge 图**�
 ```
 
 root 走查不依赖任何上层覆盖，所以「HBM 全被驱逐、池中保有完整根链」这一池化核心场景仍能
-如实报告。**所有已知 DP 都参与下层走查**（`known_dps()`：HBM lookups ∪ 各 tier 的
-`worker_keys()`），本地什么都没有的 DP 也能从池子取，报 0 会高估它的 prefill 代价。root
-走查忽略 owner，因此对所有 DP 结果相同，只计算一次后复用。
+如实报告。**所有已注册 DP 都参与下层走查**：查询从注册时维护的 Pod IP → DPs 索引汇总全局
+DP 集合，再按当前 model/tenant 过滤后传给 Indexer；不再从缓存 owner 反推 DP。本地尚未产生
+任何缓存事件的 DP 也能从池子取，报 0 会高估它的 prefill 代价。root 走查忽略 owner，因此对
+所有 DP 结果相同，只计算一次后复用。
 
 ---
 

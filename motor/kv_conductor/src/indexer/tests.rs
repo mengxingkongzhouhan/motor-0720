@@ -962,17 +962,15 @@ fn test_own_hbm_bridges_pool_gap_and_differentiates_dps() {
 
 #[test]
 fn test_dp_without_local_data_still_reports_pooled_reach() {
-    // inst-c holds blocks for an unrelated prefix, so it matches nothing of its
-    // own for this query. It can still fetch the pooled prefix, so reporting 0
-    // would over-estimate its prefill cost.
+    // inst-c is registered but has never emitted a cache event. It can still
+    // fetch the pooled prefix, so reporting 0 would over-estimate its prefill
+    // cost.
     let indexer = Indexer::new();
     let entry = indexer.get_or_create("model-idle-dp", "t1");
 
     let tokens: Vec<i64> = (0..8).collect();
     let hashes = compute_block_hash_for_seq(&tokens, 4);
     assert_eq!(hashes.len(), 2);
-    let other: Vec<i64> = (900..908).collect();
-    let other_hashes = compute_block_hash_for_seq(&other, 4);
 
     store_chain(
         &entry,
@@ -980,15 +978,12 @@ fn test_dp_without_local_data_still_reports_pooled_reach() {
         None,
         &[(100, hashes[0].0), (101, hashes[1].0)],
     );
-    // inst-c is known to the index but holds a different prefix.
-    store_chain(
-        &entry,
-        &worker_of("inst-c", 0, StorageMedium::Npu),
-        None,
-        &[(900, other_hashes[0].0)],
-    );
 
-    let resp = indexer.query("model-idle-dp", "t1", &tokens, 4).unwrap();
+    let registered_dps =
+        FxHashSet::from_iter([("inst-a".to_string(), 0), ("inst-c".to_string(), 0)]);
+    let resp = indexer
+        .query_for_dps("model-idle-dp", "t1", &tokens, 4, &registered_dps)
+        .unwrap();
     let tenant = &resp.tenants["t1"];
 
     let dp_c = &tenant["inst-c"].dp["0"];

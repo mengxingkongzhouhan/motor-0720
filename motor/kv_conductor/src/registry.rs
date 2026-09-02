@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock as ParkingRwLock;
+use rustc_hash::FxHashSet;
 
 use crate::backend::{MatchMode, StoreBackend};
 use crate::error::KvConductorError;
@@ -194,6 +195,43 @@ pub struct WorkerRegistry {
 }
 
 impl WorkerRegistry {
+    /// Snapshot every DP in the registration-derived Pod → DPs index.
+    ///
+    /// A set removes duplicates caused by multiple Pod endpoints or repeated
+    /// registration. Unlike cache ownership, this includes DPs that have not
+    /// emitted any KV event yet.
+    fn global_dps(&self) -> FxHashSet<(InstanceId, DpRank)> {
+        self.hbm_ip_index
+            .read()
+            .values()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    /// Restrict the global DP snapshot to the model/tenant being queried.
+    ///
+    /// The Pod index is cluster-wide; without this guard, a pooled prefix for
+    /// one model could be reported against a DP serving another model.
+    async fn query_dps(
+        &self,
+        model_name: &str,
+        tenant_id: &str,
+    ) -> FxHashSet<(InstanceId, DpRank)> {
+        let global_dps = self.global_dps();
+        let instances = self.instances.read().await;
+        global_dps
+            .into_iter()
+            .filter(|(instance_id, dp_rank)| {
+                instances.get(instance_id).is_some_and(|entry| {
+                    entry.model_name == model_name
+                        && entry.tenant_id == tenant_id
+                        && entry.endpoints.contains_key(dp_rank)
+                })
+            })
+            .collect()
+    }
+
     /// Resolve endpoint→media mapping from either the new `medium_endpoints`
     /// protocol or the legacy `endpoint` field (Mooncake Master compat).
     ///
@@ -556,8 +594,14 @@ impl WorkerRegistry {
 
     /// Query KV cache overlap for a token sequence.
     pub async fn query(&self, req: &QueryRequest) -> Result<QueryResponse, KvConductorError> {
-        self.indexer
-            .query(&req.model, &req.tenant_id, &req.token_ids, req.block_size)
+        let dps = self.query_dps(&req.model, &req.tenant_id).await;
+        self.indexer.query_for_dps(
+            &req.model,
+            &req.tenant_id,
+            &req.token_ids,
+            req.block_size,
+            &dps,
+        )
     }
 
     /// Query KV cache overlap using pre-computed block hashes.
@@ -570,8 +614,9 @@ impl WorkerRegistry {
             .iter()
             .map(|&h| LocalBlockHash(h))
             .collect();
+        let dps = self.query_dps(&req.model, &req.tenant_id).await;
         self.indexer
-            .query_by_hash(&req.model, &req.tenant_id, &hashes)
+            .query_by_hash_for_dps(&req.model, &req.tenant_id, &hashes, &dps)
     }
 
     /// Apply a batch of KV cache events (engine-style, HTTP POST /events).
@@ -761,6 +806,20 @@ mod tests {
 
     fn npu_endpoints(url: &str) -> HashMap<String, String> {
         HashMap::from([("npu".to_string(), url.to_string())])
+    }
+
+    #[test]
+    fn test_global_dps_are_deduplicated_from_pod_index() {
+        let registry = WorkerRegistry::new();
+        let endpoints = npu_endpoints("tcp://10.244.0.5:50090");
+        add_hbm_ip_index_entries(&registry.hbm_ip_index, &endpoints, "prefill-1", 0);
+        add_hbm_ip_index_entries(&registry.hbm_ip_index, &endpoints, "prefill-1", 0);
+        add_hbm_ip_index_entries(&registry.hbm_ip_index, &endpoints, "prefill-1", 1);
+
+        assert_eq!(
+            registry.global_dps(),
+            FxHashSet::from_iter([("prefill-1".to_string(), 0), ("prefill-1".to_string(), 1),])
+        );
     }
 
     /// Two Pods on node-1 (one hosting two DPs), one Pod on node-2.

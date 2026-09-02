@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
 # MindIE is licensed under Mulan PSL v2.
 # You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -12,18 +11,18 @@
 from importlib import import_module
 
 __all__ = [
-    "Scheduler",
-    "SchedulerServer",
-    "SchedulerClient",
-    "SchedulerClientConfig",
-    "SchedulerConnectionManager",
-    "SchedulerRequest",
-    "SchedulerResponse",
-    "SchedulerRequestType",
-    "SchedulerResponseType",
     "BaseSchedulingPolicy",
     "LoadBalancePolicy",
     "RoundRobinPolicy",
+    "SchedulerClient",
+    "SchedulerClientConfig",
+    "SchedulerConnectionManager",
+    "Scheduler",
+    "SchedulerRequest",
+    "SchedulerRequestType",
+    "SchedulerResponse",
+    "SchedulerResponseType",
+    "SchedulerServer",
     "SchedulingPolicyFactory",
 ]
 

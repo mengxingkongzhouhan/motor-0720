@@ -268,8 +268,7 @@ Coordinator                                  KV Conductor
 只能记作远端。所以 `cpu_local_blocks` 是共置的**下界** —— 只会低估不会高估。高估的后果更
 严重：会告诉调度器「这次搬运免费」，而实际要跨机。
 
-要升级成真正的「同机」语义，需要广播覆盖整台机器上的所有 DP（跨 Pod），依赖 `node_id`
-那条尚未打通的链路；**在一机一 Pod 的部署下没有收益**（那时 Pod 级广播已等价于机器级）。
+当前保持原始 Pod 粒度：同机不同 Pod 仍按远端命中处理；一机一 Pod 时 Pod 粒度等价于机器粒度。
 
 调度器读取 `DP[<dp_rank>]` 的 `*_blocks`，按 `scheduler_config.kv_affinity`
 中的 `w_npu/w_cpu/w_disk`（默认 `1.0/1.0/0.0`）加权后再算亲和分（见亲和性调度文档）。
@@ -285,7 +284,7 @@ Coordinator                                  KV Conductor
 
 | 端点 | 方法 | 用途 |
 |------|------|------|
-| `/register` | POST | 注册 Worker（`medium_endpoints`: `npu` / `cpu` / `disk`；可选 `node_id`） |
+| `/register` | POST | 注册 Worker（`medium_endpoints`: `npu` / `cpu` / `disk`） |
 | `/unregister` | POST | 注销 Worker |
 | `/query` | POST | 按 token_ids 查询各 Worker 命中 block 数 |
 | `/query_by_hash` | POST | 使用预计算 hash 查询 |
@@ -319,55 +318,6 @@ Coordinator 通过 `ConductorApiClient` 与 conductor 通信。`user_config.json
   }
 }
 ```
-
-### 节点拓扑（`node_id`,可选）
-
-`/register` 接受一个可选的 `node_id`，表示该 endpoint 跑在**哪台机器**上（K8s 的
-`status.hostIP`，或任何稳定的单机标识）。它与 `medium_endpoints` 里的 **Pod IP** 是两个
-不同层级——一台机器可以跑多个 Pod，每个 Pod 一个独立 Pod IP。
-
-带上之后 conductor 会维护两张表，**方向都是"指向 node"**，可通过 `GET /workers` 的
-`topology` 字段查看：
-
-```json
-{
-  "topology": {
-    "dp_to_node": {
-      "vllm-prefill-1/0": {"pod_ip": "10.244.0.5", "node_id": "node-1"},
-      "vllm-prefill-1/1": {"pod_ip": "10.244.0.5", "node_id": "node-1"},
-      "vllm-prefill-2/0": {"pod_ip": "10.244.0.6", "node_id": "node-1"},
-      "vllm-prefill-3/0": {"pod_ip": "10.244.1.7", "node_id": "node-2"}
-    },
-    "pod_to_node": {
-      "10.244.0.5": "node-1",
-      "10.244.0.6": "node-1",
-      "10.244.1.7": "node-2"
-    }
-  }
-}
-```
-
-| 表 | 键 → 值 | 用途 |
-|----|---------|------|
-| `dp_to_node` | `(instance_id, dp_rank)` → `{pod_ip, node_id}` | 给一个 DP（边的 owner），问它在哪台机器 |
-| `pod_to_node` | Pod IP → node | 给一个 Pod IP（池事件的 `backend_id`），问它在哪台机器 |
-
-**方向是刻意这样的**：消费者要问的是「这个 owner 和我是不是同一台机器」，两次 O(1) 查表
-再比一下即可。反向的 `node → dps` 每次都要扫列表，而且没有对应的消费场景。
-`same_node(dp_a, dp_b)` 直接封装了这个判断；任一方位置未知时返回 `false`——位置不明
-绝不能当作同机，否则远端块会被算成本地。
-
-写入时机跟随注册生命周期：`/register` 写入、`/unregister` 移除、后端类型变化的重注册
-先移除再写入。**没有轮询或刷新** —— Pod 与机器的绑定是静态的（Pod 不会迁移宿主机，
-重调度得到的是新 Pod、新 IP），所以每个 Pod 只在其注册时写一次。移除是精确的：DP 条目
-立即删除，`pod_to_node` 则在该 Pod 的最后一个 DP 离开后才删。
-
-**不带 `node_id` 时两张表为空**，其余行为完全不变——目前 Coordinator 尚未下发该字段，所以这
-两张表当前仅供外部客户端与调试使用，**未接入任何匹配或打分逻辑**。
-
-要接上不需要改 K8s 部署——`HOST_IP`（`status.hostIP`）已经注入到 engine 容器，只是 Python
-侧从不读；缺的是从 NodeManager 经 Controller 到 Coordinator 的字段透传，路径与已经跑通的
-`pod_ip` 完全相同。另一条路是复用 Controller 容错模块已有的 K8s 查询。详见设计文档。
 
 `npu_endpoint` 必须与引擎 `--kv-events-config` 的 `endpoint` 一致（`tcp://*:5557` 为 vLLM 常用值）；
 模式中的 `*` 会被替换为 endpoint IP，端口会加上 `dp_rank`，conductor 主动 connect 到各引擎节点绑定的事件端口。

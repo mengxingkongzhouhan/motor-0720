@@ -300,75 +300,6 @@ DP 集合，再按当前 model/tenant 过滤后传给 Indexer；不再从缓存 
   时，使用**注册记录中的** model/tenant 回收空 `IndexerEntry`，不信任注销请求里的同名字段。
 - `POST /events` 的 `shutdown=true` 当前只记录日志，完整释放仍需显式调用 `/unregister`。
 
-### 节点拓扑：`dp → node` 与 `pod_ip → node`
-
-`/register` 的可选字段 `node_id` 表示该 endpoint 所在的**机器**（K8s `status.hostIP`，
-即 Pod 的宿主 Node）。注意与 `medium_endpoints` 里的 **Pod IP** 分属两个层级：
-
-```text
-  Node（一台机器，status.hostIP）
-   ├── Pod（status.podIP）── DP 0, DP 1 ...
-   └── Pod（另一个 podIP）── DP 0 ...
-```
-
-带上 `node_id` 后，`NodeTopology` 维护两张表（同一把锁，避免解析到半更新状态）。
-**两张表的方向都是「指向 node」**：
-
-| 表 | 键 → 值 | 用途 |
-|----|---------|------|
-| `dp_to_node` | `(instance_id, dp_rank)` → `{pod_ip, node_id}` | 给一个 DP（边的 owner），问它在哪台机器 |
-| `pod_to_node` | Pod IP → node 标识 | 给一个 Pod IP（池事件的 `backend_id`），问它在哪台机器 |
-
-**为什么是这个方向**：消费者要回答的问题是「这个池块的 owner 和我是不是同一台机器」，
-用 `dp → node` 是两次 O(1) 查表加一次比较；反向的 `node → dps` 每次都要扫列表，而且
-没有对应的消费场景（原本设想的「扇出到同机所有 DP」在走查改为忽略 owner 后已无效果——
-走查不再读 owner，扇出只会让每条边的 owner 集合变大而不改变任何上报数字）。
-
-`same_node(dp_a, dp_b)` 封装了这个判断。**任一方位置未知时返回 `false`** —— 位置不明
-绝不能当作同机，否则远端块会被算成本地、低估搬运成本。
-
-**生命周期**：写入时机完全跟随注册——`/register` 写、`/unregister` 删、后端类型变化的
-重注册先删再写；**没有轮询也没有刷新**。因为 Pod 与机器的绑定是静态的（Pod 不迁移宿主机，
-重调度产生的是新 Pod、新 IP），所以每个 Pod 只在注册时写一次。DP 条目在注销时立即删除；
-`pod_to_node` 因为可能被同 Pod 的其他 DP 共用，只在该 Pod 最后一个 DP 离开后才删（DP 表
-的条目里带着自己的 `pod_ip`，扫一遍即可判断，注销是低频操作，比维护单独的计数更简单）。
-
-**只记录 HBM endpoint 的 IP**：`cpu` / `disk` endpoint 可能指向别处的池服务，其 IP 不是
-本引擎的 Pod IP。这也保证 `pod_to_node` 与 `hbm_ip_index` 的键来自同一处
-（`extract_ip_from_endpoint(medium_endpoints["npu"])`），两张索引对得上。
-
-**当前状态**：Coordinator **尚未下发** `node_id`，因此两张表默认为空、行为与之前完全一致；
-表也**尚未接入任何匹配或打分逻辑**，仅通过 `GET /workers` 的 `topology` 字段暴露，供外部
-客户端和排查使用。
-
-要让 Coordinator 填上这个字段，**不需要改 K8s 部署**：`engine_template.yaml` 已经通过
-downward API 把 `status.hostIP` 注入成 `HOST_IP` 环境变量（与 `POD_IP` 并排），只是 Python
-运行时从不读它（目前只有 HCCL 启动脚本在用）。缺的是数据透传，路径与 `pod_ip` 完全相同：
-
-```text
-  status.podIP  -> POD_IP  -> Env.pod_ip -> RegisterMsg.pod_ip
-                -> Endpoint.ip -> InsEventMsg -> ConductorApiClient    已通
-  status.hostIP -> HOST_IP -> ??? -> ??? -> ???                        缺中间四环
-```
-
-中间四环（`Env.host_ip`、`RegisterMsg`、`Endpoint`/`NodeManagerInfo`、
-`instance_assembler` 组装，最后 `ConductorApiClient` 填字段）都只是加字段加赋值。
-
-另一条路是复用 Controller 容错模块已有的 `K8sClient.get_node_hostname_by_pod_ip()`——它
-已经在遍历 `instance.get_node_managers()` 建 `pod_ip → node_name` 映射（RBAC 里 `pods` /
-`nodes` 的 list 权限也齐），只是结果留在 `NodeMetadata` 里，不进 `Instance`、不传 Coordinator。
-这条能省掉 NodeManager 那两环，但有三个前提：`K8sClient` 现在挂在 `FaultManager` 上，
-`enable_fault_tolerance=False` 时整个能力不存在，得先提级；解析只在 `INSTANCE_INITIAL`
-触发，可能晚于首次 conductor 注册（靠定时重注册补，`NodeTopology::record` 是幂等覆盖的）；
-标识格式变成 K8s node name 而非 hostIP，**必须全局统一**，conductor 只做字符串相等比较，
-两种格式混用会把同一台机器认成两台。
-
-注意：`NodeManagerInfo` 本身**没有**机器字段——它的 `pod_ip` 与 `Endpoint.ip` 来自同一个
-`msg.pod_ip`（`instance_assembler` 里 `add_node_mgr` 与 `add_endpoints` 相邻两行），所以
-`node_managers` 只是一份 per-Pod 列表，机器信息得靠外部查询才能得到。另外部分测试已经在
-构造 `NodeManagerInfo(..., host_ip=...)` 和引用 `api_config.host_ip`，但生产模型里没有这些
-字段，Pydantic 静默忽略了它们——动手前先确认这些测试的意图。
-
 ### 池命中的本地/远端拆分
 
 池块任意节点可取，但**搬运代价不同**：本机 DRAM 几乎免费，跨机要走
@@ -397,10 +328,8 @@ downward API 把 `status.hostIP` 注入成 `HOST_IP` 环境变量（与 `POD_IP`
 标识就看不出来，只能记作远端。所以 `cpu_local_blocks` 是共置的**下界** —— 只会低估，不会
 高估。方向很重要：高估会告诉调度器「这次搬运免费」，而实际要跨机，直接打在 TTFT 上。
 
-要把「同 Pod」升级成「同机」，需要让广播覆盖整台机器上的所有 DP（跨 Pod），这依赖上面
-`node_id` 那条尚未打通的链路；而且**在一机一 Pod 的部署下没有任何收益**（那时 Pod 级广播
-已经等价于机器级）。是否值得做，取决于 `*_pod_npu_num` 与单机卡数的比值，以及本地与远端
-池命中的实测 TTFT 差距。
+当前保持原始 Pod 粒度：同机不同 Pod 仍按远端命中处理；一机一 Pod 时 Pod 粒度等价于机器
+粒度。是否需要扩展到跨 Pod 共置识别，应另行设计，不属于当前接口。
 
 ---
 

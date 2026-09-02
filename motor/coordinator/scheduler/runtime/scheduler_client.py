@@ -55,7 +55,7 @@ from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.kv_cache_affinity import KvCacheAffinityPolicy
 from motor.coordinator.scheduler.policy.smetric import SMetricPolicy
-from motor.coordinator.domain.workload_calculator import allocated_prefill_cost, calculate_demand_workload
+from motor.coordinator.domain.workload_calculator import calculate_demand_workload, smetric_prefill_cost
 from motor.coordinator.domain.scheduling_pin import (
     resolve_pinned_instance,
     select_endpoint_for_instance,
@@ -134,19 +134,32 @@ def _endpoint_from_dict(data: dict) -> Endpoint | None:
         return None
 
 
-def _candidate_endpoint_payload(
+def _candidate_endpoint_payload(instance_id: int, endpoint_id: int) -> dict:
+    """Build a policy-neutral ALLOCATE_ONLY candidate."""
+    return {"instance_id": instance_id, "endpoint_id": endpoint_id}
+
+
+def _smetric_candidate_payload(
     instance_id: int,
     endpoint_id: int,
-    affinity_debug: dict | None = None,
-    smetric_debug: dict | None = None,
+    costs: dict | None,
 ) -> dict:
-    """Build one ALLOCATE_ONLY candidate; include prefill_cost when a policy cached it."""
+    """Build one SMetric candidate without inspecting another policy's cache."""
     item: dict = {"instance_id": instance_id, "endpoint_id": endpoint_id}
-    if isinstance(smetric_debug, dict):
-        cost = smetric_debug.get((instance_id, endpoint_id))
+    if isinstance(costs, dict):
+        cost = costs.get((instance_id, endpoint_id))
         if cost is not None:
             item["prefill_cost"] = cost
-            return item
+    return item
+
+
+def _affinity_candidate_payload(
+    instance_id: int,
+    endpoint_id: int,
+    affinity_debug: dict | None,
+) -> dict:
+    """Build one KV-affinity candidate from that policy's own debug cache."""
+    item: dict = {"instance_id": instance_id, "endpoint_id": endpoint_id}
     if not isinstance(affinity_debug, dict):
         return item
     rec = affinity_debug.get((instance_id, endpoint_id))
@@ -928,14 +941,7 @@ class AsyncSchedulerClient:
             # it without globally re-ranking (load_balance would break the pin; smetric has no
             # conductor cost cache on this path and would otherwise reject the allocation).
             candidate_policy = CANDIDATE_POLICY_ROUND_ROBIN
-            candidate_endpoints = [
-                _candidate_endpoint_payload(
-                    instance.id,
-                    endpoint.id,
-                    getattr(req_info, "kv_affinity_debug", None),
-                    getattr(req_info, "smetric_debug", None),
-                )
-            ]
+            candidate_endpoints = [_candidate_endpoint_payload(instance.id, endpoint.id)]
         else:
             # Unified affinity forwards EVERY endpoint (with prefill_cost) for the scheduler's global
             # re-rank, so the worker only needs its own top-1 locally. Only load_gated still proposes
@@ -969,7 +975,6 @@ class AsyncSchedulerClient:
             affinity_debug = getattr(req_info, "kv_affinity_debug", None)
             smetric_debug = getattr(req_info, "smetric_debug", None)
             # Unified affinity: every scored endpoint + scalars so the scheduler re-ranks globally.
-            # Detect by mode, not rec[2], so load_gated can still attach prefill_cost for accounting.
             global_affinity = (
                 candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY
                 and self._kv_affinity_mode == KV_AFFINITY_MODE_UNIFIED
@@ -988,12 +993,8 @@ class AsyncSchedulerClient:
             )
             if candidate_policy == CANDIDATE_POLICY_SMETRIC and isinstance(smetric_debug, dict):
                 candidate_endpoints = [
-                    {
-                        "instance_id": ins_id,
-                        "endpoint_id": ep_id,
-                        "prefill_cost": cost,
-                    }
-                    for (ins_id, ep_id), cost in smetric_debug.items()
+                    _smetric_candidate_payload(ins_id, ep_id, smetric_debug)
+                    for ins_id, ep_id in smetric_debug
                     if not normalized_engine_type or ins_id in allowed_instance_ids
                 ]
             elif global_affinity:
@@ -1008,14 +1009,14 @@ class AsyncSchedulerClient:
                     if rec[2] is not None and (not normalized_engine_type or ins_id in allowed_instance_ids)
                 ]
             elif candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY and isinstance(affinity_debug, dict):
-                # load_gated: ranked set with matched_tokens and prefill_cost for ledger stamp.
+                # load_gated forwards only its ranked set and matched-token data.
                 candidate_endpoints = [
-                    _candidate_endpoint_payload(cand_instance.id, cand_endpoint.id, affinity_debug, smetric_debug)
+                    _affinity_candidate_payload(cand_instance.id, cand_endpoint.id, affinity_debug)
                     for cand_instance, cand_endpoint, _score in candidates
                 ]
             else:
                 candidate_endpoints = [
-                    _candidate_endpoint_payload(cand_instance.id, cand_endpoint.id, affinity_debug, smetric_debug)
+                    _candidate_endpoint_payload(cand_instance.id, cand_endpoint.id)
                     for cand_instance, cand_endpoint, _score in candidates
                 ]
 
@@ -1114,7 +1115,7 @@ class AsyncSchedulerClient:
                 else:
                     committed_workload = workload
                 # Stamp from the worker cache when the response omitted it (in-process / legacy).
-                stamped = allocated_prefill_cost(req_info, out_instance.id, out_endpoint.id)
+                stamped = smetric_prefill_cost(req_info, out_instance.id, out_endpoint.id)
                 if not server_reported_prefill_cost and stamped:
                     committed_workload.prefill_cost = stamped
                 logger.info(

@@ -25,7 +25,7 @@ from motor.coordinator.domain.scheduling_pin import (
     resolve_pinned_instance,
     select_endpoint_for_instance,
 )
-from motor.coordinator.domain.workload_calculator import allocated_prefill_cost, calculate_demand_workload
+from motor.coordinator.domain.workload_calculator import calculate_demand_workload, smetric_prefill_cost
 from motor.config.coordinator import CoordinatorConfig, SchedulerType
 from motor.coordinator.domain import InstanceProvider
 from motor.coordinator.models.request import RequestInfo
@@ -67,6 +67,11 @@ class Scheduler:
 
         self._instance_provider = instance_provider
         self._scheduling_policy = SchedulingPolicyFactory.create(self._policy_type, self._instance_provider)
+        self._fallback_policy = (
+            SchedulingPolicyFactory.create(SchedulerType.LOAD_BALANCE, self._instance_provider)
+            if self._policy_type == SchedulerType.SMETRIC
+            else None
+        )
         if self._config and hasattr(self._scheduling_policy, "set_endpoint_instance_score_weight"):
             self._scheduling_policy.set_endpoint_instance_score_weight(
                 self._config.scheduler_config.endpoint_instance_score_weight
@@ -105,7 +110,11 @@ class Scheduler:
             (Instance, Endpoint) tuple or None if no instance available
         """
         r = self._scheduling_policy.select_instance_and_endpoint(role)
-        return (await r) if asyncio.iscoroutine(r) else r
+        result = (await r) if asyncio.iscoroutine(r) else r
+        if result is None and self._fallback_policy is not None:
+            fallback = self._fallback_policy.select_instance_and_endpoint(role)
+            result = (await fallback) if asyncio.iscoroutine(fallback) else fallback
+        return result
 
     async def select_and_allocate(
         self,
@@ -158,6 +167,13 @@ class Scheduler:
                 req_info,
             )
             result = (await r) if asyncio.iscoroutine(r) else r
+            if result is None and self._fallback_policy is not None:
+                fallback = self._fallback_policy.select_instance_and_endpoint_from_list(
+                    list(pool.values()),
+                    role,
+                    req_info,
+                )
+                result = (await fallback) if asyncio.iscoroutine(fallback) else fallback
             if result is None:
                 return None
             instance, endpoint = result
@@ -176,8 +192,8 @@ class Scheduler:
             if not hasattr(self._scheduling_policy, "update_workload")
             else calculate_demand_workload(role, req_info)
         )
-        # KV affinity / SMetric stamp the committed endpoint's prefill_cost; other policies stay 0.
-        workload.prefill_cost = allocated_prefill_cost(req_info, instance.id, endpoint.id)
+        # Only SMetric populates smetric_debug; other policies stay at 0.
+        workload.prefill_cost = smetric_prefill_cost(req_info, instance.id, endpoint.id)
         params = UpdateWorkloadParams(
             instance_id=instance.id,
             endpoint_id=endpoint.id,

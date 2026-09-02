@@ -32,7 +32,7 @@ from motor.coordinator.api_server.inference_server import InferenceServer
 from motor.coordinator.domain.request_manager import RequestManager
 from motor.coordinator.process.base import BaseProcessManager
 from motor.coordinator.process.utils import set_process_title
-from motor.coordinator.scheduler.policy.kv_cache_affinity import TokenizerManager
+from motor.coordinator.scheduler.tokenizer import TokenizerManager
 
 logger = get_logger(__name__)
 

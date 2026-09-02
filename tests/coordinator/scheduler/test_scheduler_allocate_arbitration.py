@@ -707,8 +707,8 @@ async def test_allocate_only_fast_path_accepts_encode_candidate():
 
 
 @pytest.mark.asyncio
-async def test_allocate_only_stamps_selected_endpoint_prefill_cost():
-    """KV-affinity ALLOCATE_ONLY adds the committed endpoint's prefill_cost to its ledger."""
+async def test_allocate_only_kv_affinity_does_not_stamp_prefill_cost():
+    """KV-affinity may rank by request cost without adding it to the SMetric ledger."""
     config = CoordinatorConfig()
     config.scheduler_config.scheduler_type = SchedulerType.KV_CACHE_AFFINITY
     config.scheduler_config.endpoint_instance_score_weight = 0.0
@@ -759,15 +759,15 @@ async def test_allocate_only_stamps_selected_endpoint_prefill_cost():
     assert response.data["instance"]["id"] == 2
     assert response.data["endpoint"]["id"] == 20
     _, selected_workload = await instance_manager.get_endpoint_workload(2, 20)
-    assert selected_workload.prefill_cost == 42
+    assert selected_workload.prefill_cost == 0
     assert selected_workload.active_tokens == 53.0
     _, other_workload = await instance_manager.get_endpoint_workload(1, 10)
     assert other_workload.prefill_cost == 0
 
 
 @pytest.mark.asyncio
-async def test_allocate_only_load_gated_prefill_cost_does_not_trigger_global_rank():
-    """load_gated may send prefill_cost for accounting without switching to unified global rank."""
+async def test_allocate_only_load_gated_ignores_prefill_cost_for_smetric_ledger():
+    """KV affinity must not persist an unexpected candidate cost in the SMetric ledger."""
     config = CoordinatorConfig()
     config.scheduler_config.scheduler_type = SchedulerType.KV_CACHE_AFFINITY
     config.scheduler_config.endpoint_instance_score_weight = 0.0
@@ -816,7 +816,7 @@ async def test_allocate_only_load_gated_prefill_cost_does_not_trigger_global_ran
     assert response.data["endpoint"]["id"] == 20
     _, selected_workload = await instance_manager.get_endpoint_workload(2, 20)
     assert selected_workload.active_tokens == 13
-    assert selected_workload.prefill_cost == 99
+    assert selected_workload.prefill_cost == 0
     _, skipped = await instance_manager.get_endpoint_workload(1, 11)
     assert skipped.active_tokens == 5
     assert skipped.prefill_cost == 0

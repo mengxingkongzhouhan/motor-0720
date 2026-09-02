@@ -6,7 +6,9 @@
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
 
-"""Scheduling policies: LoadBalance, RoundRobin, SMetric, and factory."""
+"""Scheduling policies and factory."""
+
+from importlib import import_module
 
 __all__ = [
     "BaseSchedulingPolicy",
@@ -16,8 +18,21 @@ __all__ = [
     "SchedulingPolicyFactory",
 ]
 
-from motor.coordinator.scheduler.policy.base import BaseSchedulingPolicy
-from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
-from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
-from motor.coordinator.scheduler.policy.smetric import SMetricPolicy
-from motor.coordinator.scheduler.policy.factory import SchedulingPolicyFactory
+_EXPORTS = {
+    "BaseSchedulingPolicy": ("motor.coordinator.scheduler.policy.base", "BaseSchedulingPolicy"),
+    "LoadBalancePolicy": ("motor.coordinator.scheduler.policy.load_balance", "LoadBalancePolicy"),
+    "RoundRobinPolicy": ("motor.coordinator.scheduler.policy.round_robin", "RoundRobinPolicy"),
+    "SMetricPolicy": ("motor.coordinator.scheduler.policy.smetric", "SMetricPolicy"),
+    "SchedulingPolicyFactory": ("motor.coordinator.scheduler.policy.factory", "SchedulingPolicyFactory"),
+}
+
+
+def __getattr__(name: str):
+    """Load policy exports on demand so importing one policy does not load the others."""
+    try:
+        module_name, attribute = _EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value

@@ -12,6 +12,8 @@
 
 import inspect
 import logging
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -237,6 +239,24 @@ class TestSMetricPolicyRanking:
         source = inspect.getsource(smetric_module)
         assert "policy.kv_cache_affinity" not in source
         assert "policy.load_balance" not in source
+
+    def test_import_does_not_load_other_policy_modules(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; "
+                    "import motor.coordinator.scheduler.policy.smetric; "
+                    "assert 'motor.coordinator.scheduler.policy.kv_cache_affinity' not in sys.modules; "
+                    "assert 'motor.coordinator.scheduler.policy.load_balance' not in sys.modules"
+                ),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
 
     @patch("motor.coordinator.scheduler.policy.smetric.ConductorApiClient.query_conductor")
     def test_no_tenant_returns_none(self, mock_query):

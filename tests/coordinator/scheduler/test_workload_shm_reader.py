@@ -155,6 +155,7 @@ class TestWorkloadSharedMemoryReader(unittest.TestCase):
         reading would slice entries at the wrong stride. The reader must refuse the read
         instead of exposing role sequences from incompatible layout bytes.
         """
+        self.assertEqual(SCHEMA_VERSION, 4)
         buf = self._make_buf(0)
         header = WorkloadShmHeader(
             magic=MAGIC,
@@ -208,6 +209,7 @@ class TestWorkloadSharedMemoryReader(unittest.TestCase):
                 endpoint_id=20,
                 role=ROLE_DECODE,
                 active_tokens=21.0,
+                prefill_cost=7.5,
             )
         )
         self.reader._buf = memoryview(buf)
@@ -221,6 +223,7 @@ class TestWorkloadSharedMemoryReader(unittest.TestCase):
             20,
             PDRole.ROLE_D,
             21.0,
+            7.5,
         )
         self.assertIsNone(self.reader.last_sequence_for_role(PDRole.ROLE_P))
         self.assertEqual(self.reader.last_sequence_for_role(PDRole.ROLE_D), 6)

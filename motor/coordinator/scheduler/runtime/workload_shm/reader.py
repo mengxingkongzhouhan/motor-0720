@@ -237,4 +237,5 @@ class WorkloadSharedMemoryReader:
                 entry.endpoint_id,
                 pdrole,
                 entry.active_tokens,
+                getattr(entry, "prefill_cost", 0.0) or 0.0,
             )

@@ -37,6 +37,7 @@ from motor.coordinator.scheduler.runtime.scheduler_server import (
 from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
     CANDIDATE_POLICY_LOAD_BALANCE,
+    CANDIDATE_POLICY_SMETRIC,
     SchedulerRequest,
     SchedulerRequestType,
     SchedulerResponseType,
@@ -612,6 +613,23 @@ class TestHandleRefreshInstances:
         assert writer.snapshots >= 1
 
     @pytest.mark.asyncio
+    async def test_changed_set_resets_smetric_average(self):
+        """A replacement topology must not inherit the old cluster's SMetric gate history."""
+        dispatcher, instance_manager, *_ = _make_dispatcher()
+        dispatcher._smetric_prefill.record(42)
+        instance_manager.refresh_instances = AsyncMock(return_value=True)
+        request = SchedulerRequest(
+            request_type=SchedulerRequestType.REFRESH_INSTANCES,
+            request_id="req-reset-smetric",
+            data={"event_type": EventType.SET.value, "instances": []},
+        )
+
+        response = await dispatcher.dispatch(request)
+
+        assert response.response_type == SchedulerResponseType.SUCCESS
+        assert dispatcher._smetric_prefill.snapshot() == (0.0, 0)
+
+    @pytest.mark.asyncio
     async def test_changed_calls_sync_callback(self):
         received = []
 
@@ -940,6 +958,10 @@ class TestShouldScanGlobalLoadBalance:
     def test_kv_affinity_policy_returns_false(self):
         dispatcher, *_ = _make_dispatcher(scheduler_type=SchedulerType.LOAD_BALANCE)
         assert dispatcher._should_scan_global_load_balance(CANDIDATE_POLICY_KV_CACHE_AFFINITY) is False
+
+    def test_smetric_policy_returns_false(self):
+        dispatcher, *_ = _make_dispatcher(scheduler_type=SchedulerType.LOAD_BALANCE)
+        assert dispatcher._should_scan_global_load_balance(CANDIDATE_POLICY_SMETRIC) is False
 
     def test_none_policy_lb_scheduler_returns_true(self):
         """No candidate_policy specified → fall back to scheduler_type (LB → True)."""

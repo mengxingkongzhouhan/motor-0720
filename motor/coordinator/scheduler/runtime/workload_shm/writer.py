@@ -62,12 +62,23 @@ def _pdrole_to_shm_role(role: PDRole) -> int:
     return ROLE_HYBRID
 
 
+def _endpoint_prefill_cost(workload) -> float:
+    """Read ``workload.prefill_cost`` as a non-negative float; mocks/missing fields yield 0."""
+    raw = getattr(workload, "prefill_cost", 0.0)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _collect_entries_and_slot_map(instance_manager: InstanceManager, max_entries: int):
     """
     Collect (instance_id, endpoint_id, role, workload) from all pools and build slot_map.
     Returns (entries list, slot_map dict).
     """
-    entries: list[tuple[int, int, int, float]] = []
+    entries: list[tuple[int, int, int, float, float]] = []
     slot_map: dict[tuple[int, int], int] = {}
 
     for role in (PDRole.ROLE_E, PDRole.ROLE_P, PDRole.ROLE_D, PDRole.ROLE_U):
@@ -90,6 +101,7 @@ def _collect_entries_and_slot_map(instance_manager: InstanceManager, max_entries
                             ep.id,
                             shm_role,
                             ep.workload.active_tokens,
+                            _endpoint_prefill_cost(ep.workload),
                         )
                     )
     return entries, slot_map
@@ -166,7 +178,9 @@ class WorkloadSharedMemoryWriter:
         entries, self._slot_map = _collect_entries_and_slot_map(self._im, self._max_entries)
         self._entry_count = len(entries)
         self._begin_write()
-        for slot, (iid, eid, role, tokens) in enumerate(entries):
+        for slot, entry in enumerate(entries):
+            iid, eid, role, tokens = entry[0], entry[1], entry[2], entry[3]
+            prefill_cost = entry[4] if len(entry) > 4 else 0.0
             self._write_entry_at_slot(
                 slot,
                 WorkloadShmEntry(
@@ -174,6 +188,7 @@ class WorkloadSharedMemoryWriter:
                     endpoint_id=eid,
                     role=role,
                     active_tokens=tokens,
+                    prefill_cost=prefill_cost,
                 ),
             )
         self._bump_changed_role_sequences(entries)
@@ -203,6 +218,7 @@ class WorkloadSharedMemoryWriter:
                 endpoint_id=endpoint_id,
                 role=shm_role,
                 active_tokens=workload.active_tokens,
+                prefill_cost=_endpoint_prefill_cost(workload),
             ),
         )
         self._bump_role_sequence(role)
@@ -233,7 +249,7 @@ class WorkloadSharedMemoryWriter:
         roles to re-scan their (unchanged) entries.
         """
         new_members: dict[str, set[tuple[int, int]]] = {"prefill": set(), "decode": set(), "hybrid": set()}
-        for iid, eid, role, _tokens in entries:
+        for iid, eid, role, *_rest in entries:
             role_key = _SHM_ROLE_TO_SEQ_KEY.get(role)
             if role_key is not None:
                 new_members[role_key].add((iid, eid))

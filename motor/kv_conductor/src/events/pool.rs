@@ -134,6 +134,37 @@ pub(crate) fn apply_pool_event(
     let entry = indexer.get_or_create(mn, tid);
 
     let target_workers = resolve_workers(match_mode, hbm_ip_index, be_id, dp_rank, &target_media);
+    let preview: Vec<u64> = seq_hashes.iter().take(4).map(|h| h.0).collect();
+
+    // One line per parsed event so a 356-event dump can be counted by
+    // outcome (`stored` / `removed` / `cleared` / `no_hashes` / `no_workers`)
+    // instead of subtracting unique `queued` hashes from parsed counts.
+    let outcome = if is_cleared {
+        "cleared"
+    } else if seq_hashes.is_empty() {
+        "no_hashes"
+    } else if target_workers.is_empty() {
+        "no_workers"
+    } else if is_stored {
+        "stored"
+    } else if is_removed {
+        "removed"
+    } else {
+        "unknown_type"
+    };
+    tracing::debug!(
+        model = %mn,
+        tenant = %tid,
+        event_type,
+        outcome,
+        event_backend_id = %event_be_id,
+        lookup_backend_id = %be_id,
+        dp_rank,
+        num_hashes = seq_hashes.len(),
+        num_workers = target_workers.len(),
+        ?preview,
+        "kv_event pool_apply"
+    );
 
     // ── Cleared events: no seq_hashes needed ──────────────────────────
     if is_cleared {

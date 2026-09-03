@@ -223,6 +223,12 @@ pub struct IndexerEntry {
     /// See [`OffloadPoolState`] for the invariant.
     pub(crate) offload_pool_state: Arc<RwLock<OffloadPoolState>>,
 
+    /// Engine DPs that have `/register`'d for this model/tenant. Query
+    /// walks pooled edges for every registered DP, even when that DP has
+    /// no HBM of its own — otherwise decode-only pool capacity would be
+    /// invisible to a prefill that never stored NPU blocks.
+    registered_dps: RwLock<FxHashSet<(String, DpRank)>>,
+
     maintenance: CacheMaintenanceConfig,
 }
 
@@ -244,6 +250,7 @@ impl IndexerEntry {
             cpu_tiers: Arc::new(LowerTierIndexer::new()),
             disk_tiers: Arc::new(LowerTierIndexer::new()),
             offload_pool_state: Arc::new(RwLock::new(OffloadPoolState::default())),
+            registered_dps: RwLock::new(FxHashSet::default()),
             maintenance,
         }
     }
@@ -353,19 +360,50 @@ impl IndexerEntry {
         (overlap, medium_ends)
     }
 
-    /// Every `(instance_id, dp_rank)` this index has seen, across all media.
+    /// Engine DPs that should see pooled coverage on query.
+    ///
+    /// Registered prefills are always included (they may hold no HBM of
+    /// their own). Tree keys are unioned so tests / replay without an
+    /// explicit `/register` still work. `pool:<ip>` placeholders and
+    /// `vllm-decode-*` workers are skipped — they own store / decode
+    /// edges but are not routing targets for the next prefill.
     fn known_dps(&self) -> FxHashSet<(String, DpRank)> {
-        let mut dps: FxHashSet<(String, DpRank)> = FxHashSet::default();
+        let mut dps = FxHashSet::default();
+        for (instance_id, dp_rank) in self.registered_dps.read().iter() {
+            if is_query_routing_instance(instance_id) {
+                dps.insert((instance_id.clone(), *dp_rank));
+            }
+        }
         for wk in self.lookups.read().keys() {
-            dps.insert((wk.instance_id.clone(), wk.dp_rank));
+            if is_query_routing_instance(&wk.instance_id) {
+                dps.insert((wk.instance_id.clone(), wk.dp_rank));
+            }
         }
         for wk in self.cpu_tiers.worker_keys() {
-            dps.insert((wk.instance_id, wk.dp_rank));
+            if is_query_routing_instance(&wk.instance_id) {
+                dps.insert((wk.instance_id, wk.dp_rank));
+            }
         }
         for wk in self.disk_tiers.worker_keys() {
-            dps.insert((wk.instance_id, wk.dp_rank));
+            if is_query_routing_instance(&wk.instance_id) {
+                dps.insert((wk.instance_id, wk.dp_rank));
+            }
         }
         dps
+    }
+
+    /// Record that an engine DP is registered and should receive pooled coverage.
+    pub fn note_registered_dp(&self, instance_id: &str, dp_rank: u32) {
+        self.registered_dps
+            .write()
+            .insert((instance_id.to_string(), dp_rank));
+    }
+
+    /// Drop a registered DP when the worker unregisters.
+    pub fn forget_registered_dp(&self, instance_id: &str, dp_rank: u32) {
+        self.registered_dps
+            .write()
+            .remove(&(instance_id.to_string(), dp_rank));
     }
 
     #[inline]
@@ -505,9 +543,10 @@ impl IndexerEntry {
 
             // Own breakpoint beats the shared root walk when it reaches further.
             let mut best = root_chain.as_ref();
-            let resumed = own_break
-                .get(dp)
-                .and_then(|b| tiers.reachable_chain(block_hashes, b.end_pos, Some(b.last_seq)));
+            let own = own_break.get(dp).copied();
+            let resumed =
+                own.and_then(|b| tiers.reachable_chain(block_hashes, b.end_pos, Some(b.last_seq)));
+            let mut selected_source = if best.is_some() { "root" } else { "none" };
             if let Some(reached) = &resumed {
                 let farther = match best {
                     Some(current) => reached.hit.end_pos() >= current.hit.end_pos(),
@@ -515,8 +554,29 @@ impl IndexerEntry {
                 };
                 if farther {
                     best = Some(reached);
+                    selected_source = "breakpoint";
                 }
             }
+
+            // Print both candidates even when neither matches. This makes a
+            // lower-tier hole directly visible: root_end shows where the pool
+            // prefix stops, while breakpoint_end shows whether this DP's own
+            // HBM/CPU coverage can bridge that hole.
+            tracing::info!(
+                instance_id = %instance_id,
+                dp_rank,
+                medium = %medium.log_str(),
+                breakpoint_kind = if medium == StorageMedium::Cpu { "hbm" } else { "hbm_or_cpu" },
+                root_count = ?root_chain.as_ref().map(|r| r.hit.count),
+                root_end = ?root_chain.as_ref().map(|r| r.hit.end_pos()),
+                breakpoint_start = ?own.map(|b| b.end_pos),
+                breakpoint_parent = ?own.map(|b| b.last_seq.0),
+                breakpoint_count = ?resumed.as_ref().map(|r| r.hit.count),
+                breakpoint_end = ?resumed.as_ref().map(|r| r.hit.end_pos()),
+                selected_source,
+                selected_end = ?best.map(|r| r.hit.end_pos()),
+                "lower_tier query candidates"
+            );
 
             let Some(reached) = best else {
                 continue;
@@ -796,6 +856,24 @@ impl IndexerEntry {
         state.offload.len() + state.pending_pool.len() + state.content.len()
     }
 
+    /// Per-medium tree sizes plus two-phase matching cache sizes.
+    ///
+    /// `(hbm, cpu, disk, offload, pending_pool, content)`. Used by `/stats`
+    /// so a dump can answer "is the CPU hole missing index entries or still
+    /// sitting in pending_pool?" without grepping event traces.
+    pub fn cache_breakdown(&self) -> (usize, usize, usize, usize, usize, usize) {
+        let hbm = self.lookups.read().values().map(|l| l.len()).sum();
+        let state = self.offload_pool_state.read();
+        (
+            hbm,
+            self.cpu_tiers.total_blocks(),
+            self.disk_tiers.total_blocks(),
+            state.offload.len(),
+            state.pending_pool.len(),
+            state.content.len(),
+        )
+    }
+
     /// Sweep stale matching-cache entries that exceed
     /// their TTLs, returning the total number of entries evicted.
     ///
@@ -836,9 +914,15 @@ impl IndexerEntry {
         });
         let expired_pending = before_pending - state.pending_pool.len();
         if expired_pending > 0 {
-            tracing::debug!(
+            // Pool-first events wait only `pending_ttl` (default 60s). If the
+            // matching vLLM offload is later than that, the block never
+            // enters the CPU index — the same symptom as a truncated root
+            // walk. This used to be debug-only and disappeared from
+            // production dumps.
+            tracing::info!(
                 expired = expired_pending,
                 pending_ttl_secs = pending_ttl.as_secs(),
+                remaining_pending_keys = state.pending_pool.len(),
                 "kv_event pending_expired"
             );
         }
@@ -1178,6 +1262,9 @@ impl Indexer {
         let mut instance_data: HashMap<String, InstanceMatchData> = HashMap::new();
 
         for ((instance_id, dp_rank), ends) in medium_ends {
+            if !is_query_routing_instance(instance_id) {
+                continue;
+            }
             let npu = ends.npu;
             let cpu = ends.cpu.saturating_sub(ends.npu);
             let disk = ends.disk.saturating_sub(ends.npu.max(ends.cpu));
@@ -1216,11 +1303,19 @@ impl Indexer {
             .map(|entry| {
                 let key = entry.key();
                 let value = entry.value();
+                let (hbm_blocks, cpu_blocks, disk_blocks, offload, pending_pool, content) =
+                    value.cache_breakdown();
                 IndexerSummary {
                     model_name: key.model_name.clone(),
                     tenant_id: key.tenant_id.clone(),
                     worker_count: value.worker_keys().len(),
                     total_blocks: value.total_blocks(),
+                    hbm_blocks,
+                    cpu_blocks,
+                    disk_blocks,
+                    offload,
+                    pending_pool,
+                    content,
                 }
             })
             .collect()
@@ -1239,6 +1334,15 @@ pub struct IndexerSummary {
     pub tenant_id: String,
     pub worker_count: usize,
     pub total_blocks: usize,
+    pub hbm_blocks: usize,
+    pub cpu_blocks: usize,
+    pub disk_blocks: usize,
+    /// Unconfirmed engine offloads waiting for a pool stored event.
+    pub offload: usize,
+    /// Pool-first hashes waiting for a vLLM offload (default TTL 60s).
+    pub pending_pool: usize,
+    /// Confirmed content retained for a later pool medium.
+    pub content: usize,
 }
 
 #[cfg(test)]

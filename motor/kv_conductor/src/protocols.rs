@@ -279,6 +279,40 @@ pub struct WorkerKey {
     pub medium: StorageMedium,
 }
 
+/// Instance-id prefix for blocks stored on a pool node that has no
+/// HBM-registered DP. Decode nodes commonly host memcache LocalService
+/// capacity; their `backend_id` is the store Pod IP, which is not in
+/// `hbm_ip_index`. Edges still go into the shared CPU/Disk graph so the
+/// ownership-blind walk can see them, but these keys are not routing targets.
+pub const POOL_LOCATION_PREFIX: &str = "pool:";
+
+/// `pool:<store_ip>` — owner of unmapped pool-store edges.
+pub fn pool_location_instance_id(store_ip: &str) -> String {
+    format!("{POOL_LOCATION_PREFIX}{store_ip}")
+}
+
+/// Whether `instance_id` is a pool-location placeholder, not a schedulable worker.
+pub fn is_pool_location_instance(instance_id: &str) -> bool {
+    instance_id.starts_with(POOL_LOCATION_PREFIX)
+}
+
+/// Coordinator registers decode as `vllm-decode-{id}` so the store Pod IP
+/// lands in `hbm_ip_index`. Those workers are not affinity / query targets.
+pub const DECODE_INSTANCE_PREFIX: &str = "vllm-decode-";
+
+/// Whether `instance_id` is a decode engine registered only for IP mapping.
+pub fn is_decode_instance(instance_id: &str) -> bool {
+    instance_id.starts_with(DECODE_INSTANCE_PREFIX)
+}
+
+/// Instances that `/query` may return as routing targets.
+///
+/// `pool:<ip>` placeholders and `vllm-decode-*` workers own pooled edges
+/// (and decode may even have HBM), but the next prefill is still P/U.
+pub fn is_query_routing_instance(instance_id: &str) -> bool {
+    !is_pool_location_instance(instance_id) && !is_decode_instance(instance_id)
+}
+
 // ---------------------------------------------------------------------------
 // Registration types (matching Python ConductorApiClient)
 // ---------------------------------------------------------------------------
@@ -822,6 +856,18 @@ impl OverlapBlocks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_query_routing_skips_pool_and_decode() {
+        assert!(is_query_routing_instance("vllm-prefill-2"));
+        assert!(is_query_routing_instance("vllm-union-1"));
+        assert!(!is_query_routing_instance("vllm-decode-3"));
+        assert!(!is_query_routing_instance(&pool_location_instance_id(
+            "10.244.59.1"
+        )));
+        assert!(is_decode_instance("vllm-decode-1"));
+        assert!(!is_decode_instance("vllm-prefill-1"));
+    }
 
     // ── StorageMedium ─────────────────────────────────────────────────
 

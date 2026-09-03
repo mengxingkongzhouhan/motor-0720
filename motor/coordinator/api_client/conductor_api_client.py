@@ -23,8 +23,11 @@ from motor.config.coordinator import CoordinatorConfig
 
 TENANT_ID = "default"
 logger = get_logger(__name__)
-# Roles whose KV events should be registered with the conductor.
-_KVA_ROLES = frozenset({PDRole.ROLE_P, PDRole.ROLE_U})
+# Roles whose KV events / pool-store IPs should be registered with the
+# conductor. ROLE_D is included so a decode node's Pod IP lands in
+# ``hbm_ip_index`` (memcache LocalService ``backend_id`` is the store
+# Pod IP). Affinity *selection* stays on P/U — see ``_KVA_SELECT_ROLES``.
+_KVA_ROLES = frozenset({PDRole.ROLE_P, PDRole.ROLE_U, PDRole.ROLE_D})
 
 # Canonical store_backend names. Input config is matched case-insensitively
 # (same as kv-conductor's StoreBackend::parse).
@@ -51,11 +54,38 @@ def decode_query_response_msgpack(payload: bytes) -> dict[str, Any]:
     return msgspec.msgpack.decode(payload)
 
 
+_DECODE_INSTANCE_PREFIX = "vllm-decode-"
+
+
 def conductor_instance_id(instance: Instance) -> str:
     """Return the Conductor tenant key for a KVA-eligible instance."""
     if instance.role == PDRole.ROLE_U:
         return f"vllm-union-{instance.id}"
+    if instance.role == PDRole.ROLE_D:
+        return f"{_DECODE_INSTANCE_PREFIX}{instance.id}"
     return f"vllm-prefill-{instance.id}"
+
+
+def strip_decode_query_instances(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Drop decode workers from a conductor `/query` tenant map.
+
+    Decode is registered so its Pod IP lands in ``hbm_ip_index``; it is
+    not an affinity target. Conductor also omits these keys, but the
+    client strips them so older conductors and the query log stay clean.
+    """
+    if not isinstance(parsed, dict):
+        return parsed
+    stripped: dict[str, Any] = {}
+    for tenant_id, instances in parsed.items():
+        if not isinstance(instances, dict):
+            stripped[tenant_id] = instances
+            continue
+        stripped[tenant_id] = {
+            instance_id: payload
+            for instance_id, payload in instances.items()
+            if not (isinstance(instance_id, str) and instance_id.startswith(_DECODE_INSTANCE_PREFIX))
+        }
+    return stripped
 
 
 class ConductorApiClient:
@@ -456,6 +486,7 @@ class ConductorApiClient:
                 else:
                     response = client.do_post("/query", data=query_data)
                 parsed = cls._decode_query_response(response, encoding)
+                parsed = strip_decode_query_instances(parsed)
                 # INFO: full match result (per-instance longest_matched / per-DP
                 # matched blocks) is key observability data for KV-affinity tuning.
                 logger.info("conductor query response: %s", parsed)

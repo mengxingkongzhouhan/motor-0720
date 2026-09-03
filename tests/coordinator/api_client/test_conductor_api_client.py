@@ -20,6 +20,7 @@ from motor.coordinator.api_client.conductor_api_client import (
     TENANT_ID,
     ConductorApiClient,
     conductor_instance_id,
+    strip_decode_query_instances,
 )
 
 # ------------------------------------------------------------------
@@ -107,9 +108,27 @@ class TestConductorInstanceId:
         inst = _make_instance(inst_id=5, role=PDRole.ROLE_E)
         assert conductor_instance_id(inst) == "vllm-prefill-5"
 
-    def test_role_d_falls_to_prefill_prefix(self):
+    def test_role_d_returns_decode_prefix(self):
         inst = _make_instance(inst_id=9, role=PDRole.ROLE_D)
-        assert conductor_instance_id(inst) == "vllm-prefill-9"
+        assert conductor_instance_id(inst) == "vllm-decode-9"
+
+
+class TestStripDecodeQueryInstances:
+    def test_drops_decode_keeps_prefill(self):
+        parsed = {
+            TENANT_ID: {
+                "vllm-prefill-2": {"longest_matched": 2304},
+                "vllm-decode-1": {"longest_matched": 2304},
+                "vllm-decode-3": {"longest_matched": 2304},
+                "vllm-prefill-4": {"longest_matched": 2304},
+            }
+        }
+        stripped = strip_decode_query_instances(parsed)
+        assert set(stripped[TENANT_ID]) == {"vllm-prefill-2", "vllm-prefill-4"}
+
+    def test_leaves_non_dict_tenant_alone(self):
+        parsed = {TENANT_ID: "not-a-map"}
+        assert strip_decode_query_instances(parsed) == parsed
 
 
 # ------------------------------------------------------------------
@@ -402,10 +421,10 @@ class TestReRegisterKvInstances:
         mock_register.assert_not_called()
 
     def test_skip_non_kva_roles(self):
-        """ROLE_D and ROLE_E are not in _KVA_ROLES → skipped."""
+        """ROLE_E is not in _KVA_ROLES → skipped. ROLE_D is registered."""
         inst_d = _make_instance(inst_id=1, role=PDRole.ROLE_D)
         inst_e = _make_instance(inst_id=2, role=PDRole.ROLE_E)
-        cfg = _mock_config()
+        cfg = _mock_config(npu_endpoint="tcp://*:5557")
 
         with (
             patch.object(ConductorApiClient, "coordinator_config", cfg),
@@ -414,7 +433,9 @@ class TestReRegisterKvInstances:
         ):
             ConductorApiClient.re_register_kv_instances([inst_d, inst_e])
 
-        mock_register.assert_not_called()
+        mock_register.assert_called_once()
+        called_inst = mock_register.call_args[0][0]
+        assert called_inst.role == PDRole.ROLE_D
 
     def test_skip_when_no_endpoints_configured(self):
         """No endpoint patterns → _build_register_payload returns {} → skip."""
@@ -603,6 +624,23 @@ def test_return_value_on_success(mock_http):
 
     result = ConductorApiClient.query_conductor(instances, [1, 2, 3])
     assert result == expected
+
+
+@patch("motor.coordinator.api_client.conductor_api_client.SafeHTTPSClient")
+def test_query_conductor_strips_decode_instances(mock_http):
+    """Decode workers are registered for IP mapping, not affinity scoring."""
+    raw = {
+        TENANT_ID: {
+            "vllm-prefill-2": {"longest_matched": 2304},
+            "vllm-decode-1": {"longest_matched": 2304},
+            "vllm-decode-3": {"longest_matched": 2304},
+        }
+    }
+    _mock_successful_query(mock_http, response=raw)
+    instances = [_make_mock_instance(2)]
+
+    result = ConductorApiClient.query_conductor(instances, [1, 2, 3])
+    assert result == {TENANT_ID: {"vllm-prefill-2": {"longest_matched": 2304}}}
 
 
 @patch("motor.coordinator.api_client.conductor_api_client.SafeHTTPSClient")

@@ -364,22 +364,28 @@ impl IndexerEntry {
     ///
     /// Registered prefills are always included (they may hold no HBM of
     /// their own). Tree keys are unioned so tests / replay without an
-    /// explicit `/register` still work. `pool:<ip>` placeholders are
-    /// skipped — they own decode-store edges but are not routing targets.
+    /// explicit `/register` still work. `pool:<ip>` placeholders and
+    /// `vllm-decode-*` workers are skipped — they own store / decode
+    /// edges but are not routing targets for the next prefill.
     fn known_dps(&self) -> FxHashSet<(String, DpRank)> {
-        let mut dps = self.registered_dps.read().clone();
+        let mut dps = FxHashSet::default();
+        for (instance_id, dp_rank) in self.registered_dps.read().iter() {
+            if is_query_routing_instance(instance_id) {
+                dps.insert((instance_id.clone(), *dp_rank));
+            }
+        }
         for wk in self.lookups.read().keys() {
-            if !is_pool_location_instance(&wk.instance_id) {
+            if is_query_routing_instance(&wk.instance_id) {
                 dps.insert((wk.instance_id.clone(), wk.dp_rank));
             }
         }
         for wk in self.cpu_tiers.worker_keys() {
-            if !is_pool_location_instance(&wk.instance_id) {
+            if is_query_routing_instance(&wk.instance_id) {
                 dps.insert((wk.instance_id, wk.dp_rank));
             }
         }
         for wk in self.disk_tiers.worker_keys() {
-            if !is_pool_location_instance(&wk.instance_id) {
+            if is_query_routing_instance(&wk.instance_id) {
                 dps.insert((wk.instance_id, wk.dp_rank));
             }
         }
@@ -1256,6 +1262,9 @@ impl Indexer {
         let mut instance_data: HashMap<String, InstanceMatchData> = HashMap::new();
 
         for ((instance_id, dp_rank), ends) in medium_ends {
+            if !is_query_routing_instance(instance_id) {
+                continue;
+            }
             let npu = ends.npu;
             let cpu = ends.cpu.saturating_sub(ends.npu);
             let disk = ends.disk.saturating_sub(ends.npu.max(ends.cpu));

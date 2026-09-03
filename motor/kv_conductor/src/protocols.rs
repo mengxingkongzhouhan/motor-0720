@@ -296,6 +296,23 @@ pub fn is_pool_location_instance(instance_id: &str) -> bool {
     instance_id.starts_with(POOL_LOCATION_PREFIX)
 }
 
+/// Coordinator registers decode as `vllm-decode-{id}` so the store Pod IP
+/// lands in `hbm_ip_index`. Those workers are not affinity / query targets.
+pub const DECODE_INSTANCE_PREFIX: &str = "vllm-decode-";
+
+/// Whether `instance_id` is a decode engine registered only for IP mapping.
+pub fn is_decode_instance(instance_id: &str) -> bool {
+    instance_id.starts_with(DECODE_INSTANCE_PREFIX)
+}
+
+/// Instances that `/query` may return as routing targets.
+///
+/// `pool:<ip>` placeholders and `vllm-decode-*` workers own pooled edges
+/// (and decode may even have HBM), but the next prefill is still P/U.
+pub fn is_query_routing_instance(instance_id: &str) -> bool {
+    !is_pool_location_instance(instance_id) && !is_decode_instance(instance_id)
+}
+
 // ---------------------------------------------------------------------------
 // Registration types (matching Python ConductorApiClient)
 // ---------------------------------------------------------------------------
@@ -839,6 +856,18 @@ impl OverlapBlocks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_query_routing_skips_pool_and_decode() {
+        assert!(is_query_routing_instance("vllm-prefill-2"));
+        assert!(is_query_routing_instance("vllm-union-1"));
+        assert!(!is_query_routing_instance("vllm-decode-3"));
+        assert!(!is_query_routing_instance(&pool_location_instance_id(
+            "10.244.59.1"
+        )));
+        assert!(is_decode_instance("vllm-decode-1"));
+        assert!(!is_decode_instance("vllm-prefill-1"));
+    }
 
     // ── StorageMedium ─────────────────────────────────────────────────
 

@@ -1520,3 +1520,57 @@ fn test_disk_only_coverage_matched_tokens() {
     assert_eq!(dp0.disk_blocks, 1);
     assert_eq!(dp0.matched_tokens, 4);
 }
+
+/// Decode is registered so its store IP maps into the pool index, but
+/// `/query` must not emit `vllm-decode-*`. Prefill still sees those CPU
+/// edges as `cpu_remote`.
+#[test]
+fn test_registered_decode_is_omitted_from_query() {
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("qwen3", "default");
+    entry.note_registered_dp("vllm-prefill-2", 0);
+    entry.note_registered_dp("vllm-decode-1", 0);
+    entry.note_registered_dp("vllm-decode-1", 3);
+
+    let tokens: Vec<i64> = (0..12).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+    assert_eq!(hashes.len(), 3);
+
+    store_chain(
+        &entry,
+        &worker_of("vllm-prefill-2", 0, StorageMedium::Npu),
+        None,
+        &[(100, hashes[0].0)],
+    );
+    store_chain(
+        &entry,
+        &worker_of("vllm-decode-1", 0, StorageMedium::Npu),
+        None,
+        &[(200, hashes[0].0), (201, hashes[1].0), (202, hashes[2].0)],
+    );
+    store_chain(
+        &entry,
+        &worker_of("vllm-decode-1", 0, StorageMedium::Cpu),
+        None,
+        &[(300, hashes[0].0), (301, hashes[1].0), (302, hashes[2].0)],
+    );
+
+    let resp = indexer.query("qwen3", "default", &tokens, 4).unwrap();
+    let tenant = &resp.tenants["default"];
+    assert!(
+        !tenant.contains_key("vllm-decode-1"),
+        "decode workers must not appear in /query: {:?}",
+        tenant.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(tenant.len(), 1);
+
+    let dp0 = &tenant["vllm-prefill-2"].dp["0"];
+    assert_eq!(dp0.npu_blocks, 1);
+    assert_eq!(
+        dp0.cpu_blocks, 2,
+        "decode-owned CPU edges must still extend the prefill prefix"
+    );
+    assert_eq!(dp0.matched_tokens, 12);
+    assert_eq!(dp0.cpu_local_blocks, 0);
+    assert_eq!(dp0.cpu_remote_blocks, 2);
+}

@@ -130,3 +130,35 @@ async def test_prepare_resource_uses_encode_states_for_encode_role():
     assert ReqState.E_ALLOCATED in req_info.status
     assert ReqState.D_SCHEDULING not in req_info.status
     assert ReqState.D_ALLOCATED not in req_info.status
+
+
+@pytest.mark.asyncio
+async def test_prepare_resource_logs_request_destination_and_length():
+    config = CoordinatorConfig()
+    config.exception_config.max_retry = 1
+    req_info = _make_req_info()
+    resource = _make_resource(PDRole.ROLE_D)
+
+    scheduler = MagicMock()
+    scheduler.select_and_allocate = AsyncMock(
+        return_value=(resource.instance, resource.endpoint, Workload(active_tokens=5))
+    )
+    request_manager = MagicMock()
+    request_manager.add_req_workload = AsyncMock(return_value=True)
+    router = _TestRouter(req_info, config, scheduler=scheduler, request_manager=request_manager)
+    router.logger = MagicMock()
+
+    await router.prepare_resource(PDRole.ROLE_D)
+
+    router.logger.info.assert_called_once_with(
+        "Dispatch request role=%s instance_id=%s job=%s endpoint=%s:%s "
+        "api=%s length_bytes=%d model=%s",
+        PDRole.ROLE_D,
+        resource.instance.id,
+        resource.instance.job_name,
+        resource.endpoint.ip,
+        resource.endpoint.business_port,
+        req_info.api,
+        req_info.req_len,
+        resource.instance.model_name,
+    )

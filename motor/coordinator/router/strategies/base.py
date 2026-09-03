@@ -325,11 +325,16 @@ class BaseRouter(ABC):
                         endpoint.business_port,
                         elapsed_prepare_ms,
                     )
-                self.logger.debug(
-                    "Dispatch api=%s len=%d endpoint_status=%s model=%s",
+                self.logger.info(
+                    "Dispatch request role=%s instance_id=%s job=%s endpoint=%s:%s "
+                    "api=%s length_bytes=%d model=%s",
+                    role,
+                    ins.id,
+                    ins.job_name,
+                    endpoint.ip,
+                    endpoint.business_port,
                     self.req_info.api,
                     self.req_info.req_len,
-                    endpoint.status,
                     ins.model_name,
                 )
                 return ScheduledResource(instance=ins, endpoint=endpoint)

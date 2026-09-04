@@ -222,6 +222,10 @@ class _SchedulerRequestDispatcher:
         self._workload_commit_lock = asyncio.Lock()
         # Bounded FIFO of committed operation_ids for retry de-dup (oldest evicted when full).
         self._committed_update_workload_operations: "OrderedDict[str, None]" = OrderedDict()
+        # Diagnostic ledger: (instance_id, endpoint_id) -> number of allocations committed by this
+        # scheduler that have not yet been released. Kept alongside the token workload so the
+        # allocation log can show how many requests each endpoint is actually running.
+        self._endpoint_running_requests: dict[tuple[int, int], int] = {}
         self._endpoint_instance_score_weight = max(
             0.0,
             getattr(config.scheduler_config, "endpoint_instance_score_weight", 0.05),
@@ -317,6 +321,7 @@ class _SchedulerRequestDispatcher:
         if success and params.operation_id:
             self._remember_committed_operation(params.operation_id)
         if success:
+            self._track_running_request(int(instance_id), int(endpoint_id), workload_action)
             self._write_workload_entry(int(instance_id), int(endpoint_id), updated_role, updated_workload)
         return SchedulerResponse(
             response_type=SchedulerResponseType.SUCCESS,
@@ -352,6 +357,37 @@ class _SchedulerRequestDispatcher:
         ops[operation_id] = None
         if len(ops) > _MAX_COMMITTED_UPDATE_WORKLOAD_OPERATIONS:
             ops.popitem(last=False)
+
+    def _track_running_request(self, instance_id: int, endpoint_id: int, action: WorkloadAction) -> None:
+        """Count one committed ALLOCATION (+1) / RELEASE_TOKENS (-1, floored at 0) on an endpoint."""
+        key = (instance_id, endpoint_id)
+        if action == WorkloadAction.ALLOCATION:
+            self._endpoint_running_requests[key] = self._endpoint_running_requests.get(key, 0) + 1
+            return
+        if action != WorkloadAction.RELEASE_TOKENS:
+            return
+        remaining = self._endpoint_running_requests.get(key, 0) - 1
+        if remaining > 0:
+            self._endpoint_running_requests[key] = remaining
+        else:
+            self._endpoint_running_requests.pop(key, None)
+
+    def _prune_running_requests(self, keep_instance_ids: set[int] | None, drop_instance_ids: set[int]) -> None:
+        """Drop running-request counters for instances that left the pool."""
+        for key in list(self._endpoint_running_requests):
+            instance_id = key[0]
+            dropped = instance_id in drop_instance_ids
+            if dropped or (keep_instance_ids is not None and instance_id not in keep_instance_ids):
+                self._endpoint_running_requests.pop(key, None)
+
+    def _format_endpoint_load_snapshot(self, role: PDRole) -> str:
+        """Render 'ins/ep:running/active_tokens' for every available endpoint of ``role``."""
+        parts: list[str] = []
+        for instance in self._instance_manager.get_available_instances(role).values():
+            for endpoint in instance.get_all_endpoints():
+                running = self._endpoint_running_requests.get((instance.id, endpoint.id), 0)
+                parts.append(f"{instance.id}/{endpoint.id}:{running}/{endpoint.workload.active_tokens:.1f}")
+        return " ".join(parts) if parts else "<none>"
 
     def _handle_get_available_instances(self, request: SchedulerRequest) -> SchedulerResponse:
         role_str = request.data.get("role")
@@ -392,10 +428,12 @@ class _SchedulerRequestDispatcher:
                     if not task.done():
                         task.cancel()
                     self._recovery_timers.pop(key, None)
+                self._prune_running_requests({inst.id for inst in instances}, set())
             elif event_type == EventType.DEL:
                 for inst in instances:
                     self._cb_manager.clear_instance(inst.id)
                     self._cancel_recovery(inst.id)
+                self._prune_running_requests(None, {inst.id for inst in instances})
             if changed and self._workload_writer:
                 self._workload_writer.write_snapshot()
         if changed:
@@ -757,6 +795,17 @@ class _SchedulerRequestDispatcher:
                 data={_KEY_INSTANCE: None, _KEY_ENDPOINT: None},
             )
         instance, endpoint, selected_score = selected
+        logger.info(
+            "ALLOCATE_ONLY selected req_id=%s role=%s ins=%s ep=%s score=%.4f fast_path=%s "
+            "endpoints[ins/ep:running/workload]=%s",
+            req_id,
+            role.value,
+            instance.id,
+            endpoint.id,
+            selected_score,
+            fast_path,
+            self._format_endpoint_load_snapshot(role),
+        )
         selected_matched = matched_tokens_map.get((instance.id, endpoint.id), 0.0)
         if (
             candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY
@@ -782,6 +831,7 @@ class _SchedulerRequestDispatcher:
         )
         success, updated_role, updated_workload = self._scheduler.update_workload_sync(params)
         if success:
+            self._track_running_request(instance.id, endpoint.id, WorkloadAction.ALLOCATION)
             self._write_workload_entry(instance.id, endpoint.id, updated_role, updated_workload)
 
         if not success:

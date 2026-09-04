@@ -279,6 +279,23 @@ pub struct WorkerKey {
     pub medium: StorageMedium,
 }
 
+/// Instance-id prefix for blocks stored on a pool node that has no
+/// HBM-registered DP. Decode nodes commonly host memcache LocalService
+/// capacity; their `backend_id` is the store Pod IP, which is not in
+/// `hbm_ip_index`. Edges still go into the shared CPU/Disk graph so the
+/// ownership-blind walk can see them, but these keys are not routing targets.
+pub const POOL_LOCATION_PREFIX: &str = "pool:";
+
+/// `pool:<store_ip>` — owner of unmapped pool-store edges.
+pub fn pool_location_instance_id(store_ip: &str) -> String {
+    format!("{POOL_LOCATION_PREFIX}{store_ip}")
+}
+
+/// Whether `instance_id` is a pool-location placeholder, not a schedulable worker.
+pub fn is_pool_location_instance(instance_id: &str) -> bool {
+    instance_id.starts_with(POOL_LOCATION_PREFIX)
+}
+
 // ---------------------------------------------------------------------------
 // Registration types (matching Python ConductorApiClient)
 // ---------------------------------------------------------------------------

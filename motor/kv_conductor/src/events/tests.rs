@@ -740,6 +740,213 @@ fn test_memcache_batch_parse_and_apply_ip_only() {
     }
 }
 
+/// A memcache stored event whose `backend_id` is a decode (or any
+/// non-HBM) Pod IP must still enter `pending_pool` under `pool:<ip>`.
+/// Decode nodes host pool capacity; dropping those events was the
+/// silent hole that left CPU root walks at 7 blocks.
+#[test]
+fn test_memcache_unknown_backend_id_queues_at_pool_location() {
+    use crate::indexer::Indexer;
+    use crate::protocols::HbmIpIndex;
+
+    let indexer = Indexer::new();
+    let ip_index = HbmIpIndex::default();
+    ip_index
+        .write()
+        .entry("10.244.0.99".to_string())
+        .or_default()
+        .push(("vllm-prefill-1".to_string(), 0));
+
+    let token_ids = vec![1i64, 2, 3, 4];
+    let block_size = 4u32;
+    let hash = compute_block_hash_for_seq(&token_ids, block_size)[0].0;
+
+    let packed = rmp_serde::to_vec(&memcache_wire_batch(hash)).unwrap();
+    let parsed: MemcacheEventBatch = from_slice(&packed).unwrap();
+    let event = &parsed.events[0];
+    assert_eq!(event.backend_id.as_deref(), Some("10.244.0.5"));
+
+    apply_pool_event(
+        &indexer,
+        event,
+        "test-model",
+        "default",
+        "memcache-pool",
+        0,
+        &[StorageMedium::Npu, StorageMedium::Cpu, StorageMedium::Disk],
+        MatchMode::IpOnly,
+        &Some(ip_index),
+    )
+    .unwrap();
+
+    let entry = indexer.get_or_create("test-model", "default");
+    {
+        let state = entry.offload_pool_state.read();
+        assert!(
+            state.pending_pool.contains_key(&hash),
+            "decode-store IP must still queue in pending_pool"
+        );
+    }
+    assert!(entry.pending_count() > 0);
+}
+
+/// `MatchMode::IpOnly` with no HBM IP index still keeps the event under
+/// `pool:<ip>` so a later offload can confirm it.
+#[test]
+fn test_ip_only_without_hbm_index_queues_at_pool_location() {
+    use crate::indexer::Indexer;
+
+    let indexer = Indexer::new();
+    let store_ev = PoolEvent {
+        event_id: 1,
+        timestamp: None,
+        event_type: Some("stored".into()),
+        legacy_type: None,
+        model_name: Some("m".into()),
+        tenant_id: Some("t".into()),
+        backend_id: Some("10.0.0.1".into()),
+        medium: Some("cpu".into()),
+        dp_rank: Some(0),
+        seq_hashes: Some(vec![FlexHash(0xFEED)]),
+        block_hashes: None,
+    };
+    apply_pool_event(
+        &indexer,
+        &store_ev,
+        "m",
+        "t",
+        "memcache-pool",
+        0,
+        &[StorageMedium::Cpu],
+        MatchMode::IpOnly,
+        &None,
+    )
+    .unwrap();
+
+    let entry = indexer.get_or_create("m", "t");
+    assert!(
+        entry
+            .offload_pool_state
+            .read()
+            .pending_pool
+            .contains_key(&0xFEED),
+        "IpOnly without hbm_ip_index must queue at pool location"
+    );
+}
+
+/// Decode LocalService stores the full prefix; prefill only has a short
+/// HBM hit. After two-phase match, the registered prefill DP must report
+/// the pooled tail, and `pool:<decode-ip>` must not appear as a routing
+/// instance.
+#[test]
+fn test_unmapped_decode_pool_is_visible_to_registered_prefill() {
+    use crate::indexer::Indexer;
+    use crate::protocols::{pool_location_instance_id, HbmIpIndex};
+
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("qwen3", "default");
+    entry.note_registered_dp("vllm-prefill-3", 0);
+
+    let ip_index = HbmIpIndex::default();
+    ip_index
+        .write()
+        .entry("10.244.55.60".to_string())
+        .or_default()
+        .push(("vllm-prefill-3".to_string(), 0));
+
+    let tokens: Vec<i64> = (0..12).collect();
+    let block_size = 4u32;
+    let local_hashes = compute_block_hash_for_seq(&tokens, block_size);
+    assert_eq!(local_hashes.len(), 3);
+    let seq_hashes = [0xA01u64, 0xA02, 0xA03];
+
+    let prefill = WorkerKey {
+        instance_id: "vllm-prefill-3".into(),
+        backend_id: "vllm-prefill-3".into(),
+        dp_rank: 0,
+        medium: StorageMedium::Npu,
+    };
+    entry
+        .apply_event(
+            &prefill,
+            &KvCacheEventData::Stored(KvCacheStoreData {
+                parent_hash: None,
+                start_position: None,
+                blocks: vec![KvCacheStoredBlockData {
+                    block_hash: seq_hashes[0],
+                    tokens_hash: local_hashes[0].0,
+                }],
+            }),
+        )
+        .unwrap();
+
+    let decode_store = PoolEvent {
+        event_id: 1,
+        timestamp: None,
+        event_type: Some("stored".into()),
+        legacy_type: None,
+        model_name: Some("qwen3".into()),
+        tenant_id: Some("default".into()),
+        backend_id: Some("10.244.59.1".into()),
+        medium: Some("cpu".into()),
+        dp_rank: None,
+        seq_hashes: Some(seq_hashes.iter().copied().map(FlexHash).collect()),
+        block_hashes: None,
+    };
+    apply_pool_event(
+        &indexer,
+        &decode_store,
+        "qwen3",
+        "default",
+        "memcache-pool",
+        0,
+        &[StorageMedium::Cpu],
+        MatchMode::IpOnly,
+        &Some(ip_index),
+    )
+    .unwrap();
+
+    let offload = VllmEvent::BlockStored {
+        block_hashes: seq_hashes.to_vec(),
+        parent_block_hash: None,
+        token_ids: tokens.clone(),
+        block_size,
+        medium: Some("cpu".into()),
+        group_idx: None,
+    };
+    apply_vllm_event(
+        &indexer,
+        &offload,
+        "qwen3",
+        "default",
+        "vllm-prefill-3",
+        0,
+        &[StorageMedium::Cpu],
+        MatchMode::None,
+        &None,
+        block_size,
+    )
+    .unwrap();
+
+    let resp = indexer
+        .query("qwen3", "default", &tokens, block_size)
+        .unwrap();
+    let tenant = &resp.tenants["default"];
+    assert!(
+        !tenant.contains_key(&pool_location_instance_id("10.244.59.1")),
+        "pool-location placeholder must not be a routing instance"
+    );
+    let dp0 = &tenant["vllm-prefill-3"].dp["0"];
+    assert_eq!(dp0.npu_blocks, 1);
+    assert_eq!(
+        dp0.cpu_blocks, 2,
+        "decode-hosted pool should extend the prefix past HBM"
+    );
+    assert_eq!(dp0.matched_tokens, 12);
+    assert_eq!(dp0.cpu_local_blocks, 0);
+    assert_eq!(dp0.cpu_remote_blocks, 2);
+}
+
 #[test]
 fn test_pool_backend_remove_evicts_cache() {
     use crate::indexer::Indexer;

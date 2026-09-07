@@ -126,6 +126,7 @@ Located in `scheduler/policy/`, each policy implements `BaseSchedulingPolicy`:
 | `LoadBalancePolicy` | Reads workload SHM, picks endpoint with minimum active tokens | Heterogeneous workloads, varying request lengths |
 | `KvCacheAffinityPolicy` | Queries KV Conductor (via `ConductorApiClient`) for prefix match; prefers endpoints with cached blocks | High prefix reuse, PD disaggregation |
 | `SMetricPolicy` | Queries KV Conductor and ranks by remaining prefill cost; the central Scheduler gates request-cost ranking against its shared running average and the scored endpoints' ledgers | Prefill routing driven by uncached prompt cost |
+| `SMetricGatedPolicy` | SMetric cost order (prefill_cost ascending), then the first endpoint whose ledger is strictly below both averages over the scored endpoints: `active_tokens` and `cpu_hit_blocks` (CPU-tier KV blocks in flight, stamped per allocation from conductor `cpu_blocks`). Fallback: active gate only, then cheapest. Always arbitrated on the Scheduler ledger (no fast path; `cpu_hit_blocks` is not in the SHM) | Cache-first routing that avoids endpoints hot on compute or CPU->NPU KV transfer |
 
 **Conductor `/query` wire encoding** (`ConductorApiClient.query_conductor`):
 `kv_conductor_config.query_encoding` (default `"msgpack"`) selects the wire
@@ -137,7 +138,7 @@ kv-conductor binaries.<br>
 
 **Factory registration** (`factory.py`): `SchedulingPolicyFactory` maps policy name → class. New policies register here.
 
-The policy is selected by `SchedulerType` (`config/coordinator.py`): `LOAD_BALANCE` / `ROUND_ROBIN` / `KV_CACHE_AFFINITY` (default) / `SMETRIC`. For `scheduler_type=kv_cache_affinity`, a sub-mode is chosen by `kv_affinity.mode`:
+The policy is selected by `SchedulerType` (`config/coordinator.py`): `LOAD_BALANCE` / `ROUND_ROBIN` / `KV_CACHE_AFFINITY` (default) / `SMETRIC` / `SMETRIC_GATED`. For `scheduler_type=kv_cache_affinity`, a sub-mode is chosen by `kv_affinity.mode`:
 
 - `unified` (default) — single score fusing affinity and live load; pick the minimum
 - `load_gated` — keep the N least-loaded endpoints, then pick the longest cached prefix

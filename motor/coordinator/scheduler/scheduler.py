@@ -25,7 +25,11 @@ from motor.coordinator.domain.scheduling_pin import (
     resolve_pinned_instance,
     select_endpoint_for_instance,
 )
-from motor.coordinator.domain.workload_calculator import allocated_prefill_cost, calculate_demand_workload
+from motor.coordinator.domain.workload_calculator import (
+    allocated_cpu_hit_blocks,
+    allocated_prefill_cost,
+    calculate_demand_workload,
+)
 from motor.config.coordinator import CoordinatorConfig, SchedulerType
 from motor.coordinator.domain import InstanceProvider
 from motor.coordinator.models.request import RequestInfo
@@ -178,6 +182,8 @@ class Scheduler:
         )
         # KV affinity / SMetric stamp the committed endpoint's prefill_cost; other policies stay 0.
         workload.prefill_cost = allocated_prefill_cost(req_info, instance.id, endpoint.id)
+        # smetric_gated additionally tracks the request's CPU-tier KV hits on the endpoint.
+        workload.cpu_hit_blocks = allocated_cpu_hit_blocks(req_info, instance.id, endpoint.id)
         params = UpdateWorkloadParams(
             instance_id=instance.id,
             endpoint_id=endpoint.id,

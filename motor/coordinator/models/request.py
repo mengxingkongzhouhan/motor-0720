@@ -72,6 +72,14 @@ class RequestInfo(BaseModel):
         "worker forwards every scored endpoint cost plus isl so the central Scheduler can "
         "gate min-cost ranking vs min ledger prefill_cost. Keyed by (instance_id, endpoint_id).",
     )
+    smetric_gated_debug: dict | None = Field(
+        default=None,
+        exclude=True,
+        description="Per-endpoint (prefill_cost, cpu_hit_blocks) cached by the smetric_gated policy at "
+        "selection; the worker forwards every endpoint so the central Scheduler can rank by "
+        "prefill_cost, gate on its ledger averages and stamp both values on the committed endpoint. "
+        "Keyed by (instance_id, endpoint_id).",
+    )
     api: str = Field(..., description="API need to be forwarded")
     entry_api: str = Field(
         default="",

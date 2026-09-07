@@ -38,6 +38,7 @@ from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_ROUND_ROBIN,
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
     CANDIDATE_POLICY_SMETRIC,
+    CANDIDATE_POLICY_SMETRIC_GATED,
     pack_send_frames,
     unpack_recv_payload,
     ZMQMessageSerializer,
@@ -55,7 +56,12 @@ from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.kv_cache_affinity import KvCacheAffinityPolicy
 from motor.coordinator.scheduler.policy.smetric import SMetricPolicy
-from motor.coordinator.domain.workload_calculator import allocated_prefill_cost, calculate_demand_workload
+from motor.coordinator.scheduler.policy.smetric_gated import SMETRIC_GATED_ROLES, SMetricGatedPolicy
+from motor.coordinator.domain.workload_calculator import (
+    allocated_cpu_hit_blocks,
+    allocated_prefill_cost,
+    calculate_demand_workload,
+)
 from motor.coordinator.domain.scheduling_pin import (
     resolve_pinned_instance,
     select_endpoint_for_instance,
@@ -968,6 +974,7 @@ class AsyncSchedulerClient:
             # alternates (best-first) for the scheduler's existing re-pick.
             affinity_debug = getattr(req_info, "kv_affinity_debug", None)
             smetric_debug = getattr(req_info, "smetric_debug", None)
+            gated_debug = getattr(req_info, "smetric_gated_debug", None)
             # Unified affinity: every scored endpoint + scalars so the scheduler re-ranks globally.
             # Detect by mode, not rec[2], so load_gated can still attach prefill_cost for accounting.
             global_affinity = (
@@ -994,6 +1001,19 @@ class AsyncSchedulerClient:
                         "prefill_cost": cost,
                     }
                     for (ins_id, ep_id), cost in smetric_debug.items()
+                    if not normalized_engine_type or ins_id in allowed_instance_ids
+                ]
+            elif candidate_policy == CANDIDATE_POLICY_SMETRIC_GATED and isinstance(gated_debug, dict):
+                # Every scored endpoint with cost + CPU hits: the scheduler re-sorts by cost, gates
+                # on its own ledger averages and stamps both values on whatever it commits.
+                candidate_endpoints = [
+                    {
+                        "instance_id": ins_id,
+                        "endpoint_id": ep_id,
+                        "prefill_cost": rec[0],
+                        "cpu_hit_blocks": rec[1],
+                    }
+                    for (ins_id, ep_id), rec in gated_debug.items()
                     if not normalized_engine_type or ins_id in allowed_instance_ids
                 ]
             elif global_affinity:
@@ -1117,6 +1137,10 @@ class AsyncSchedulerClient:
                 stamped = allocated_prefill_cost(req_info, out_instance.id, out_endpoint.id)
                 if not server_reported_prefill_cost and stamped:
                     committed_workload.prefill_cost = stamped
+                server_reported_cpu_hits = isinstance(committed_data, dict) and "cpu_hit_blocks" in committed_data
+                stamped_cpu_hits = allocated_cpu_hit_blocks(req_info, out_instance.id, out_endpoint.id)
+                if not server_reported_cpu_hits and stamped_cpu_hits:
+                    committed_workload.cpu_hit_blocks = stamped_cpu_hits
                 logger.info(
                     "scheduled role=%s req_id=%s instance=%s endpoint=%s policy=%s matched=%s "
                     "load=%s committed=%s score=%s fast_path=%s repicked=%s proposed=%s-%s",
@@ -1686,6 +1710,20 @@ class AsyncSchedulerClient:
             if candidates:
                 return candidates, CANDIDATE_POLICY_LOAD_BALANCE
             logger.warning("load_balance unavailable, falling back to round-robin")
+        elif st == "smetric_gated":
+            if role in SMETRIC_GATED_ROLES:
+                ranked = SMetricGatedPolicy.select_endpoint_candidates_from_list(
+                    instances,
+                    req_info,
+                    top_k=max(1, top_k),
+                )
+                if ranked:
+                    return ranked, CANDIDATE_POLICY_SMETRIC_GATED
+                logger.warning("smetric_gated did not select an endpoint, falling back to load_balance")
+            candidates = self._select_endpoint_candidates_by_load_balance(instances, role, top_k)
+            if candidates:
+                return candidates, CANDIDATE_POLICY_LOAD_BALANCE
+            logger.warning("load_balance unavailable, falling back to round-robin")
         elif st == "kv_cache_affinity":
             # Affinity ranking applies to KVA-eligible roles only; others fall through to
             # the load_balance -> round_robin chain below.
@@ -1737,7 +1775,7 @@ class AsyncSchedulerClient:
         if not all_endpoints:
             return None
         st = self._scheduler_type or "round_robin"
-        if st in ("load_balance", "kv_cache_affinity", "smetric"):
+        if st in ("load_balance", "kv_cache_affinity", "smetric", "smetric_gated"):
             ep = LoadBalancePolicy.select_endpoint_from_instance(instance)
             if ep:
                 return (instance, ep)

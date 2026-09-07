@@ -196,6 +196,9 @@ class SchedulerType(Enum):
     ROUND_ROBIN = "round_robin"
     KV_CACHE_AFFINITY = "kv_cache_affinity"
     SMETRIC = "smetric"
+    # SMetric ordering (prefill_cost ascending), then the first endpoint below both ledger averages
+    # (active_tokens and cpu_hit_blocks) wins.
+    SMETRIC_GATED = "smetric_gated"
 
     @classmethod
     def from_string(cls, value: str) -> Optional["SchedulerType"]:

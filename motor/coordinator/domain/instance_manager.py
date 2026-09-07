@@ -14,6 +14,7 @@ from typing import Mapping
 from motor.common.logger import get_logger
 from motor.common.logger.rate_limited_logger import RateLimitedLogger
 from motor.common.resources.instance import Instance, PDRole, Workload, Endpoint
+from motor.common.resources.endpoint import WorkloadAction
 from motor.common.resources.http_msg_spec import EventType
 from motor.config.coordinator import CoordinatorConfig
 from motor.coordinator.domain.scheduling import InstanceReadiness, readiness_from_instances
@@ -91,7 +92,19 @@ def _clamp_workload_floor(workload: Workload) -> bool:
     if workload.active_tokens < 0:
         workload.active_tokens = 0.0
         floored = True
+    if getattr(workload, "running", 0) < 0:
+        workload.running = 0
+        floored = True
     return floored
+
+
+def _apply_running_action(workload: Workload, workload_action: WorkloadAction | None) -> None:
+    """Count one in-flight request on the same endpoint object that stores active_tokens."""
+    if workload_action == WorkloadAction.ALLOCATION:
+        workload.running = int(getattr(workload, "running", 0) or 0) + 1
+        return
+    if workload_action == WorkloadAction.RELEASE_TOKENS:
+        workload.running = max(0, int(getattr(workload, "running", 0) or 0) - 1)
 
 
 def _rebuild_instance_workload(instance: Instance) -> bool:
@@ -233,6 +246,7 @@ class InstanceManager:
         instance_id: int,
         endpoint_id: int,
         workload_change: Workload,
+        workload_action: WorkloadAction | None = None,
     ) -> tuple[PDRole | None, Workload | None]:
         """Synchronously update workload and return the endpoint's new workload."""
         instance = self._available_pool.get(instance_id)
@@ -255,6 +269,7 @@ class InstanceManager:
             )
             return (None, None)
         endpoint.workload += workload_change
+        _apply_running_action(endpoint.workload, workload_action)
         # Ledger floor: workload is an unbounded signed accumulator updated by ALLOCATION(+) /
         # RELEASE(-) deltas. A release that exceeds the endpoint's outstanding allocation (e.g. a
         # duplicated/late release, or one whose allocation was reset) would drive the counter

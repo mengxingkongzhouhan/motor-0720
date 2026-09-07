@@ -23,12 +23,17 @@ class Workload(BaseModel):
     """Workload information for load balancing (compute-load ledger)."""
 
     active_tokens: float = Field(default=0, description="Active compute load in token units")
+    running: int = Field(
+        default=0,
+        description="In-flight allocations on this endpoint (ALLOCATION +1 / RELEASE_TOKENS -1)",
+    )
 
     def __iadd__(self, other):
         if not isinstance(other, Workload):
             raise TypeError(f"Unsupported operand type(s) for +=: 'Workload' and {type(other).__name__}")
 
         self.active_tokens += other.active_tokens
+        # ``running`` is updated from WorkloadAction, not from token deltas.
 
         return self
 

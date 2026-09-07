@@ -222,6 +222,10 @@ class _SchedulerRequestDispatcher:
         self._workload_commit_lock = asyncio.Lock()
         # Bounded FIFO of committed operation_ids for retry de-dup (oldest evicted when full).
         self._committed_update_workload_operations: "OrderedDict[str, None]" = OrderedDict()
+        # In-flight requests per (instance_id, endpoint_id). The token ledger only stores
+        # active_tokens, so ALLOCATE_ONLY snapshots this alongside workload.
+        self._endpoint_in_flight_req_ids: dict[tuple[int, int], set[str]] = {}
+        self._endpoint_anonymous_running: dict[tuple[int, int], int] = {}
         self._endpoint_instance_score_weight = max(
             0.0,
             getattr(config.scheduler_config, "endpoint_instance_score_weight", 0.05),
@@ -317,6 +321,12 @@ class _SchedulerRequestDispatcher:
         if success and params.operation_id:
             self._remember_committed_operation(params.operation_id)
         if success:
+            self._track_running_request(
+                int(instance_id),
+                int(endpoint_id),
+                workload_action,
+                req_id or "",
+            )
             self._write_workload_entry(int(instance_id), int(endpoint_id), updated_role, updated_workload)
         return SchedulerResponse(
             response_type=SchedulerResponseType.SUCCESS,
@@ -352,6 +362,84 @@ class _SchedulerRequestDispatcher:
         ops[operation_id] = None
         if len(ops) > _MAX_COMMITTED_UPDATE_WORKLOAD_OPERATIONS:
             ops.popitem(last=False)
+
+    @staticmethod
+    def _endpoint_running_key(instance_id: int, endpoint_id: int) -> tuple[int, int]:
+        return (int(instance_id), int(endpoint_id))
+
+    def _track_running_request(
+        self,
+        instance_id: int,
+        endpoint_id: int,
+        action: WorkloadAction,
+        req_id: str = "",
+    ) -> None:
+        """Record a committed ALLOCATION / RELEASE_TOKENS against an endpoint."""
+        key = self._endpoint_running_key(instance_id, endpoint_id)
+        named_id = str(req_id).strip() if req_id else ""
+        if action == WorkloadAction.ALLOCATION:
+            if named_id:
+                self._endpoint_in_flight_req_ids.setdefault(key, set()).add(named_id)
+            else:
+                self._endpoint_anonymous_running[key] = self._endpoint_anonymous_running.get(key, 0) + 1
+            return
+        if action != WorkloadAction.RELEASE_TOKENS:
+            return
+        if named_id:
+            in_flight = self._endpoint_in_flight_req_ids.get(key)
+            if not in_flight:
+                return
+            in_flight.discard(named_id)
+            if not in_flight:
+                self._endpoint_in_flight_req_ids.pop(key, None)
+            return
+        remaining = self._endpoint_anonymous_running.get(key, 0) - 1
+        if remaining > 0:
+            self._endpoint_anonymous_running[key] = remaining
+        else:
+            self._endpoint_anonymous_running.pop(key, None)
+
+    def _endpoint_running_count(self, instance_id: int, endpoint_id: int) -> int:
+        """Return in-flight request count for one endpoint (named req_ids + anonymous)."""
+        key = self._endpoint_running_key(instance_id, endpoint_id)
+        return len(self._endpoint_in_flight_req_ids.get(key, ())) + self._endpoint_anonymous_running.get(key, 0)
+
+    def _prune_running_requests(self, keep_instance_ids: set[int]) -> None:
+        """Drop running-request state for instances that left every pool."""
+        keep = {int(instance_id) for instance_id in keep_instance_ids}
+        for store in (self._endpoint_in_flight_req_ids, self._endpoint_anonymous_running):
+            for key in list(store):
+                if key[0] not in keep:
+                    store.pop(key, None)
+
+    def _format_endpoint_load_snapshot(self, role: PDRole) -> str:
+        """Render 'ins/ep:running/active_tokens' for every endpoint of ``role``.
+
+        ``running`` is read from the same endpoint Workload object as ``active_tokens``
+        (updated on ALLOCATION/RELEASE in InstanceManager). The dispatcher req_id set is
+        a fallback for policies that do not touch that ledger.
+        """
+        entries: list[tuple[int, int, int, float]] = []
+        for instance in self._instance_manager.get_available_instances(role).values():
+            for pod_eps in (instance.endpoints or {}).values():
+                for endpoint in (pod_eps or {}).values():
+                    ledger_running = int(getattr(endpoint.workload, "running", 0) or 0)
+                    tracked_running = self._endpoint_running_count(instance.id, endpoint.id)
+                    # Prefer the req_id set when it is populated; otherwise the endpoint
+                    # ledger (same object as active_tokens) is the source of truth.
+                    running = tracked_running if tracked_running > 0 else ledger_running
+                    entries.append(
+                        (
+                            int(instance.id),
+                            int(endpoint.id),
+                            running,
+                            float(endpoint.workload.active_tokens),
+                        )
+                    )
+        if not entries:
+            return "<none>"
+        entries.sort()
+        return " ".join(f"{ins}/{ep}:{running}/{tokens:.1f}" for ins, ep, running, tokens in entries)
 
     def _handle_get_available_instances(self, request: SchedulerRequest) -> SchedulerResponse:
         role_str = request.data.get("role")
@@ -396,6 +484,9 @@ class _SchedulerRequestDispatcher:
                 for inst in instances:
                     self._cb_manager.clear_instance(inst.id)
                     self._cancel_recovery(inst.id)
+            if event_type in (EventType.SET, EventType.DEL):
+                live = await self._instance_manager.snapshot_instances()
+                self._prune_running_requests({inst.id for inst in live})
             if changed and self._workload_writer:
                 self._workload_writer.write_snapshot()
         if changed:
@@ -782,6 +873,7 @@ class _SchedulerRequestDispatcher:
         )
         success, updated_role, updated_workload = self._scheduler.update_workload_sync(params)
         if success:
+            self._track_running_request(instance.id, endpoint.id, WorkloadAction.ALLOCATION, req_id)
             self._write_workload_entry(instance.id, endpoint.id, updated_role, updated_workload)
 
         if not success:
@@ -790,6 +882,17 @@ class _SchedulerRequestDispatcher:
                 request_id=request.request_id,
                 data={_KEY_INSTANCE: None, _KEY_ENDPOINT: None},
             )
+        logger.info(
+            "ALLOCATE_ONLY selected req_id=%s role=%s ins=%s ep=%s score=%.4f fast_path=%s "
+            "endpoints[ins/ep:running/workload]=%s",
+            req_id,
+            role.value,
+            instance.id,
+            endpoint.id,
+            selected_score,
+            fast_path,
+            self._format_endpoint_load_snapshot(role),
+        )
         instance_data = _serialize_instance_minimal(instance) if instance else None
         endpoint_data = _serialize_endpoint_minimal(endpoint) if endpoint else None
         if _should_log_scheduling_sample(req_id or request.request_id):

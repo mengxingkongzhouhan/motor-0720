@@ -13,6 +13,7 @@
 from unittest.mock import Mock, patch
 
 import msgspec
+import pytest
 
 from motor.common.resources.instance import Instance, Endpoint, PDRole
 from motor.coordinator.api_client.conductor_api_client import (
@@ -353,8 +354,8 @@ class TestGetRegisteredServices:
 
         assert services == [{"InstanceID": "vllm-prefill-2", "DPRank": 1}]
 
-    def test_returns_empty_when_both_fail(self):
-        """When both /workers and /services raise, return empty."""
+    def test_raises_when_both_endpoints_unreachable(self):
+        """When both /workers and /services raise, propagate so re-register skips."""
         cfg = _mock_config()
 
         with (
@@ -362,9 +363,8 @@ class TestGetRegisteredServices:
             patch("motor.coordinator.api_client.conductor_api_client.SafeHTTPSClient") as mock_http,
         ):
             mock_http.return_value.__enter__.return_value.get.side_effect = ConnectionError("conn refused")
-            services = ConductorApiClient.get_registered_services()
-
-        assert services == []
+            with pytest.raises(ConnectionError, match="conn refused"):
+                ConductorApiClient.get_registered_services()
 
     def test_returns_empty_when_response_not_dict(self):
         cfg = _mock_config()

@@ -1552,11 +1552,12 @@ fn test_query_dps_from_hbm_ip_index_skips_store_only_workers() {
         &[(300, hashes[0].0), (301, hashes[1].0), (302, hashes[2].0)],
     );
 
-    // Tree fallback still sees every owner (indexer-only tests).
+    // Tree fallback must not score decode — it is never an affinity target.
     let all = indexer.query("qwen3", "default", &tokens, 4).unwrap();
     assert!(
-        all.tenants["default"].contains_key("vllm-decode-1"),
-        "without the pod→DP table, tree keys still include the store owner"
+        !all.tenants["default"].contains_key("vllm-decode-1"),
+        "decode instances are not query targets: {:?}",
+        all.tenants["default"].keys().collect::<Vec<_>>()
     );
 
     let mut query_dps = rustc_hash::FxHashSet::default();

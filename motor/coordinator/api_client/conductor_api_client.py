@@ -524,11 +524,14 @@ class ConductorApiClient:
         reg = cls._kv_reg()
         client_args = {"address": format_address(reg.conductor_service, reg.http_server_port)}
 
+        workers_error: Exception | None = None
+        services_error: Exception | None = None
         with SafeHTTPSClient(timeout=15, **client_args) as client:
             # ── kv-conductor flavour (preferred) ─────────────────────
             try:
                 response = client.get("/workers")
-            except Exception:
+            except Exception as exc:
+                workers_error = exc
                 response = None
             if isinstance(response, dict):
                 workers = response.get("workers")
@@ -538,13 +541,19 @@ class ConductorApiClient:
             # ── Mooncake Master flavour (fallback) ───────────────────
             try:
                 response = client.get("/services")
-            except Exception:
+            except Exception as exc:
+                services_error = exc
                 response = None
             if isinstance(response, dict):
                 services = response.get("services", [])
                 if isinstance(services, list):
                     return services
 
+        # Both endpoints unreachable (conductor down / connection refused).
+        # Raise so re_register skips — returning [] would treat every DP as
+        # missing and spam failing /register calls.
+        if workers_error is not None and services_error is not None:
+            raise workers_error
         return []
 
     @staticmethod

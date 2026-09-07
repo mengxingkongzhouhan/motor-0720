@@ -59,6 +59,7 @@ pub fn query_dps_from_hbm_ip_index(index: &HbmIpIndex) -> FxHashSet<(String, u32
         .read()
         .values()
         .flatten()
+        .filter(|(instance_id, _)| is_query_target_instance(instance_id))
         .map(|(instance_id, dp_rank)| (instance_id.clone(), *dp_rank))
         .collect()
 }
@@ -195,6 +196,21 @@ pub fn pool_location_instance_id(store_ip: &str) -> String {
 /// Whether `instance_id` is a pool-location placeholder, not a schedulable worker.
 pub fn is_pool_location_instance(instance_id: &str) -> bool {
     instance_id.starts_with(POOL_LOCATION_PREFIX)
+}
+
+/// Decode engine instances are never affinity targets.
+///
+/// Coordinator may still `/register` them (older images named
+/// `vllm-decode-*`). Their store events stay in the tree; `/query` must not
+/// score those DPs.
+pub fn is_decode_instance(instance_id: &str) -> bool {
+    instance_id.starts_with("vllm-decode-")
+}
+
+/// Instances `/query` may return as routing keys.
+#[inline]
+pub fn is_query_target_instance(instance_id: &str) -> bool {
+    !is_pool_location_instance(instance_id) && !is_decode_instance(instance_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -751,12 +767,19 @@ mod tests {
                 .entry("10.244.0.5".into())
                 .or_default()
                 .push(("vllm-prefill-1".into(), 0));
+            // Decode may be in the index if an older coordinator registered it;
+            // /query must not score those DPs.
+            guard
+                .entry("10.244.59.26".into())
+                .or_default()
+                .push(("vllm-decode-3".into(), 0));
         }
         let dps = query_dps_from_hbm_ip_index(&index);
         assert_eq!(dps.len(), 3);
         assert!(dps.contains(&("vllm-prefill-1".into(), 0)));
         assert!(dps.contains(&("vllm-prefill-1".into(), 1)));
         assert!(dps.contains(&("vllm-prefill-2".into(), 0)));
+        assert!(!dps.iter().any(|(id, _)| id.starts_with("vllm-decode-")));
     }
 
     #[test]

@@ -381,17 +381,17 @@ impl IndexerEntry {
     fn tree_known_dps(&self) -> FxHashSet<(String, DpRank)> {
         let mut dps: FxHashSet<(String, DpRank)> = FxHashSet::default();
         for wk in self.lookups.read().keys() {
-            if !is_pool_location_instance(&wk.instance_id) {
+            if is_query_target_instance(&wk.instance_id) {
                 dps.insert((wk.instance_id.clone(), wk.dp_rank));
             }
         }
         for wk in self.cpu_tiers.worker_keys() {
-            if !is_pool_location_instance(&wk.instance_id) {
+            if is_query_target_instance(&wk.instance_id) {
                 dps.insert((wk.instance_id, wk.dp_rank));
             }
         }
         for wk in self.disk_tiers.worker_keys() {
-            if !is_pool_location_instance(&wk.instance_id) {
+            if is_query_target_instance(&wk.instance_id) {
                 dps.insert((wk.instance_id, wk.dp_rank));
             }
         }
@@ -1255,7 +1255,7 @@ impl Indexer {
         let mut instance_data: HashMap<String, InstanceMatchData> = HashMap::new();
 
         for ((instance_id, dp_rank), ends) in medium_ends {
-            if is_pool_location_instance(instance_id) {
+            if !is_query_target_instance(instance_id) {
                 continue;
             }
             let npu = ends.npu;

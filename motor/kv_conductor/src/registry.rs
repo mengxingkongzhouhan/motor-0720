@@ -65,11 +65,15 @@ fn add_hbm_ip_index_entries(
         let Some(ref ip) = extract_ip_from_endpoint(ep_url) else {
             continue;
         };
-        ip_index
-            .write()
-            .entry(ip.clone())
-            .or_default()
-            .push((instance_id.to_string(), dp_rank));
+        let mut idx = ip_index.write();
+        let dps = idx.entry(ip.clone()).or_default();
+        if dps
+            .iter()
+            .any(|(iid, rank)| iid == instance_id && *rank == dp_rank)
+        {
+            continue;
+        }
+        dps.push((instance_id.to_string(), dp_rank));
         tracing::info!(instance_id = %instance_id, dp_rank, ip = %ip, "HBM IP indexed for pool auto-attach");
     }
     refresh_query_dps(ip_index, query_dps);

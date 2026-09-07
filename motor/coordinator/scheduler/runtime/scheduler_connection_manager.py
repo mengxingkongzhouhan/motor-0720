@@ -76,6 +76,7 @@ class SchedulerConnectionManager:
             client_count=client_count,
             endpoint_instance_score_weight=(coordinator_config.scheduler_config.endpoint_instance_score_weight),
             kv_affinity=coordinator_config.scheduler_config.kv_affinity,
+            prefill_cost_balance=coordinator_config.scheduler_config.prefill_cost_balance,
             tls_config=coordinator_config.infer_tls_config,
             on_instance_refreshed=on_instance_refreshed,
         )

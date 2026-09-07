@@ -243,6 +243,9 @@ motor_coordinator_config字段配置样例如下所示：
       "w_npu": 1.0,
       "w_cpu": 1.0,
       "w_disk": 0.0
+    },
+    "prefill_cost_balance": {
+      "active_tokens_weight": 1.0
     }
   },
   "inference_workers_config": {
@@ -396,10 +399,11 @@ motor_coordinator_config字段配置样例如下所示：
 | **reschedule_config字段** |-|-|
 | enable | bool | 故障场景重调度功能开关。默认：`false`。<br>模型重计算由引擎侧负责，该配置不控制引擎侧重计算；`recompute_enabled`仅作为`reschedule_enabled`的旧配置兼容别名；`recompute_max_retry`已移除并会被忽略。 |
 | **scheduler_config字段** |-|-|
-| scheduler_type | string | 调度类型，默认值：load_balance<ul><li>load_balance：负载均衡；</li><li>round_robin：轮询；</li><li>kv_cache_affinity：KV Cache 亲和调度。</li></ul> |
+| scheduler_type | string | 调度类型，默认值：load_balance<ul><li>load_balance：负载均衡；</li><li>round_robin：轮询；</li><li>kv_cache_affinity：KV Cache 亲和调度；</li><li>smetric：按剩余 prefill 成本调度；</li><li>prefill_cost_balance：按 endpoint 账本 `prefill_cost + x * active_tokens` 负载均衡（x 见 `prefill_cost_balance.active_tokens_weight`）。</li></ul> |
 | enable_pd_separation_fallback_to_hybrid | bool | PD分离场景下，当D实例不可用或P/D实例不满足调度条件时，是否允许降级使用混部路由，默认值为 `true` |
 | endpoint_instance_score_weight | float | endpoint 优先负载均衡时实例平均负载权重。默认：`0.05` |
 | kv_affinity | object | KV Cache 亲和性调度参数（见下表） |
+| prefill_cost_balance | object | `scheduler_type=prefill_cost_balance` 时的参数（见下表） |
 | **kv_affinity 字段** |-|-|
 | mode | string | `scheduler_type=kv_cache_affinity` 时的子策略：`unified`（默认）或 `load_gated` |
 | load_weight | float | unified 模式下 endpoint 实时负载权重。默认值：`1.0` |
@@ -409,6 +413,8 @@ motor_coordinator_config字段配置样例如下所示：
 | w_npu | float | 互斥 NPU 命中块权重。默认值：`1.0` |
 | w_cpu | float | 互斥 CPU 命中块权重。默认值：`1.0` |
 | w_disk | float | 互斥 Disk 命中块权重。默认值：`0.0` |
+| **prefill_cost_balance 字段** |-|-|
+| active_tokens_weight | float | endpoint 得分 `prefill_cost + active_tokens_weight * active_tokens` 中 active_tokens 的系数，得分越低越优先。`0` 表示只按账本中未完成的剩余 prefill 排序。默认值：`1.0` |
 | **inference_workers_config字段** |-|-|
 | num_workers | int | Coordinator中业务面worker个数，默认值：4。 |
 | worker_metaserver_base_port | int | vLLM layerwise/trigger PD 时每个 Inference Worker 的 metaserver 起始端口。默认值：`12000`。Worker `i` 监听 `base+i`，仅暴露 `POST /v1/metaserver`。设为 `0` 关闭。须保证 `base+num_workers-1 <= 65535`。同一集群不可混部 handoff 与 trigger。监听地址优先 `POD_IP`，否则用 `coordinator_api_host`（不绑 loopback）。`coordinator_api_host=0.0.0.0`/`::` 仍可启动；走 Trigger 时须有 `POD_IP` 或可达的 `coordinator_api_host`，否则该请求返回 503。端口占用或 metaserver 启动失败时推理口继续服务，该 Worker 的 Trigger 请求返回 503。 |

@@ -38,6 +38,10 @@ from motor.coordinator.models.constants import DEFAULT_REQUEST_ID, REQUEST_ID_KE
 from motor.coordinator.domain.instance_manager import InstanceManager
 from motor.coordinator.scheduler.scheduler import Scheduler
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
+from motor.coordinator.scheduler.policy.prefill_cost_balance import (
+    PREFILL_COST_ROLES,
+    PrefillCostBalancePolicy,
+)
 from motor.coordinator.scheduler.policy.smetric import SMetricPrefillCostTracker
 from motor.coordinator.scheduler.runtime.workload_shm import WorkloadSharedMemoryWriter
 from motor.coordinator.scheduler.runtime.workload_shm.layout import (
@@ -51,6 +55,7 @@ from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_LOAD_BALANCE,
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
     CANDIDATE_POLICY_SMETRIC,
+    CANDIDATE_POLICY_PREFILL_COST_BALANCE,
     KNOWN_CANDIDATE_POLICIES,
     INSTANCE_CHANGE_TOPIC,
     CIRCUIT_BREAKER_TOPIC,
@@ -232,6 +237,12 @@ class _SchedulerRequestDispatcher:
         self._is_load_balance_scheduler = getattr(scheduler_type, "value", scheduler_type) == "load_balance"
         # One running average for all Workers that ALLOCATE_ONLY into this Scheduler process.
         self._smetric_prefill = SMetricPrefillCostTracker()
+        # ``x`` in the prefill_cost_balance endpoint score ``prefill_cost + x * active_tokens``.
+        prefill_cost_balance = getattr(config.scheduler_config, "prefill_cost_balance", None)
+        self._prefill_cost_active_tokens_weight = max(
+            0.0,
+            float(getattr(prefill_cost_balance, "active_tokens_weight", 1.0)),
+        )
 
     async def dispatch(self, request: SchedulerRequest) -> SchedulerResponse:
         """Dispatch request to the appropriate handler (async handlers supported)."""
@@ -739,6 +750,17 @@ class _SchedulerRequestDispatcher:
             )
             if selected is None or (selected[0].id, selected[1].id) != selected_candidate:
                 fast_path = False
+        elif candidate_policy == CANDIDATE_POLICY_PREFILL_COST_BALANCE:
+            # Ledger-only ranking: a fresh worker view means its top-1 already is the ledger
+            # minimum; otherwise re-rank every endpoint of the role on the authoritative ledger.
+            selected = (
+                self._select_valid_prefill_cost_balance_candidate(selected_candidate, role, required_engine_type)
+                if fast_path
+                else None
+            )
+            if selected is None:
+                selected = self._select_global_prefill_cost_balance_candidate(role, required_engine_type)
+                fast_path = False
         else:
             selected = (
                 self._select_valid_candidate(selected_candidate, role, required_engine_type)
@@ -795,6 +817,14 @@ class _SchedulerRequestDispatcher:
             workload = worker_demand
         # KV affinity / SMetric stamp the committed endpoint's prefill_cost; other policies leave 0.
         workload.prefill_cost = self._lookup_candidate_prefill_cost(affinity_candidates, instance.id, endpoint.id)
+        if (
+            candidate_policy == CANDIDATE_POLICY_PREFILL_COST_BALANCE
+            and role in PREFILL_COST_ROLES
+            and not self._has_candidate_prefill_cost(affinity_candidates, instance.id, endpoint.id)
+        ):
+            # No Conductor cost for this endpoint (lookup failed / instance unknown to the
+            # Conductor): assume nothing is cached, so the remaining prefill is the whole prompt.
+            workload.prefill_cost = max(0.0, float(isl)) if isl is not None else max(0.0, workload.active_tokens)
         params = UpdateWorkloadParams(
             instance_id=instance.id,
             endpoint_id=endpoint.id,
@@ -1060,6 +1090,52 @@ class _SchedulerRequestDispatcher:
             if iid == instance_id and eid == endpoint_id:
                 return max(0.0, float(cost))
         return 0.0
+
+    @staticmethod
+    def _has_candidate_prefill_cost(
+        candidates: list[tuple[int, int, float]] | None,
+        instance_id: int,
+        endpoint_id: int,
+    ) -> bool:
+        """True when the worker reported a prefill_cost for this endpoint (0.0 is a valid cost)."""
+        if not candidates:
+            return False
+        return any(iid == instance_id and eid == endpoint_id for iid, eid, _cost in candidates)
+
+    def _select_global_prefill_cost_balance_candidate(
+        self,
+        role: PDRole,
+        required_engine_type: str | None = None,
+    ) -> tuple[Instance, Endpoint, float] | None:
+        """Lowest ``prefill_cost + x * active_tokens`` over every available endpoint of ``role``."""
+        instances = [
+            instance
+            for instance in self._instance_manager.get_available_instances(role).values()
+            if self._matches_engine_type(instance, required_engine_type)
+        ]
+        candidates = PrefillCostBalancePolicy.select_endpoint_candidates_from_list(
+            instances,
+            top_k=1,
+            active_tokens_weight=self._prefill_cost_active_tokens_weight,
+            is_blocked=self._is_instance_circuit_open,
+        )
+        if not candidates:
+            return None
+        return candidates[0]
+
+    def _select_valid_prefill_cost_balance_candidate(
+        self,
+        candidate: tuple[int, int],
+        role: PDRole,
+        required_engine_type: str | None = None,
+    ) -> tuple[Instance, Endpoint, float] | None:
+        """Fast path: validate the worker's top-1 and report its ledger score."""
+        validated = self._select_valid_candidate(candidate, role, required_engine_type)
+        if validated is None:
+            return None
+        instance, endpoint, _lb_score = validated
+        score = PrefillCostBalancePolicy.calculate_endpoint_score(endpoint, self._prefill_cost_active_tokens_weight)
+        return (instance, endpoint, score)
 
     def _select_smetric_hybrid(
         self,

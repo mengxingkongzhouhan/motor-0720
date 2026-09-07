@@ -47,6 +47,12 @@ def _create_smetric(instance_provider: InstanceProvider) -> BaseSchedulingPolicy
     return SMetricPolicy(instance_provider=instance_provider)
 
 
+def _create_prefill_cost_balance(instance_provider: InstanceProvider) -> BaseSchedulingPolicy:
+    from motor.coordinator.scheduler.policy.prefill_cost_balance import PrefillCostBalancePolicy
+
+    return PrefillCostBalancePolicy(instance_provider=instance_provider)
+
+
 _REGISTRY: dict[SchedulerType, PolicyFactory] = {}
 
 
@@ -84,6 +90,7 @@ def _register_builtin() -> None:
     register(SchedulerType.LOAD_BALANCE, _create_load_balance)
     register(SchedulerType.KV_CACHE_AFFINITY, _create_kv_cache_affinity)
     register(SchedulerType.SMETRIC, _create_smetric)
+    register(SchedulerType.PREFILL_COST_BALANCE, _create_prefill_cost_balance)
 
 
 _register_builtin()

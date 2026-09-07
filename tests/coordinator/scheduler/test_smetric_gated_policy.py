@@ -10,6 +10,7 @@
 
 """Tests for SMetricGatedPolicy: prefill_cost order, then first endpoint under both ledger averages."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -18,7 +19,7 @@ import pytest
 from motor.common.resources.endpoint import Endpoint, EndpointStatus, Workload, WorkloadAction
 from motor.common.resources.http_msg_spec import EventType
 from motor.common.resources.instance import Instance, InsStatus, PDRole, ParallelConfig
-from motor.config.coordinator import CoordinatorConfig, SchedulerType
+from motor.config.coordinator import CoordinatorConfig, SchedulerType, SMetricGatedConfig
 from motor.coordinator.api_client.conductor_api_client import TENANT_ID, conductor_instance_id
 from motor.coordinator.domain import ScheduledResource
 from motor.coordinator.domain.instance_manager import InstanceManager
@@ -254,6 +255,64 @@ class TestPickGated:
     def test_empty(self):
         assert pick_gated([]) is None
 
+    def test_thresholds_are_mean_times_factor(self):
+        ranked = sort_candidates(
+            [_cand(1, ledger_prefill=1, active=10, cpu=10), _cand(2, ledger_prefill=2, active=30, cpu=30)]
+        )
+        _c, _r, active_threshold, cpu_threshold = pick_gated(ranked, 1.5, 0.5)
+        assert active_threshold == 20 * 1.5
+        assert cpu_threshold == 20 * 0.5
+
+    def test_factor_above_one_loosens_gate(self):
+        # ep1 (lowest ledger prefill) is exactly on the active mean: rejected at 1.0, accepted at 1.2.
+        ranked = sort_candidates(
+            [
+                _cand(1, ledger_prefill=1, active=20, cpu=0),
+                _cand(2, ledger_prefill=2, active=10, cpu=0),
+                _cand(3, ledger_prefill=3, active=30, cpu=0),
+            ]
+        )
+        strict, reason_strict, _a, _c = pick_gated(ranked)
+        loose, reason_loose, _a2, _c2 = pick_gated(ranked, active_tokens_mean_factor=1.2)
+        assert strict.endpoint.id == 2 and reason_strict == PICK_ACTIVE_GATE  # cpu all 0 -> cpu gate never passes
+        assert loose.endpoint.id == 1 and reason_loose == PICK_ACTIVE_GATE
+
+    def test_factor_below_one_tightens_gate(self):
+        # ep1 is under the plain mean (15 < 20) but not under 0.5 * mean (10); ep2 is.
+        ranked = sort_candidates(
+            [
+                _cand(1, ledger_prefill=1, active=15, cpu=5),
+                _cand(2, ledger_prefill=2, active=5, cpu=5),
+                _cand(3, ledger_prefill=3, active=40, cpu=20),
+            ]
+        )
+        plain, _r, _a, _c = pick_gated(ranked)
+        tight, _r2, _a2, _c2 = pick_gated(ranked, active_tokens_mean_factor=0.5)
+        assert plain.endpoint.id == 1
+        assert tight.endpoint.id == 2
+
+    def test_cpu_factor_only_affects_cpu_gate(self):
+        # Both under the active mean; ep1 over the cpu mean at 1.0 but under it at 2.0.
+        ranked = sort_candidates(
+            [
+                _cand(1, ledger_prefill=1, active=5, cpu=15),
+                _cand(2, ledger_prefill=2, active=5, cpu=5),
+                _cand(3, ledger_prefill=3, active=50, cpu=10),
+            ]
+        )
+        plain, reason_plain, _a, _c = pick_gated(ranked)
+        loose, reason_loose, _a2, _c2 = pick_gated(ranked, cpu_hit_blocks_mean_factor=2.0)
+        assert plain.endpoint.id == 2 and reason_plain == PICK_BOTH_GATES
+        assert loose.endpoint.id == 1 and reason_loose == PICK_BOTH_GATES
+
+    def test_negative_or_none_factor_normalized(self):
+        ranked = sort_candidates(
+            [_cand(1, ledger_prefill=1, active=10, cpu=10), _cand(2, ledger_prefill=2, active=30, cpu=30)]
+        )
+        _c, _r, active_threshold, cpu_threshold = pick_gated(ranked, -3.0, None)
+        assert active_threshold == 0.0  # negative -> 0: nothing can be strictly below
+        assert cpu_threshold == 20.0  # None -> default 1.0
+
 
 # ---------------------------------------------------------------------------
 # Policy (conductor scoring + registration)
@@ -326,6 +385,52 @@ class TestPolicy:
         assert SchedulerType.from_string("smetric_gated") is SchedulerType.SMETRIC_GATED
         assert CANDIDATE_POLICY_SMETRIC_GATED in KNOWN_CANDIDATE_POLICIES
 
+    def test_scheduler_pushes_mean_factors_from_config(self):
+        config = CoordinatorConfig()
+        config.scheduler_config.scheduler_type = SchedulerType.SMETRIC_GATED
+        config.scheduler_config.smetric_gated.active_tokens_mean_factor = 1.5
+        config.scheduler_config.smetric_gated.cpu_hit_blocks_mean_factor = 0.5
+        policy = Scheduler(instance_provider=MockInstanceProvider(), config=config).get_scheduling_policy()
+        assert isinstance(policy, SMetricGatedPolicy)
+        assert policy.mean_factors == (1.5, 0.5)
+
+    def test_json_config_sets_factors(self, tmp_path):
+        cfg_path = tmp_path / "coordinator.json"
+        cfg_path.write_text(
+            json.dumps(
+                {
+                    "scheduler_config": {
+                        "scheduler_type": "smetric_gated",
+                        "smetric_gated": {"active_tokens_mean_factor": 1.3, "cpu_hit_blocks_mean_factor": 0.8},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        config = CoordinatorConfig.from_json(str(cfg_path))
+        assert config.scheduler_config.scheduler_type is SchedulerType.SMETRIC_GATED
+        assert config.scheduler_config.smetric_gated.active_tokens_mean_factor == 1.3
+        assert config.scheduler_config.smetric_gated.cpu_hit_blocks_mean_factor == 0.8
+
+    def test_in_process_selection_uses_factors(self):
+        # ep10 first in ledger order, exactly on the active mean: only passes with factor > 1.
+        inst_a = _instance(1, [_endpoint(10, active_tokens=20, prefill_cost=1)])
+        inst_b = _instance(2, [_endpoint(20, active_tokens=10, prefill_cost=2)])
+        inst_c = _instance(3, [_endpoint(30, active_tokens=30, prefill_cost=3)])
+        instances = [inst_a, inst_b, inst_c]
+
+        def fake_score(insts, info):
+            info.smetric_gated_debug = {}
+            return sort_candidates([GatedCandidate(i, i.get_all_endpoints()[0], 0.0, 0.0) for i in insts])
+
+        policy = SMetricGatedPolicy(MockInstanceProvider())
+        with patch.object(SMetricGatedPolicy, "score_endpoints", side_effect=fake_score):
+            plain = policy.select_instance_and_endpoint_from_list(instances, PDRole.ROLE_P, _req_info())
+            policy.set_mean_factors(1.2, 1.0)
+            loose = policy.select_instance_and_endpoint_from_list(instances, PDRole.ROLE_P, _req_info())
+        assert plain[1].id == 20
+        assert loose[1].id == 10
+
     def test_pinned_endpoint_uses_load_balance_within_instance(self):
         inst = Mock()
         inst.id = 1
@@ -362,11 +467,36 @@ class TestPolicy:
 # ---------------------------------------------------------------------------
 
 
-def _client() -> AsyncSchedulerClient:
-    return AsyncSchedulerClient(SchedulerClientConfig(scheduler_type="smetric_gated"))
+def _client(active_factor: float = 1.0, cpu_factor: float = 1.0) -> AsyncSchedulerClient:
+    return AsyncSchedulerClient(
+        SchedulerClientConfig(
+            scheduler_type="smetric_gated",
+            smetric_gated=SMetricGatedConfig(
+                active_tokens_mean_factor=active_factor,
+                cpu_hit_blocks_mean_factor=cpu_factor,
+            ),
+        )
+    )
 
 
 class TestClientDispatch:
+    def test_factors_from_config_reach_the_policy(self):
+        client = _client(active_factor=1.7, cpu_factor=0.3)
+        inst = _instance(1, [_endpoint(10)])
+        with patch.object(
+            SMetricGatedPolicy,
+            "select_endpoint_candidates_from_list",
+            return_value=[(inst, inst.get_all_endpoints()[0], 0.0)],
+        ) as m:
+            client._select_endpoint_candidates_from_list_with_policy([inst], PDRole.ROLE_P, _req_info(), top_k=1)
+        kwargs = m.call_args.kwargs
+        assert kwargs["active_tokens_mean_factor"] == 1.7
+        assert kwargs["cpu_hit_blocks_mean_factor"] == 0.3
+
+    def test_default_factors_when_config_absent(self):
+        client = AsyncSchedulerClient(SchedulerClientConfig(scheduler_type="smetric_gated"))
+        assert (client._smetric_gated_active_factor, client._smetric_gated_cpu_factor) == (1.0, 1.0)
+
     def test_prefill_uses_gated_policy(self):
         client = _client()
         inst = _instance(1, [_endpoint(10)])
@@ -469,9 +599,11 @@ class TestClientDispatch:
 # ---------------------------------------------------------------------------
 
 
-async def _dispatcher(instances: list[Instance]):
+async def _dispatcher(instances: list[Instance], active_factor: float = 1.0, cpu_factor: float = 1.0):
     config = CoordinatorConfig()
     config.scheduler_config.scheduler_type = SchedulerType.SMETRIC_GATED
+    config.scheduler_config.smetric_gated.active_tokens_mean_factor = active_factor
+    config.scheduler_config.smetric_gated.cpu_hit_blocks_mean_factor = cpu_factor
     im = InstanceManager(config)
     await im.refresh_instances(EventType.ADD, instances)
     scheduler = Scheduler(instance_provider=im, config=config)
@@ -577,6 +709,48 @@ class TestServerArbitration:
         response = await dispatcher.dispatch(_allocate(1, 10, [_cand_payload(1, 10, 5.0), _cand_payload(1, 11, 60.0)]))
 
         assert response.data["endpoint"]["id"] == 11
+
+    @pytest.mark.asyncio
+    async def test_mean_factors_change_the_server_pick(self):
+        # ep10 first in ledger order, sits exactly on the active mean (20 of [20, 10, 30]).
+        inst = _instance(1, [_endpoint(10), _endpoint(11), _endpoint(12)])
+        ledger = {10: 20, 11: 10, 12: 30}
+        candidates = [_cand_payload(1, ep, float(ep)) for ep in ledger]
+
+        dispatcher, im, _ = await _dispatcher([inst])
+        for ep, active in ledger.items():
+            await im.update_instance_workload(1, ep, Workload(active_tokens=active, prefill_cost=ep))
+        strict = await dispatcher.dispatch(_allocate(1, 10, candidates))
+        assert strict.data["endpoint"]["id"] == 11
+
+        dispatcher, im, _ = await _dispatcher([_instance(1, [_endpoint(10), _endpoint(11), _endpoint(12)])], 1.2, 1.0)
+        for ep, active in ledger.items():
+            await im.update_instance_workload(1, ep, Workload(active_tokens=active, prefill_cost=ep))
+        loose = await dispatcher.dispatch(_allocate(1, 10, candidates))
+        assert loose.data["endpoint"]["id"] == 10
+
+    @pytest.mark.asyncio
+    async def test_cpu_factor_on_server(self):
+        # Both under the active mean; ep10 over the cpu mean at 1.0, under it at 2.0.
+        def build():
+            return _instance(1, [_endpoint(10), _endpoint(11), _endpoint(12)])
+
+        ledger = {10: (5, 15), 11: (5, 5), 12: (50, 10)}
+        candidates = [_cand_payload(1, ep, float(ep)) for ep in ledger]
+
+        dispatcher, im, _ = await _dispatcher([build()])
+        for ep, (active, cpu) in ledger.items():
+            await im.update_instance_workload(
+                1, ep, Workload(active_tokens=active, cpu_hit_blocks=cpu, prefill_cost=ep)
+            )
+        assert (await dispatcher.dispatch(_allocate(1, 10, candidates))).data["endpoint"]["id"] == 11
+
+        dispatcher, im, _ = await _dispatcher([build()], 1.0, 2.0)
+        for ep, (active, cpu) in ledger.items():
+            await im.update_instance_workload(
+                1, ep, Workload(active_tokens=active, cpu_hit_blocks=cpu, prefill_cost=ep)
+            )
+        assert (await dispatcher.dispatch(_allocate(1, 10, candidates))).data["endpoint"]["id"] == 10
 
     @pytest.mark.asyncio
     async def test_release_subtracts_cpu_hits_from_ledger(self):

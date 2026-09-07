@@ -371,6 +371,23 @@ class KvAffinityConfig:
 
 
 @dataclass
+class SMetricGatedConfig:
+    """Tunables for ``scheduler_type=smetric_gated``.
+
+    Nested under ``scheduler_config.smetric_gated`` in user JSON. Endpoints are walked in ledger
+    ``prefill_cost`` order and the first one passing both gates is committed:
+    ``active_tokens < mean(active_tokens) * active_tokens_mean_factor`` and
+    ``cpu_hit_blocks < mean(cpu_hit_blocks) * cpu_hit_blocks_mean_factor``.
+    """
+
+    # Multiplier on the candidates' mean active_tokens. >1 loosens the gate (more endpoints pass,
+    # ordering by ledger prefill dominates), <1 tightens it (only clearly idle endpoints pass).
+    active_tokens_mean_factor: float = 1.0
+    # Multiplier on the candidates' mean cpu_hit_blocks, same semantics.
+    cpu_hit_blocks_mean_factor: float = 1.0
+
+
+@dataclass
 class SchedulerConfig:
     scheduler_type: SchedulerType = field(default=SchedulerType.LOAD_BALANCE)
     enable_pd_separation_fallback_to_hybrid: bool = True
@@ -379,6 +396,8 @@ class SchedulerConfig:
     endpoint_instance_score_weight: float = 0.05
     # kv_cache_affinity tunables (affinity + load + per-medium weights).
     kv_affinity: KvAffinityConfig = field(default_factory=KvAffinityConfig)
+    # smetric_gated tunables (gate thresholds = candidate mean * factor).
+    smetric_gated: SMetricGatedConfig = field(default_factory=SMetricGatedConfig)
     # KV event registration config for kv-conductor.
     kv_conductor_config: KvConductorConfig = field(default_factory=KvConductorConfig)
 
@@ -911,6 +930,17 @@ class CoordinatorConfig:
         )
         if affinity.mode not in KV_AFFINITY_MODES:
             self._errors.append(f"kv_affinity.mode must be one of {KV_AFFINITY_MODES}, got {affinity.mode!r}")
+        gated = self.scheduler_config.smetric_gated
+        self._validate_positive_number(
+            gated.active_tokens_mean_factor,
+            "smetric_gated.active_tokens_mean_factor",
+            allow_zero=True,
+        )
+        self._validate_positive_number(
+            gated.cpu_hit_blocks_mean_factor,
+            "smetric_gated.cpu_hit_blocks_mean_factor",
+            allow_zero=True,
+        )
         if self.context_budget_mode not in CONTEXT_BUDGET_MODES:
             self._errors.append(
                 f"context_budget_mode must be one of {CONTEXT_BUDGET_MODES}, got {self.context_budget_mode!r}"
@@ -1128,6 +1158,10 @@ class CoordinatorConfig:
             f"    ├─ KV Affinity W NPU:          {self.scheduler_config.kv_affinity.w_npu}\n"
             f"    ├─ KV Affinity W CPU:          {self.scheduler_config.kv_affinity.w_cpu}\n"
             f"    ├─ KV Affinity W Disk:         {self.scheduler_config.kv_affinity.w_disk}\n"
+            f"    ├─ SMetric Gated Active Factor: "
+            f"{self.scheduler_config.smetric_gated.active_tokens_mean_factor}\n"
+            f"    ├─ SMetric Gated CPU Factor:    "
+            f"{self.scheduler_config.smetric_gated.cpu_hit_blocks_mean_factor}\n"
             f"    └─ Context Budget Mode:        {self.context_budget_mode}\n"
             "\n"
             "  Multiprocess (Inference Workers):\n"

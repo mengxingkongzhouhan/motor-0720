@@ -14,9 +14,11 @@ SMetric-gated scheduling policy: rank endpoints by their ledger, gate on two led
 1. Sort the endpoints of the request's role by the ledger ``workload.prefill_cost`` ascending,
    i.e. the remaining prefill currently outstanding on each endpoint (sum over its in-flight
    requests of ``isl - matched_tokens``).
-2. Walk that order and commit the first endpoint whose ledger is strictly below BOTH averages
-   over the ranked endpoints: ``active_tokens < mean(active_tokens)`` and
-   ``cpu_hit_blocks < mean(cpu_hit_blocks)``.
+2. Walk that order and commit the first endpoint whose ledger is strictly below BOTH scaled
+   averages over the ranked endpoints:
+   ``active_tokens < mean(active_tokens) * active_tokens_mean_factor`` and
+   ``cpu_hit_blocks < mean(cpu_hit_blocks) * cpu_hit_blocks_mean_factor``
+   (factors from ``SchedulerConfig.smetric_gated``, default 1.0).
 
 All three inputs are ledger fields, so the ranking itself needs no per-request affinity math.
 The KV Conductor is queried once per request only to know what to ADD to the committed
@@ -51,6 +53,20 @@ logger = get_logger(__name__)
 
 # Roles that do prefill, i.e. whose allocations have a conductor cost and CPU hit count.
 SMETRIC_GATED_ROLES = frozenset({PDRole.ROLE_P, PDRole.ROLE_U})
+
+# Gate threshold = candidate mean * factor; 1.0 is the plain average.
+DEFAULT_MEAN_FACTOR = 1.0
+
+
+def _factor(value: float | None) -> float:
+    """Normalize a mean factor: None -> default, negatives -> 0."""
+    if value is None:
+        return DEFAULT_MEAN_FACTOR
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return DEFAULT_MEAN_FACTOR
+
 
 # How the final endpoint was chosen (returned for logging / tests).
 PICK_BOTH_GATES = "both_gates"
@@ -112,10 +128,15 @@ def sort_candidates(candidates: list[GatedCandidate]) -> list[GatedCandidate]:
     return sorted(candidates, key=lambda c: (c.ledger_prefill_cost, c.instance.id, c.endpoint.id))
 
 
-def pick_gated(candidates: list[GatedCandidate]) -> tuple[GatedCandidate, str, float, float] | None:
+def pick_gated(
+    candidates: list[GatedCandidate],
+    active_tokens_mean_factor: float = DEFAULT_MEAN_FACTOR,
+    cpu_hit_blocks_mean_factor: float = DEFAULT_MEAN_FACTOR,
+) -> tuple[GatedCandidate, str, float, float] | None:
     """
     Walk ``candidates`` (already in ledger prefill_cost order) and return the first one whose
-    ledger is strictly below both averages, plus the pick reason and the two averages used.
+    ledger is strictly below both scaled averages, plus the pick reason and the two thresholds
+    actually used (``mean * factor``).
 
     Averages are taken over the candidates' current ledgers (``endpoint.workload``), so the
     caller decides which view is authoritative (worker SHM cache vs scheduler ledger).
@@ -125,19 +146,19 @@ def pick_gated(candidates: list[GatedCandidate]) -> tuple[GatedCandidate, str, f
     if not candidates:
         return None
     n = len(candidates)
-    mean_active = sum(c.ledger_active_tokens for c in candidates) / n
-    mean_cpu = sum(c.ledger_cpu_hit_blocks for c in candidates) / n
+    active_threshold = (sum(c.ledger_active_tokens for c in candidates) / n) * _factor(active_tokens_mean_factor)
+    cpu_threshold = (sum(c.ledger_cpu_hit_blocks for c in candidates) / n) * _factor(cpu_hit_blocks_mean_factor)
     active_only: GatedCandidate | None = None
     for cand in candidates:
-        under_active = cand.ledger_active_tokens < mean_active
-        under_cpu = cand.ledger_cpu_hit_blocks < mean_cpu
+        under_active = cand.ledger_active_tokens < active_threshold
+        under_cpu = cand.ledger_cpu_hit_blocks < cpu_threshold
         if under_active and under_cpu:
-            return (cand, PICK_BOTH_GATES, mean_active, mean_cpu)
+            return (cand, PICK_BOTH_GATES, active_threshold, cpu_threshold)
         if under_active and active_only is None:
             active_only = cand
     if active_only is not None:
-        return (active_only, PICK_ACTIVE_GATE, mean_active, mean_cpu)
-    return (candidates[0], PICK_MIN_LEDGER_PREFILL, mean_active, mean_cpu)
+        return (active_only, PICK_ACTIVE_GATE, active_threshold, cpu_threshold)
+    return (candidates[0], PICK_MIN_LEDGER_PREFILL, active_threshold, cpu_threshold)
 
 
 def format_candidates(candidates: list[GatedCandidate]) -> str:
@@ -160,7 +181,18 @@ class SMetricGatedPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
 
     def __init__(self, instance_provider: InstanceProvider):
         super().__init__(instance_provider=instance_provider)
+        self._active_tokens_mean_factor = DEFAULT_MEAN_FACTOR
+        self._cpu_hit_blocks_mean_factor = DEFAULT_MEAN_FACTOR
         logger.info("SMetricGatedPolicy started.")
+
+    def set_mean_factors(self, active_tokens_mean_factor: float, cpu_hit_blocks_mean_factor: float) -> None:
+        """Set the multipliers applied to the two candidate averages used as gate thresholds."""
+        self._active_tokens_mean_factor = _factor(active_tokens_mean_factor)
+        self._cpu_hit_blocks_mean_factor = _factor(cpu_hit_blocks_mean_factor)
+
+    @property
+    def mean_factors(self) -> tuple[float, float]:
+        return (self._active_tokens_mean_factor, self._cpu_hit_blocks_mean_factor)
 
     @staticmethod
     def score_endpoints(instances: list[Instance], req_info: RequestInfo) -> list[GatedCandidate] | None:
@@ -226,6 +258,8 @@ class SMetricGatedPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         instances: list[Instance],
         req_info: RequestInfo,
         top_k: int = 1,
+        active_tokens_mean_factor: float = DEFAULT_MEAN_FACTOR,
+        cpu_hit_blocks_mean_factor: float = DEFAULT_MEAN_FACTOR,
     ) -> list[tuple[Instance, Endpoint, float]] | None:
         """
         Worker-side proposal: the gated pick first, then the rest in ledger prefill_cost order.
@@ -237,18 +271,18 @@ class SMetricGatedPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         ranked = SMetricGatedPolicy.score_endpoints(instances, req_info)
         if not ranked:
             return None
-        picked = pick_gated(ranked)
+        picked = pick_gated(ranked, active_tokens_mean_factor, cpu_hit_blocks_mean_factor)
         if picked is None:
             return None
-        chosen, reason, mean_active, mean_cpu = picked
+        chosen, reason, active_threshold, cpu_threshold = picked
         logger.debug(
-            "smetric_gated(worker): req_id=%s pick=%s-%s reason=%s mean_active=%.1f mean_cpu=%.1f",
+            "smetric_gated(worker): req_id=%s pick=%s-%s reason=%s active_threshold=%.1f cpu_threshold=%.1f",
             getattr(req_info, "req_id", None) or DEFAULT_REQUEST_ID,
             chosen.instance.id,
             chosen.endpoint.id,
             reason,
-            mean_active,
-            mean_cpu,
+            active_threshold,
+            cpu_threshold,
         )
         ordered = [chosen] + [c for c in ranked if c is not chosen]
         return [(c.instance, c.endpoint, c.ledger_prefill_cost) for c in ordered[: max(1, top_k)]]
@@ -257,8 +291,16 @@ class SMetricGatedPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
     def select_endpoint_from_list(
         instances: list[Instance],
         req_info: RequestInfo,
+        active_tokens_mean_factor: float = DEFAULT_MEAN_FACTOR,
+        cpu_hit_blocks_mean_factor: float = DEFAULT_MEAN_FACTOR,
     ) -> tuple[Instance, Endpoint] | None:
-        ranked = SMetricGatedPolicy.select_endpoint_candidates_from_list(instances, req_info, top_k=1)
+        ranked = SMetricGatedPolicy.select_endpoint_candidates_from_list(
+            instances,
+            req_info,
+            top_k=1,
+            active_tokens_mean_factor=active_tokens_mean_factor,
+            cpu_hit_blocks_mean_factor=cpu_hit_blocks_mean_factor,
+        )
         if not ranked:
             return None
         instance, endpoint, _cost = ranked[0]
@@ -277,7 +319,12 @@ class SMetricGatedPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         req_info: RequestInfo | None = None,
     ):
         if role in SMETRIC_GATED_ROLES and req_info is not None:
-            selected = SMetricGatedPolicy.select_endpoint_from_list(instances, req_info)
+            selected = SMetricGatedPolicy.select_endpoint_from_list(
+                instances,
+                req_info,
+                active_tokens_mean_factor=self._active_tokens_mean_factor,
+                cpu_hit_blocks_mean_factor=self._cpu_hit_blocks_mean_factor,
+            )
             if selected is not None:
                 return selected
         from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy

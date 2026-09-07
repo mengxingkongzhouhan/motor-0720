@@ -241,6 +241,10 @@ class _SchedulerRequestDispatcher:
         self._is_load_balance_scheduler = getattr(scheduler_type, "value", scheduler_type) == "load_balance"
         # One running average for all Workers that ALLOCATE_ONLY into this Scheduler process.
         self._smetric_prefill = SMetricPrefillCostTracker()
+        # smetric_gated gate thresholds are ``candidate mean * factor``.
+        gated = getattr(config.scheduler_config, "smetric_gated", None)
+        self._smetric_gated_active_factor = max(0.0, float(getattr(gated, "active_tokens_mean_factor", 1.0)))
+        self._smetric_gated_cpu_factor = max(0.0, float(getattr(gated, "cpu_hit_blocks_mean_factor", 1.0)))
 
     async def dispatch(self, request: SchedulerRequest) -> SchedulerResponse:
         """Dispatch request to the appropriate handler (async handlers supported)."""
@@ -1166,19 +1170,21 @@ class _SchedulerRequestDispatcher:
                 )
             )
         ranked = sort_candidates(candidates)
-        picked = pick_gated(ranked)
+        picked = pick_gated(ranked, self._smetric_gated_active_factor, self._smetric_gated_cpu_factor)
         if picked is None:
             return None
-        chosen, reason, mean_active, mean_cpu = picked
+        chosen, reason, active_threshold, cpu_threshold = picked
         logger.info(
-            "smetric_gated: req_id=%s pick=%s-%s reason=%s mean_active=%.1f mean_cpu=%.1f "
-            "ranked[ins-ep:ledger_prefill/active/cpu(+req_cost/+req_cpu)]=%s",
+            "smetric_gated: req_id=%s pick=%s-%s reason=%s active_threshold=%.1f cpu_threshold=%.1f "
+            "factors=%.2f/%.2f ranked[ins-ep:ledger_prefill/active/cpu(+req_cost/+req_cpu)]=%s",
             req_id,
             chosen.instance.id,
             chosen.endpoint.id,
             reason,
-            mean_active,
-            mean_cpu,
+            active_threshold,
+            cpu_threshold,
+            self._smetric_gated_active_factor,
+            self._smetric_gated_cpu_factor,
             format_candidates(ranked),
         )
         return (chosen.instance, chosen.endpoint, chosen.ledger_prefill_cost)

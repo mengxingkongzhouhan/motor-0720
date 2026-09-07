@@ -48,6 +48,7 @@ from motor.config.coordinator import (
     KV_AFFINITY_MODE_UNIFIED,
     KV_AFFINITY_MODES,
     KvAffinityConfig,
+    SMetricGatedConfig,
 )
 from motor.coordinator.fault_tolerance.precision.streak_result import (
     PrecisionStreakResult,
@@ -661,6 +662,8 @@ class SchedulerClientConfig:
     endpoint_instance_score_weight: float = 0.05
     # kv_cache_affinity tunables (see SchedulerConfig.kv_affinity).
     kv_affinity: KvAffinityConfig | None = None
+    # smetric_gated tunables (see SchedulerConfig.smetric_gated).
+    smetric_gated: SMetricGatedConfig | None = None
     tls_config: Any | None = None
     on_instance_refreshed: OnInstanceRefreshedCallback | None = None
 
@@ -702,6 +705,9 @@ class AsyncSchedulerClient:
         self._kv_affinity_w_npu = max(0.0, float(affinity.w_npu))
         self._kv_affinity_w_cpu = max(0.0, float(affinity.w_cpu))
         self._kv_affinity_w_disk = max(0.0, float(affinity.w_disk))
+        gated = config.smetric_gated or SMetricGatedConfig()
+        self._smetric_gated_active_factor = max(0.0, float(gated.active_tokens_mean_factor))
+        self._smetric_gated_cpu_factor = max(0.0, float(gated.cpu_hit_blocks_mean_factor))
 
         self._serializer = ZMQMessageSerializer()
         self._transport = _SchedulerTransport(config.scheduler_address, config.timeout, self._serializer)
@@ -1716,6 +1722,8 @@ class AsyncSchedulerClient:
                     instances,
                     req_info,
                     top_k=max(1, top_k),
+                    active_tokens_mean_factor=self._smetric_gated_active_factor,
+                    cpu_hit_blocks_mean_factor=self._smetric_gated_cpu_factor,
                 )
                 if ranked:
                     return ranked, CANDIDATE_POLICY_SMETRIC_GATED

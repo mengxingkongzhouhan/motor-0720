@@ -75,6 +75,12 @@ class Scheduler:
             self._scheduling_policy.set_endpoint_instance_score_weight(
                 self._config.scheduler_config.endpoint_instance_score_weight
             )
+        if self._config and hasattr(self._scheduling_policy, "set_mean_factors"):
+            gated = self._config.scheduler_config.smetric_gated
+            self._scheduling_policy.set_mean_factors(
+                gated.active_tokens_mean_factor,
+                gated.cpu_hit_blocks_mean_factor,
+            )
         # Global per-PD-group precision state (shared across inference workers).
         self._sample_exit_last_time: dict[tuple[int | None, int], float] = {}
         self._precision_streak_counts: dict[tuple[int | None, int], int] = {}

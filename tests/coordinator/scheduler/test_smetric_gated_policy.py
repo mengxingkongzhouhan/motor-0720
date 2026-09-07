@@ -32,6 +32,7 @@ from motor.coordinator.scheduler.policy.smetric_gated import (
     PICK_MIN_LEDGER_PREFILL,
     GatedCandidate,
     SMetricGatedPolicy,
+    TieOffsetCounter,
     _cpu_hit_blocks,
     pick_gated,
     sort_candidates,
@@ -199,6 +200,48 @@ class TestPickGated:
             [_cand(3, ledger_prefill=50), _cand(1, ledger_prefill=10), _cand(2, ledger_prefill=10)]
         )
         assert [c.endpoint.id for c in ranked] == [1, 2, 3]
+
+    def test_tie_offset_rotates_equal_ledger_endpoints(self):
+        tied = [_cand(1, ledger_prefill=5), _cand(2, ledger_prefill=5), _cand(3, ledger_prefill=5)]
+        assert [c.endpoint.id for c in sort_candidates(tied, 0)] == [1, 2, 3]
+        assert [c.endpoint.id for c in sort_candidates(tied, 1)] == [2, 3, 1]
+        assert [c.endpoint.id for c in sort_candidates(tied, 2)] == [3, 1, 2]
+        assert [c.endpoint.id for c in sort_candidates(tied, 3)] == [1, 2, 3]  # wraps modulo n
+
+    def test_tie_offset_never_reorders_different_ledger_costs(self):
+        mixed = [
+            _cand(1, ledger_prefill=9),
+            _cand(2, ledger_prefill=5),
+            _cand(3, ledger_prefill=5),
+            _cand(4, ledger_prefill=1),
+        ]
+        for offset in range(6):
+            ranked = [c.endpoint.id for c in sort_candidates(mixed, offset)]
+            assert ranked[0] == 4 and ranked[-1] == 1
+            assert set(ranked[1:3]) == {2, 3}
+
+    def test_tie_offset_is_independent_of_input_order(self):
+        a = [_cand(3, ledger_prefill=0), _cand(1, ledger_prefill=0), _cand(2, ledger_prefill=0)]
+        b = [_cand(2, ledger_prefill=0), _cand(3, ledger_prefill=0), _cand(1, ledger_prefill=0)]
+        assert (
+            [c.endpoint.id for c in sort_candidates(a, 1)]
+            == [c.endpoint.id for c in sort_candidates(b, 1)]
+            == [2, 3, 1]
+        )
+
+    def test_idle_cluster_spreads_across_offsets(self):
+        idle = [_cand(1, ledger_prefill=0), _cand(2, ledger_prefill=0), _cand(3, ledger_prefill=0)]
+        picks = [pick_gated(sort_candidates(idle, offset))[0].endpoint.id for offset in range(6)]
+        assert picks == [1, 2, 3, 1, 2, 3]
+
+    def test_tie_offset_counter_is_monotonic_and_wraps(self):
+        counter = TieOffsetCounter()
+        assert [counter.next() for _ in range(3)] == [0, 1, 2]
+        staggered = TieOffsetCounter(start=5)
+        assert staggered.next() == 5
+        near_wrap = TieOffsetCounter(start=TieOffsetCounter._WRAP - 1)
+        assert near_wrap.next() == TieOffsetCounter._WRAP - 1
+        assert near_wrap.next() == 0
 
     def test_request_cost_does_not_affect_order(self):
         # ep2 has the best cache hit for this request (req_cost 1) but the heavier ledger.
@@ -412,6 +455,21 @@ class TestPolicy:
         assert config.scheduler_config.smetric_gated.active_tokens_mean_factor == 1.3
         assert config.scheduler_config.smetric_gated.cpu_hit_blocks_mean_factor == 0.8
 
+    def test_in_process_selection_rotates_ties(self):
+        instances = [_instance(i, [_endpoint(i * 10)]) for i in (1, 2, 3)]
+
+        def fake_score(insts, info):
+            info.smetric_gated_debug = {}
+            return sort_candidates([GatedCandidate(i, i.get_all_endpoints()[0], 0.0, 0.0) for i in insts])
+
+        policy = SMetricGatedPolicy(MockInstanceProvider())
+        with patch.object(SMetricGatedPolicy, "score_endpoints", side_effect=fake_score):
+            picks = [
+                policy.select_instance_and_endpoint_from_list(instances, PDRole.ROLE_P, _req_info())[1].id
+                for _ in range(6)
+            ]
+        assert picks == [10, 20, 30, 10, 20, 30]
+
     def test_in_process_selection_uses_factors(self):
         # ep10 first in ledger order, exactly on the active mean: only passes with factor > 1.
         inst_a = _instance(1, [_endpoint(10, active_tokens=20, prefill_cost=1)])
@@ -496,6 +554,33 @@ class TestClientDispatch:
     def test_default_factors_when_config_absent(self):
         client = AsyncSchedulerClient(SchedulerClientConfig(scheduler_type="smetric_gated"))
         assert (client._smetric_gated_active_factor, client._smetric_gated_cpu_factor) == (1.0, 1.0)
+
+    def test_tie_offset_advances_per_call_and_is_staggered_by_client_index(self):
+        client = AsyncSchedulerClient(
+            SchedulerClientConfig(scheduler_type="smetric_gated", client_index=2, client_count=4)
+        )
+        inst = _instance(1, [_endpoint(10)])
+        with patch.object(
+            SMetricGatedPolicy,
+            "select_endpoint_candidates_from_list",
+            return_value=[(inst, inst.get_all_endpoints()[0], 0.0)],
+        ) as m:
+            for _ in range(3):
+                client._select_endpoint_candidates_from_list_with_policy([inst], PDRole.ROLE_P, _req_info(), top_k=1)
+        assert [call.kwargs["tie_offset"] for call in m.call_args_list] == [2, 3, 4]
+
+    @patch("motor.coordinator.scheduler.policy.smetric_gated.ConductorApiClient.query_conductor")
+    def test_worker_proposal_rotates_idle_endpoints(self, mock_query):
+        client = _client()
+        instances = [_instance(i, [_endpoint(i * 10)]) for i in (1, 2, 3)]
+        mock_query.return_value = _conductor_tenant(*instances, dp={})
+        picks = [
+            client._select_endpoint_candidates_from_list_with_policy(instances, PDRole.ROLE_P, _req_info(), 1)[0][0][
+                1
+            ].id
+            for _ in range(6)
+        ]
+        assert picks == [10, 20, 30, 10, 20, 30]
 
     def test_prefill_uses_gated_policy(self):
         client = _client()
@@ -751,6 +836,39 @@ class TestServerArbitration:
                 1, ep, Workload(active_tokens=active, cpu_hit_blocks=cpu, prefill_cost=ep)
             )
         assert (await dispatcher.dispatch(_allocate(1, 10, candidates))).data["endpoint"]["id"] == 10
+
+    @pytest.mark.asyncio
+    async def test_idle_cluster_rotates_across_allocations(self):
+        """Equal ledgers must not always land on the lowest ids: the pick rotates per request."""
+        inst = _instance(1, [_endpoint(10), _endpoint(11), _endpoint(12)])
+        dispatcher, im, _ = await _dispatcher([inst])
+        candidates = [_cand_payload(1, ep, 0.0) for ep in (10, 11, 12)]
+
+        picks = []
+        for _ in range(6):
+            response = await dispatcher.dispatch(_allocate(1, 10, candidates))
+            picks.append(response.data["endpoint"]["id"])
+            # Undo the commit so every round sees an all-equal ledger again.
+            _, ledger = await im.get_endpoint_workload(1, picks[-1])
+            await im.update_instance_workload(
+                1,
+                picks[-1],
+                Workload(active_tokens=-ledger.active_tokens, prefill_cost=-ledger.prefill_cost),
+            )
+        assert picks == [10, 11, 12, 10, 11, 12]
+
+    @pytest.mark.asyncio
+    async def test_rotation_does_not_override_ledger_order(self):
+        inst = _instance(1, [_endpoint(10), _endpoint(11), _endpoint(12)])
+        dispatcher, im, _ = await _dispatcher([inst])
+        await im.update_instance_workload(1, 10, Workload(prefill_cost=50))
+        await im.update_instance_workload(1, 11, Workload(prefill_cost=50))
+        candidates = [_cand_payload(1, ep, 0.0) for ep in (10, 11, 12)]
+
+        for _ in range(4):
+            response = await dispatcher.dispatch(_allocate(1, 10, candidates))
+            assert response.data["endpoint"]["id"] == 12  # strictly lowest ledger prefill every time
+            await im.update_instance_workload(1, 12, Workload(active_tokens=-100.0))
 
     @pytest.mark.asyncio
     async def test_release_subtracts_cpu_hits_from_ledger(self):

@@ -1128,10 +1128,11 @@ class _SchedulerRequestDispatcher:
         """
         smetric_gated arbitration on the authoritative ledger.
 
-        Resolve every worker-scored endpoint that is still schedulable, sort by prefill_cost and
-        take the first one strictly below both ledger averages (active_tokens, cpu_hit_blocks);
-        see ``smetric_gated.pick_gated`` for the fallback order. The returned score is the
-        committed endpoint's prefill_cost.
+        Resolve every worker-scored endpoint that is still schedulable, sort by the endpoint's
+        ledger ``prefill_cost`` and take the first one strictly below both ledger averages
+        (active_tokens, cpu_hit_blocks); see ``smetric_gated.pick_gated`` for the fallback order.
+        The worker-supplied per-endpoint cost / cpu_blocks are only the values stamped on the
+        committed ledger. The returned score is the committed endpoint's ledger prefill_cost.
         """
         if not cost_candidates:
             logger.warning(
@@ -1171,7 +1172,7 @@ class _SchedulerRequestDispatcher:
         chosen, reason, mean_active, mean_cpu = picked
         logger.info(
             "smetric_gated: req_id=%s pick=%s-%s reason=%s mean_active=%.1f mean_cpu=%.1f "
-            "ranked[ins-ep:cost/active/cpu]=%s",
+            "ranked[ins-ep:ledger_prefill/active/cpu(+req_cost/+req_cpu)]=%s",
             req_id,
             chosen.instance.id,
             chosen.endpoint.id,
@@ -1180,7 +1181,7 @@ class _SchedulerRequestDispatcher:
             mean_cpu,
             format_candidates(ranked),
         )
-        return (chosen.instance, chosen.endpoint, chosen.prefill_cost)
+        return (chosen.instance, chosen.endpoint, chosen.ledger_prefill_cost)
 
     def _select_smetric_min_cost(
         self,

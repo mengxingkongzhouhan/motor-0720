@@ -28,7 +28,7 @@ from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.policy.smetric_gated import (
     PICK_ACTIVE_GATE,
     PICK_BOTH_GATES,
-    PICK_MIN_COST,
+    PICK_MIN_LEDGER_PREFILL,
     GatedCandidate,
     SMetricGatedPolicy,
     _cpu_hit_blocks,
@@ -56,13 +56,18 @@ from motor.coordinator.router.workload import WorkloadActionHandler
 from tests.coordinator.scheduler.conftest import MockInstanceProvider
 
 
-def _endpoint(ep_id: int, active_tokens: float = 0.0, cpu_hit_blocks: float = 0.0) -> Endpoint:
+def _endpoint(
+    ep_id: int,
+    active_tokens: float = 0.0,
+    cpu_hit_blocks: float = 0.0,
+    prefill_cost: float = 0.0,
+) -> Endpoint:
     return Endpoint(
         id=ep_id,
         ip="10.0.0.1",
         business_port=f"80{ep_id}",
         status=EndpointStatus.NORMAL,
-        workload=Workload(active_tokens=active_tokens, cpu_hit_blocks=cpu_hit_blocks),
+        workload=Workload(active_tokens=active_tokens, cpu_hit_blocks=cpu_hit_blocks, prefill_cost=prefill_cost),
     )
 
 
@@ -79,10 +84,17 @@ def _instance(instance_id: int, endpoints: list[Endpoint], role: PDRole = PDRole
     return inst
 
 
-def _cand(ep_id: int, cost: float, active: float = 0.0, cpu: float = 0.0, cpu_req: float = 0.0) -> GatedCandidate:
-    """Standalone candidate: endpoint ledger (active, cpu) + this request's cost / cpu hits."""
-    inst = _instance(ep_id, [_endpoint(ep_id, active_tokens=active, cpu_hit_blocks=cpu)])
-    return GatedCandidate(inst, inst.get_all_endpoints()[0], cost, cpu_req)
+def _cand(
+    ep_id: int,
+    ledger_prefill: float,
+    active: float = 0.0,
+    cpu: float = 0.0,
+    req_cost: float = 0.0,
+    req_cpu: float = 0.0,
+) -> GatedCandidate:
+    """Standalone candidate: endpoint ledger (prefill, active, cpu) + this request's stamp values."""
+    inst = _instance(ep_id, [_endpoint(ep_id, active_tokens=active, cpu_hit_blocks=cpu, prefill_cost=ledger_prefill)])
+    return GatedCandidate(inst, inst.get_all_endpoints()[0], req_cost, req_cpu)
 
 
 def _req_info(token_count: int = 100, req_id: str = "req-gated") -> SimpleNamespace:
@@ -181,18 +193,25 @@ class TestConductorParsing:
 
 
 class TestPickGated:
-    def test_sorted_by_cost_then_ids(self):
-        ranked = sort_candidates([_cand(3, 50), _cand(1, 10), _cand(2, 10)])
+    def test_sorted_by_ledger_prefill_then_ids(self):
+        ranked = sort_candidates(
+            [_cand(3, ledger_prefill=50), _cand(1, ledger_prefill=10), _cand(2, ledger_prefill=10)]
+        )
         assert [c.endpoint.id for c in ranked] == [1, 2, 3]
 
+    def test_request_cost_does_not_affect_order(self):
+        # ep2 has the best cache hit for this request (req_cost 1) but the heavier ledger.
+        ranked = sort_candidates([_cand(1, ledger_prefill=40, req_cost=90), _cand(2, ledger_prefill=80, req_cost=1)])
+        assert [c.endpoint.id for c in ranked] == [1, 2]
+
     def test_first_under_both_averages_wins(self):
-        # Cheapest (ep1) is hot on active tokens; ep2 is hot on cpu hits; ep3 is under both.
+        # Lowest ledger prefill (ep1) is hot on active tokens; ep2 is hot on cpu hits; ep3 is under both.
         ranked = sort_candidates(
             [
-                _cand(1, cost=10, active=90, cpu=0),
-                _cand(2, cost=20, active=10, cpu=90),
-                _cand(3, cost=30, active=20, cpu=10),
-                _cand(4, cost=40, active=0, cpu=0),
+                _cand(1, ledger_prefill=10, active=90, cpu=0),
+                _cand(2, ledger_prefill=20, active=10, cpu=90),
+                _cand(3, ledger_prefill=30, active=20, cpu=10),
+                _cand(4, ledger_prefill=40, active=0, cpu=0),
             ]
         )
         chosen, reason, mean_active, mean_cpu = pick_gated(ranked)
@@ -203,26 +222,34 @@ class TestPickGated:
     def test_gate_is_strict(self):
         # ep1 sits exactly on both averages -> rejected; ep2 strictly below -> chosen.
         ranked = sort_candidates(
-            [_cand(1, 1, active=20, cpu=20), _cand(2, 2, active=10, cpu=10), _cand(3, 3, active=30, cpu=30)]
+            [
+                _cand(1, ledger_prefill=1, active=20, cpu=20),
+                _cand(2, ledger_prefill=2, active=10, cpu=10),
+                _cand(3, ledger_prefill=3, active=30, cpu=30),
+            ]
         )
         chosen, reason, _a, _c = pick_gated(ranked)
         assert chosen.endpoint.id == 2 and reason == PICK_BOTH_GATES
 
     def test_fallback_active_gate_only(self):
         # Nobody is under both: ep1 under active but over cpu, ep2 the reverse.
-        ranked = sort_candidates([_cand(1, 5, active=10, cpu=30), _cand(2, 6, active=30, cpu=10)])
+        ranked = sort_candidates(
+            [_cand(1, ledger_prefill=5, active=10, cpu=30), _cand(2, ledger_prefill=6, active=30, cpu=10)]
+        )
         chosen, reason, _a, _c = pick_gated(ranked)
         assert chosen.endpoint.id == 1 and reason == PICK_ACTIVE_GATE
 
-    def test_fallback_min_cost_when_all_equal(self):
-        ranked = sort_candidates([_cand(2, 7, active=5, cpu=5), _cand(1, 9, active=5, cpu=5)])
+    def test_fallback_min_ledger_prefill_when_all_equal(self):
+        ranked = sort_candidates(
+            [_cand(2, ledger_prefill=7, active=5, cpu=5), _cand(1, ledger_prefill=9, active=5, cpu=5)]
+        )
         chosen, reason, _a, _c = pick_gated(ranked)
-        assert chosen.endpoint.id == 2 and reason == PICK_MIN_COST
+        assert chosen.endpoint.id == 2 and reason == PICK_MIN_LEDGER_PREFILL
 
-    def test_idle_cluster_takes_cheapest(self):
-        ranked = sort_candidates([_cand(1, 50), _cand(2, 5), _cand(3, 20)])
+    def test_idle_cluster_takes_lowest_ledger_prefill(self):
+        ranked = sort_candidates([_cand(1, ledger_prefill=50), _cand(2, ledger_prefill=5), _cand(3, ledger_prefill=20)])
         chosen, reason, _a, _c = pick_gated(ranked)
-        assert chosen.endpoint.id == 2 and reason == PICK_MIN_COST
+        assert chosen.endpoint.id == 2 and reason == PICK_MIN_LEDGER_PREFILL
 
     def test_empty(self):
         assert pick_gated([]) is None
@@ -235,44 +262,45 @@ class TestPickGated:
 
 class TestPolicy:
     @patch("motor.coordinator.scheduler.policy.smetric_gated.ConductorApiClient.query_conductor")
-    def test_score_endpoints_reads_cost_and_cpu_hits(self, mock_query):
-        inst_a = _instance(1, [_endpoint(10), _endpoint(11)])
-        inst_b = _instance(2, [_endpoint(20)])
+    def test_score_endpoints_reads_cost_and_cpu_hits_and_orders_by_ledger(self, mock_query):
+        # Ledger prefill: ep10=300, ep11=100, ep20=200 -> order 11, 20, 10 regardless of request cost.
+        inst_a = _instance(1, [_endpoint(10, prefill_cost=300), _endpoint(11, prefill_cost=100)])
+        inst_b = _instance(2, [_endpoint(20, prefill_cost=200)])
         req_info = _req_info(100)
         mock_query.return_value = _conductor_tenant(
             inst_a,
             inst_b,
             dp={
-                (1, 10): {"npu_blocks": 1, "cpu_blocks": 4, "matched_tokens": 30},
-                (1, 11): {"npu_blocks": 0, "cpu_blocks": 0, "matched_tokens": 90},
+                (1, 10): {"npu_blocks": 1, "cpu_blocks": 4, "matched_tokens": 90},  # best hit, heaviest ledger
+                (1, 11): {"npu_blocks": 0, "cpu_blocks": 0, "matched_tokens": 0},
                 (2, 20): 50,  # legacy int match
             },
         )
 
         ranked = SMetricGatedPolicy.score_endpoints([inst_a, inst_b], req_info)
 
-        assert [(c.endpoint.id, c.prefill_cost, c.cpu_hit_blocks) for c in ranked] == [
-            (11, 10.0, 0.0),
-            (20, 50.0, 0.0),
-            (10, 70.0, 4.0),
+        assert [(c.endpoint.id, c.ledger_prefill_cost, c.prefill_cost, c.cpu_hit_blocks) for c in ranked] == [
+            (11, 100.0, 100.0, 0.0),
+            (20, 200.0, 50.0, 0.0),
+            (10, 300.0, 10.0, 4.0),
         ]
-        assert req_info.smetric_gated_debug == {(1, 11): (10.0, 0.0), (2, 20): (50.0, 0.0), (1, 10): (70.0, 4.0)}
+        assert req_info.smetric_gated_debug == {(1, 11): (100.0, 0.0), (2, 20): (50.0, 0.0), (1, 10): (10.0, 4.0)}
         assert req_info.smetric_debug is None
-        assert allocated_prefill_cost(req_info, 1, 10) == 70.0
+        assert allocated_prefill_cost(req_info, 1, 10) == 10.0
         assert allocated_cpu_hit_blocks(req_info, 1, 10) == 4.0
         assert allocated_cpu_hit_blocks(req_info, 9, 9) == 0.0
 
     @patch("motor.coordinator.scheduler.policy.smetric_gated.ConductorApiClient.query_conductor")
     def test_worker_proposal_puts_gated_pick_first(self, mock_query):
-        # ep10 is the cheapest but hot (SHM view); ep20 is under the active average.
-        inst_a = _instance(1, [_endpoint(10, active_tokens=500)])
-        inst_b = _instance(2, [_endpoint(20, active_tokens=10)])
+        # ep10 has the lowest ledger prefill but is hot on active tokens (SHM view); ep20 passes.
+        inst_a = _instance(1, [_endpoint(10, active_tokens=500, prefill_cost=10)])
+        inst_b = _instance(2, [_endpoint(20, active_tokens=10, prefill_cost=80)])
         req_info = _req_info(100)
         mock_query.return_value = _conductor_tenant(inst_a, inst_b, dp={(1, 10): 90, (2, 20): 20})
 
         ranked = SMetricGatedPolicy.select_endpoint_candidates_from_list([inst_a, inst_b], req_info, top_k=2)
 
-        assert [(ep.id, cost) for _i, ep, cost in ranked] == [(20, 80.0), (10, 10.0)]
+        assert [(ep.id, score) for _i, ep, score in ranked] == [(20, 80.0), (10, 10.0)]
 
     @patch("motor.coordinator.scheduler.policy.smetric_gated.ConductorApiClient.query_conductor")
     def test_no_tenant_returns_none(self, mock_query):
@@ -473,16 +501,17 @@ def _allocate(instance_id: int, endpoint_id: int, candidates: list[dict] | None,
 
 class TestServerArbitration:
     @pytest.mark.asyncio
-    async def test_reorders_by_cost_and_gates_on_fresh_ledger(self):
+    async def test_reorders_by_ledger_prefill_and_gates_on_fresh_ledger(self):
         inst_a = _instance(1, [_endpoint(10), _endpoint(11)])
         inst_b = _instance(2, [_endpoint(20)])
         dispatcher, im, writer = await _dispatcher([inst_a, inst_b])
-        # Ledger: ep10 hot on active, ep11 hot on cpu hits, ep20 under both averages.
-        await im.update_instance_workload(1, 10, Workload(active_tokens=900))
-        await im.update_instance_workload(1, 11, Workload(cpu_hit_blocks=90))
-        await im.update_instance_workload(2, 20, Workload(active_tokens=100, cpu_hit_blocks=5))
+        # Ledger prefill order 10 (30) -> 11 (60) -> 20 (90); ep10 hot on active, ep11 hot on cpu,
+        # ep20 under both averages.
+        await im.update_instance_workload(1, 10, Workload(active_tokens=900, prefill_cost=30))
+        await im.update_instance_workload(1, 11, Workload(cpu_hit_blocks=90, prefill_cost=60))
+        await im.update_instance_workload(2, 20, Workload(active_tokens=100, cpu_hit_blocks=5, prefill_cost=90))
 
-        # Worker proposed the cheapest (ep10); scheduler must walk cost order 10 -> 11 -> 20.
+        # Worker proposed ep10; the request's own costs (ep20 the most expensive) must not reorder.
         response = await dispatcher.dispatch(
             _allocate(
                 1,
@@ -499,7 +528,7 @@ class TestServerArbitration:
         assert response.data["instance"]["id"] == 2
         assert response.data["endpoint"]["id"] == 20
         assert response.data["fast_path"] is False
-        assert response.data["selected_score"] == 50.0
+        assert response.data["selected_score"] == 90.0  # ledger prefill_cost of the committed endpoint
         committed = response.data["committed_workload"]
         assert (committed["active_tokens"], committed["prefill_cost"], committed["cpu_hit_blocks"]) == (
             100.0,
@@ -507,27 +536,43 @@ class TestServerArbitration:
             6.0,
         )
         _, ledger = await im.get_endpoint_workload(2, 20)
-        assert (ledger.active_tokens, ledger.prefill_cost, ledger.cpu_hit_blocks) == (200.0, 50.0, 11.0)
+        assert (ledger.active_tokens, ledger.prefill_cost, ledger.cpu_hit_blocks) == (200.0, 140.0, 11.0)
         assert writer.writes == [(2, 20)]
 
     @pytest.mark.asyncio
-    async def test_cpu_gate_rejects_cheapest_endpoint(self):
+    async def test_order_follows_ledger_not_request_cost(self):
         inst = _instance(1, [_endpoint(10), _endpoint(11)])
         dispatcher, im, _ = await _dispatcher([inst])
-        await im.update_instance_workload(1, 10, Workload(active_tokens=10, cpu_hit_blocks=50))
-        await im.update_instance_workload(1, 11, Workload(active_tokens=10, cpu_hit_blocks=0))
+        # Both idle on active/cpu (gates cannot pass: nothing is strictly below the mean), so the
+        # head of the ledger order wins: ep11 (ledger 5) even though ep10 has the better cache hit.
+        await im.update_instance_workload(1, 10, Workload(prefill_cost=50))
+        await im.update_instance_workload(1, 11, Workload(prefill_cost=5))
+
+        response = await dispatcher.dispatch(_allocate(1, 10, [_cand_payload(1, 10, 1.0), _cand_payload(1, 11, 99.0)]))
+
+        assert response.data["endpoint"]["id"] == 11
+        assert response.data["selected_score"] == 5.0
+        assert response.data["committed_workload"]["prefill_cost"] == 99.0
+
+    @pytest.mark.asyncio
+    async def test_equal_active_falls_back_to_min_ledger_prefill(self):
+        inst = _instance(1, [_endpoint(10), _endpoint(11)])
+        dispatcher, im, _ = await _dispatcher([inst])
+        await im.update_instance_workload(1, 10, Workload(active_tokens=10, cpu_hit_blocks=50, prefill_cost=5))
+        await im.update_instance_workload(1, 11, Workload(active_tokens=10, cpu_hit_blocks=0, prefill_cost=60))
 
         response = await dispatcher.dispatch(_allocate(1, 10, [_cand_payload(1, 10, 5.0), _cand_payload(1, 11, 60.0)]))
 
-        # active equal (neither strictly below the mean) -> active gate fails for both -> min cost fallback
+        # active equal (neither strictly below the mean) -> active gate fails for both -> min ledger prefill
         assert response.data["endpoint"]["id"] == 10
 
     @pytest.mark.asyncio
     async def test_cpu_gate_with_active_headroom_prefers_cold_cpu(self):
         inst = _instance(1, [_endpoint(10), _endpoint(11)])
         dispatcher, im, _ = await _dispatcher([inst])
-        await im.update_instance_workload(1, 10, Workload(active_tokens=10, cpu_hit_blocks=50))
-        await im.update_instance_workload(1, 11, Workload(active_tokens=5, cpu_hit_blocks=0))
+        # ep10 first in ledger order but over the cpu average; ep11 is under both.
+        await im.update_instance_workload(1, 10, Workload(active_tokens=10, cpu_hit_blocks=50, prefill_cost=1))
+        await im.update_instance_workload(1, 11, Workload(active_tokens=5, cpu_hit_blocks=0, prefill_cost=2))
 
         response = await dispatcher.dispatch(_allocate(1, 10, [_cand_payload(1, 10, 5.0), _cand_payload(1, 11, 60.0)]))
 

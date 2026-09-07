@@ -9,22 +9,24 @@
 # See the Mulan PSL v2 for more details.
 
 """
-SMetric-gated scheduling policy.
+SMetric-gated scheduling policy: rank endpoints by their ledger, gate on two ledger averages.
 
-1. Query the KV Conductor once and score every endpoint of the request's role with the SMetric
-   cost model ``prefill_cost = max(0, isl - matched_tokens)``; also read how many CPU-tier KV
-   blocks (``cpu_blocks``) that endpoint would serve for this request.
-2. Sort endpoints by ``prefill_cost`` ascending (best cache reuse first).
-3. Walk that order and commit the first endpoint whose ledger is below BOTH averages over the
-   scored endpoints: ``active_tokens < mean(active_tokens)`` and
+1. Sort the endpoints of the request's role by the ledger ``workload.prefill_cost`` ascending,
+   i.e. the remaining prefill currently outstanding on each endpoint (sum over its in-flight
+   requests of ``isl - matched_tokens``).
+2. Walk that order and commit the first endpoint whose ledger is strictly below BOTH averages
+   over the ranked endpoints: ``active_tokens < mean(active_tokens)`` and
    ``cpu_hit_blocks < mean(cpu_hit_blocks)``.
 
-``cpu_hit_blocks`` is a scheduler-ledger field: on ALLOCATION the committed endpoint's ledger
-gets this request's ``cpu_blocks`` added (alongside ``prefill_cost`` / ``active_tokens``) and
-RELEASE subtracts it again, so it tracks the CPU->NPU KV load currently in flight per endpoint.
+All three inputs are ledger fields, so the ranking itself needs no per-request affinity math.
+The KV Conductor is queried once per request only to know what to ADD to the committed
+endpoint's ledger: the request's own remaining prefill (SMetric cost model,
+``max(0, isl - matched_tokens)``) and the CPU-tier KV blocks it would pull there
+(``cpu_blocks``). RELEASE subtracts both again, so ``prefill_cost`` / ``cpu_hit_blocks`` track
+the prefill compute and CPU->NPU KV transfer currently in flight per endpoint.
 
 When no endpoint passes both gates the policy degrades in order: first endpoint passing the
-``active_tokens`` gate alone, then the cheapest endpoint overall.
+``active_tokens`` gate alone, then the head of the list (lowest ledger prefill_cost).
 """
 
 from __future__ import annotations
@@ -53,22 +55,39 @@ SMETRIC_GATED_ROLES = frozenset({PDRole.ROLE_P, PDRole.ROLE_U})
 # How the final endpoint was chosen (returned for logging / tests).
 PICK_BOTH_GATES = "both_gates"
 PICK_ACTIVE_GATE = "active_gate"
-PICK_MIN_COST = "min_cost"
+PICK_MIN_LEDGER_PREFILL = "min_ledger_prefill"
 
 
 @dataclass(frozen=True)
 class GatedCandidate:
-    """One endpoint scored for the current request."""
+    """
+    One endpoint of the request's role.
+
+    ``prefill_cost`` / ``cpu_hit_blocks`` are what THIS request would add to the endpoint ledger
+    if committed there (conductor-derived); they are stamped on allocation and never used for
+    ordering. Ordering and gating read the endpoint's current ledger via ``endpoint.workload``.
+    """
 
     instance: Instance
     endpoint: Endpoint
     prefill_cost: float
-    # CPU-tier KV blocks this request would pull on this endpoint (conductor ``cpu_blocks``).
     cpu_hit_blocks: float
 
     @property
     def key(self) -> tuple[int, int]:
         return (self.instance.id, self.endpoint.id)
+
+    @property
+    def ledger_prefill_cost(self) -> float:
+        return _ledger_value(self.endpoint, "prefill_cost")
+
+    @property
+    def ledger_active_tokens(self) -> float:
+        return _ledger_value(self.endpoint, "active_tokens")
+
+    @property
+    def ledger_cpu_hit_blocks(self) -> float:
+        return _ledger_value(self.endpoint, "cpu_hit_blocks")
 
 
 def _cpu_hit_blocks(matched: object) -> float:
@@ -89,54 +108,54 @@ def _ledger_value(endpoint: Endpoint, field: str) -> float:
 
 
 def sort_candidates(candidates: list[GatedCandidate]) -> list[GatedCandidate]:
-    """SMetric order: lowest prefill_cost first, ties by (instance_id, endpoint_id)."""
-    return sorted(candidates, key=lambda c: (c.prefill_cost, c.instance.id, c.endpoint.id))
+    """Lowest ledger ``workload.prefill_cost`` first, ties by (instance_id, endpoint_id)."""
+    return sorted(candidates, key=lambda c: (c.ledger_prefill_cost, c.instance.id, c.endpoint.id))
 
 
 def pick_gated(candidates: list[GatedCandidate]) -> tuple[GatedCandidate, str, float, float] | None:
     """
-    Walk ``candidates`` (already sorted by prefill_cost) and return the first one whose ledger is
-    strictly below both averages, plus the pick reason and the two averages used.
+    Walk ``candidates`` (already in ledger prefill_cost order) and return the first one whose
+    ledger is strictly below both averages, plus the pick reason and the two averages used.
 
-    Averages are taken over the scored endpoints' current ledgers (``endpoint.workload``), so
-    the caller decides which view is authoritative (worker SHM cache vs scheduler ledger).
+    Averages are taken over the candidates' current ledgers (``endpoint.workload``), so the
+    caller decides which view is authoritative (worker SHM cache vs scheduler ledger).
     Fallback order when nothing passes both gates: active_tokens gate only, then the head of the
-    list (cheapest prefill).
+    list (lowest ledger prefill_cost).
     """
     if not candidates:
         return None
     n = len(candidates)
-    mean_active = sum(_ledger_value(c.endpoint, "active_tokens") for c in candidates) / n
-    mean_cpu = sum(_ledger_value(c.endpoint, "cpu_hit_blocks") for c in candidates) / n
+    mean_active = sum(c.ledger_active_tokens for c in candidates) / n
+    mean_cpu = sum(c.ledger_cpu_hit_blocks for c in candidates) / n
     active_only: GatedCandidate | None = None
     for cand in candidates:
-        under_active = _ledger_value(cand.endpoint, "active_tokens") < mean_active
-        under_cpu = _ledger_value(cand.endpoint, "cpu_hit_blocks") < mean_cpu
+        under_active = cand.ledger_active_tokens < mean_active
+        under_cpu = cand.ledger_cpu_hit_blocks < mean_cpu
         if under_active and under_cpu:
             return (cand, PICK_BOTH_GATES, mean_active, mean_cpu)
         if under_active and active_only is None:
             active_only = cand
     if active_only is not None:
         return (active_only, PICK_ACTIVE_GATE, mean_active, mean_cpu)
-    return (candidates[0], PICK_MIN_COST, mean_active, mean_cpu)
+    return (candidates[0], PICK_MIN_LEDGER_PREFILL, mean_active, mean_cpu)
 
 
 def format_candidates(candidates: list[GatedCandidate]) -> str:
-    """``ins-ep:cost/active/cpu`` per candidate, for the selection log."""
+    """``ins-ep:ledger_prefill/active/cpu(+req_cost/+req_cpu)`` per candidate, for the selection log."""
     return " ".join(
-        f"{c.instance.id}-{c.endpoint.id}:{c.prefill_cost:.0f}/"
-        f"{_ledger_value(c.endpoint, 'active_tokens'):.0f}/{_ledger_value(c.endpoint, 'cpu_hit_blocks'):.0f}"
+        f"{c.instance.id}-{c.endpoint.id}:{c.ledger_prefill_cost:.0f}/{c.ledger_active_tokens:.0f}/"
+        f"{c.ledger_cpu_hit_blocks:.0f}(+{c.prefill_cost:.0f}/+{c.cpu_hit_blocks:.0f})"
         for c in candidates
     )
 
 
 class SMetricGatedPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
     """
-    Rank by SMetric prefill_cost, commit the first endpoint under both ledger load averages.
+    Rank by ledger prefill_cost, commit the first endpoint under both ledger load averages.
 
-    Workers run the conductor query and forward every scored endpoint (cost + cpu_blocks) to the
-    central Scheduler, which re-applies the gates against its authoritative ledger before
-    committing; the worker's own pick is only a proposal.
+    Workers run the conductor query (for the stamp values) and forward every endpoint with its
+    request cost + cpu_blocks to the central Scheduler, which re-ranks and re-gates against its
+    authoritative ledger before committing; the worker's own pick is only a proposal.
     """
 
     def __init__(self, instance_provider: InstanceProvider):
@@ -146,10 +165,11 @@ class SMetricGatedPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
     @staticmethod
     def score_endpoints(instances: list[Instance], req_info: RequestInfo) -> list[GatedCandidate] | None:
         """
-        Conductor lookup: return every endpoint as a ``GatedCandidate`` sorted by prefill_cost.
+        Conductor lookup: every endpoint as a ``GatedCandidate``, sorted by its ledger prefill_cost.
 
-        ``None`` means the conductor had no data for our instances (caller falls back). Also
-        caches ``{(instance_id, endpoint_id): (prefill_cost, cpu_hit_blocks)}`` on
+        The conductor only supplies the per-endpoint stamp values (request cost, cpu_blocks).
+        ``None`` means it had no data for our instances (caller falls back). Also caches
+        ``{(instance_id, endpoint_id): (prefill_cost, cpu_hit_blocks)}`` on
         ``req_info.smetric_gated_debug`` for the ALLOCATE payload and the ledger stamp.
         """
         encoded_ids = _prompt_token_ids(req_info)
@@ -194,7 +214,7 @@ class SMetricGatedPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         ranked = sort_candidates(candidates)
         req_info.smetric_gated_debug = {c.key: (c.prefill_cost, c.cpu_hit_blocks) for c in ranked}
         logger.info(
-            "smetric_gated: req_id=%s isl=%s scored[ins-ep:cost/active/cpu]=%s",
+            "smetric_gated: req_id=%s isl=%s ranked[ins-ep:ledger_prefill/active/cpu(+req_cost/+req_cpu)]=%s",
             req_id,
             isl,
             format_candidates(ranked),
@@ -208,10 +228,11 @@ class SMetricGatedPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         top_k: int = 1,
     ) -> list[tuple[Instance, Endpoint, float]] | None:
         """
-        Worker-side proposal: the gated pick first, then the remaining endpoints in cost order.
+        Worker-side proposal: the gated pick first, then the rest in ledger prefill_cost order.
 
-        The ledger view here is the worker's SHM cache (``cpu_hit_blocks`` is not in the SHM,
-        so only the active_tokens gate can bite on the worker); the Scheduler re-gates.
+        The ledger view here is the worker's SHM cache (it carries prefill_cost and active_tokens
+        but not ``cpu_hit_blocks``, so only the active_tokens gate can bite on the worker); the
+        Scheduler re-ranks and re-gates on its own ledger.
         """
         ranked = SMetricGatedPolicy.score_endpoints(instances, req_info)
         if not ranked:
@@ -230,7 +251,7 @@ class SMetricGatedPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
             mean_cpu,
         )
         ordered = [chosen] + [c for c in ranked if c is not chosen]
-        return [(c.instance, c.endpoint, c.prefill_cost) for c in ordered[: max(1, top_k)]]
+        return [(c.instance, c.endpoint, c.ledger_prefill_cost) for c in ordered[: max(1, top_k)]]
 
     @staticmethod
     def select_endpoint_from_list(

@@ -413,12 +413,21 @@ class _SchedulerRequestDispatcher:
                     store.pop(key, None)
 
     def _format_endpoint_load_snapshot(self, role: PDRole) -> str:
-        """Render 'ins/ep:running/active_tokens' for every endpoint of ``role``."""
+        """Render 'ins/ep:running/active_tokens' for every endpoint of ``role``.
+
+        ``running`` is read from the same endpoint Workload object as ``active_tokens``
+        (updated on ALLOCATION/RELEASE in InstanceManager). The dispatcher req_id set is
+        a fallback for policies that do not touch that ledger.
+        """
         entries: list[tuple[int, int, int, float]] = []
         for instance in self._instance_manager.get_available_instances(role).values():
             for pod_eps in (instance.endpoints or {}).values():
                 for endpoint in (pod_eps or {}).values():
-                    running = self._endpoint_running_count(instance.id, endpoint.id)
+                    ledger_running = int(getattr(endpoint.workload, "running", 0) or 0)
+                    tracked_running = self._endpoint_running_count(instance.id, endpoint.id)
+                    # Prefer the req_id set when it is populated; otherwise the endpoint
+                    # ledger (same object as active_tokens) is the source of truth.
+                    running = tracked_running if tracked_running > 0 else ledger_running
                     entries.append(
                         (
                             int(instance.id),

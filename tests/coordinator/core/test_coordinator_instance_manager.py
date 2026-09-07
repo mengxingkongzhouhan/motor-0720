@@ -14,6 +14,7 @@ import threading
 import pytest
 
 from motor.common.resources import Instance, PDRole, Workload, Endpoint, EventType
+from motor.common.resources.endpoint import WorkloadAction
 from motor.config.coordinator import CoordinatorConfig
 from motor.coordinator.domain.instance_manager import InstanceManager, UpdateInstanceMode
 
@@ -221,6 +222,28 @@ class TestInstanceManager:
 
         assert self.prefill_instance.gathered_workload.active_tokens == 10
         assert self.endpoint.workload.active_tokens == 10
+        assert self.endpoint.workload.running == 0
+
+    @pytest.mark.asyncio
+    async def test_update_instance_workload_counts_running_from_action(self):
+        """ALLOCATION/RELEASE_TOKENS adjust running on the same endpoint ledger as tokens."""
+        self.prefill_instance.add_endpoints("127.0.0.1", {self.endpoint.id: self.endpoint})
+        self.instance_manager._add_instance_to_available_pool(self.prefill_instance)
+
+        self.instance_manager.update_instance_workload_sync(
+            1, self.endpoint.id, Workload(active_tokens=10), WorkloadAction.ALLOCATION
+        )
+        self.instance_manager.update_instance_workload_sync(
+            1, self.endpoint.id, Workload(active_tokens=8), WorkloadAction.ALLOCATION
+        )
+        assert self.endpoint.workload.active_tokens == 18
+        assert self.endpoint.workload.running == 2
+
+        self.instance_manager.update_instance_workload_sync(
+            1, self.endpoint.id, Workload(active_tokens=-10), WorkloadAction.RELEASE_TOKENS
+        )
+        assert self.endpoint.workload.active_tokens == 8
+        assert self.endpoint.workload.running == 1
 
     @pytest.mark.asyncio
     async def test_update_instance_workload_floors_negative_and_warns(self, caplog):

@@ -41,6 +41,7 @@ class WorkloadLedgerMixin:
                 instance_id,
                 endpoint_id,
                 workload_change,
+                workload_action=workload_action,
             )
         else:
             raise RuntimeError(f"InstanceProvider must support update_instance_workload_sync for {policy_name}")

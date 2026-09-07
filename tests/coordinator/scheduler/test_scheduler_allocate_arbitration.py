@@ -880,3 +880,29 @@ async def test_set_refresh_keeps_running_count_for_live_instances(caplog):
     counts = _parse_running_counts(_running_snapshot_from_logs(caplog))
     assert sum(running for running, _ in counts.values()) == 2
     assert counts[(1, second.data["endpoint"]["id"])][0] >= 1
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_running_survives_if_dispatcher_counter_is_cleared(caplog):
+    """Production bug: tokens moved on the endpoint ledger while a side dict stayed 0.
+
+    Running must be stored on the same Workload object as active_tokens so the next
+    ALLOCATE_ONLY snapshot still shows in-flight requests after the dict is empty.
+    """
+    caplog.set_level(logging.INFO)
+    dispatcher, instance_manager = await _make_running_count_dispatcher()
+
+    first = await dispatcher.dispatch(_allocate_request("req-1", tokens=5.0))
+    first_ep = first.data["endpoint"]["id"]
+    _, workload = await instance_manager.get_endpoint_workload(1, first_ep)
+    assert workload.running == 1
+    assert workload.active_tokens == 5.0
+
+    dispatcher._endpoint_in_flight_req_ids.clear()
+    dispatcher._endpoint_anonymous_running.clear()
+
+    caplog.clear()
+    await dispatcher.dispatch(_allocate_request("req-2", tokens=3.0))
+    counts = _parse_running_counts(_running_snapshot_from_logs(caplog))
+    assert counts[(1, first_ep)][0] >= 1
+    assert sum(running for running, _ in counts.values()) >= 2

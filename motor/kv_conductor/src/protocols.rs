@@ -52,7 +52,8 @@ pub type HbmIpIndex = Arc<ParkingRwLock<HashMap<String, Vec<(String, u32)>>>>;
 /// Unique `(instance_id, dp_rank)` values recorded in the pod → DP index.
 ///
 /// One Pod may host several DPs; the same DP may appear under more than one
-/// HBM medium key. The set collapses those duplicates.
+/// HBM medium key. The set collapses those duplicates. Called when the
+/// index changes (register / unregister), not on each `/query`.
 pub fn query_dps_from_hbm_ip_index(index: &HbmIpIndex) -> FxHashSet<(String, u32)> {
     index
         .read()

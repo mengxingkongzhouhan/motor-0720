@@ -190,6 +190,26 @@ impl ContiguousHit {
     }
 }
 
+/// A contiguous walk plus the blocks it passed through.
+#[derive(Debug, Clone)]
+pub struct ReachableChain {
+    pub hit: ContiguousHit,
+    /// `chain[i]` is the block at absolute position `hit.start_pos + i`.
+    pub chain: Vec<SequenceBlockHash>,
+}
+
+impl ReachableChain {
+    /// The walked blocks from absolute position `from` onwards.
+    ///
+    /// Callers pass the end of the higher-priority media so the slice covers
+    /// exactly the blocks that still need fetching — earlier ones are already
+    /// local in HBM. Empty when the walk ends at or before `from`.
+    pub fn blocks_from(&self, from: usize) -> &[SequenceBlockHash] {
+        let offset = from.saturating_sub(self.hit.start_pos);
+        self.chain.get(offset..).unwrap_or(&[])
+    }
+}
+
 /// Continuation-edge index for one lower-tier medium (CPU or Disk).
 #[derive(Debug, Default)]
 pub struct LowerTierIndexer {
@@ -352,6 +372,99 @@ impl LowerTierIndexer {
 
     pub fn is_empty(&self) -> bool {
         self.worker_blocks.read().is_empty()
+    }
+
+    /// Contiguous span reachable from `start_pos`, **ignoring** which worker
+    /// owns each edge.
+    ///
+    /// Pooled blocks are fetchable from any node over the backend's transfer
+    /// protocol (`device_rdma` / `device_sdma` / `device_urma`), so a block held
+    /// by another DP still lets this DP skip recomputing it. Ownership therefore
+    /// does not gate the walk — it only decides whether a block is *local*
+    /// (free) or *fetched* (transfer cost), which the caller expresses by
+    /// attributing the span to the NPU vs CPU/Disk tier.
+    ///
+    /// Contrast [`Self::query_contiguous_hits`], which does gate on ownership
+    /// and answers "what does this worker hold locally".
+    ///
+    /// Returns `None` when the first edge is already missing, so a zero-length
+    /// walk never reports its start position as an end.
+    pub fn reachable_from(
+        &self,
+        local_hashes: &[LocalBlockHash],
+        start_pos: usize,
+        start_parent: Option<SequenceBlockHash>,
+    ) -> Option<ContiguousHit> {
+        self.reachable_chain(local_hashes, start_pos, start_parent)
+            .map(|reached| reached.hit)
+    }
+
+    /// [`Self::reachable_from`], also returning the block identities it walked
+    /// through.
+    ///
+    /// The chain is what makes per-DP attribution cheap: the walk itself is
+    /// ownership-blind and so identical for every DP, but each DP still needs to
+    /// know *which* of those blocks it can read locally. Walking once and then
+    /// testing the chain against [`Self::count_owned`] answers that with one map
+    /// lookup per DP instead of one walk per DP.
+    pub fn reachable_chain(
+        &self,
+        local_hashes: &[LocalBlockHash],
+        start_pos: usize,
+        start_parent: Option<SequenceBlockHash>,
+    ) -> Option<ReachableChain> {
+        if start_pos >= local_hashes.len() {
+            return None;
+        }
+
+        let edges = self.edges.read();
+        let mut cur_pos = start_pos;
+        let mut cur_hash = start_parent;
+        let mut chain = Vec::new();
+
+        while cur_pos < local_hashes.len() {
+            let key = TransitionKey {
+                parent_hash: cur_hash,
+                local_hash: local_hashes[cur_pos],
+            };
+            let Some(edge) = edges.get(&key) else {
+                break;
+            };
+            let child = edge.child_hash();
+            chain.push(child);
+            cur_hash = Some(child);
+            cur_pos += 1;
+        }
+
+        if cur_pos > start_pos {
+            Some(ReachableChain {
+                hit: ContiguousHit {
+                    count: cur_pos - start_pos,
+                    start_pos,
+                    last_matched_hash: cur_hash,
+                },
+                chain,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// How many of `blocks` this worker owns.
+    ///
+    /// For a pooled medium this is the count of *local* hits: the pool-event
+    /// fanout registers every DP in the reporting Pod as an owner, so owning a
+    /// pooled block means holding a copy readable without a cross-machine
+    /// transfer.
+    pub fn count_owned(&self, worker: &WorkerKey, blocks: &[SequenceBlockHash]) -> u32 {
+        let worker_blocks = self.worker_blocks.read();
+        let Some(owned) = worker_blocks.get(worker) else {
+            return 0;
+        };
+        blocks
+            .iter()
+            .filter(|block| owned.contains_key(*block))
+            .count() as u32
     }
 
     /// For each worker, walk contiguous lower-tier hits from its continuations.

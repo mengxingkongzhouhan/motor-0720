@@ -41,6 +41,7 @@ from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.policy.smetric import SMetricPrefillCostTracker
 from motor.coordinator.scheduler.policy.smetric_gated import (
     GatedCandidate,
+    TieOffsetCounter,
     format_candidates,
     pick_gated,
     sort_candidates,
@@ -245,6 +246,8 @@ class _SchedulerRequestDispatcher:
         gated = getattr(config.scheduler_config, "smetric_gated", None)
         self._smetric_gated_active_factor = max(0.0, float(getattr(gated, "active_tokens_mean_factor", 1.0)))
         self._smetric_gated_cpu_factor = max(0.0, float(getattr(gated, "cpu_hit_blocks_mean_factor", 1.0)))
+        # Bumped per smetric_gated arbitration so equal-ledger endpoints are picked in rotation.
+        self._smetric_gated_tie_offsets = TieOffsetCounter()
 
     async def dispatch(self, request: SchedulerRequest) -> SchedulerResponse:
         """Dispatch request to the appropriate handler (async handlers supported)."""
@@ -1169,14 +1172,15 @@ class _SchedulerRequestDispatcher:
                     cpu_hit_blocks=cpu_hit_blocks_map.get((instance_id, endpoint_id), 0.0),
                 )
             )
-        ranked = sort_candidates(candidates)
+        tie_offset = self._smetric_gated_tie_offsets.next()
+        ranked = sort_candidates(candidates, tie_offset)
         picked = pick_gated(ranked, self._smetric_gated_active_factor, self._smetric_gated_cpu_factor)
         if picked is None:
             return None
         chosen, reason, active_threshold, cpu_threshold = picked
         logger.info(
             "smetric_gated: req_id=%s pick=%s-%s reason=%s active_threshold=%.1f cpu_threshold=%.1f "
-            "factors=%.2f/%.2f ranked[ins-ep:ledger_prefill/active/cpu(+req_cost/+req_cpu)]=%s",
+            "factors=%.2f/%.2f tie_offset=%d ranked[ins-ep:ledger_prefill/active/cpu(+req_cost/+req_cpu)]=%s",
             req_id,
             chosen.instance.id,
             chosen.endpoint.id,
@@ -1185,6 +1189,7 @@ class _SchedulerRequestDispatcher:
             cpu_threshold,
             self._smetric_gated_active_factor,
             self._smetric_gated_cpu_factor,
+            tie_offset,
             format_candidates(ranked),
         )
         return (chosen.instance, chosen.endpoint, chosen.ledger_prefill_cost)

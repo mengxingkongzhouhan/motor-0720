@@ -124,9 +124,39 @@ def _ledger_value(endpoint: Endpoint, field: str) -> float:
         return 0.0
 
 
-def sort_candidates(candidates: list[GatedCandidate]) -> list[GatedCandidate]:
-    """Lowest ledger ``workload.prefill_cost`` first, ties by (instance_id, endpoint_id)."""
-    return sorted(candidates, key=lambda c: (c.ledger_prefill_cost, c.instance.id, c.endpoint.id))
+def sort_candidates(candidates: list[GatedCandidate], tie_offset: int = 0) -> list[GatedCandidate]:
+    """
+    Lowest ledger ``workload.prefill_cost`` first; ties keep a rotated canonical order.
+
+    Endpoints are first put in canonical ``(instance_id, endpoint_id)`` order, that list is
+    rotated by ``tie_offset`` positions, and then a stable sort by ledger prefill_cost is applied.
+    Equal-cost endpoints therefore come out in rotated order, so a caller that bumps
+    ``tie_offset`` per request (see ``TieOffsetCounter``) spreads ties across endpoints instead of
+    always landing on the lowest ids -- which matters on an idle cluster where every ledger is 0.
+    """
+    if not candidates:
+        return []
+    canonical = sorted(candidates, key=lambda c: (c.instance.id, c.endpoint.id))
+    shift = tie_offset % len(canonical)
+    rotated = canonical[shift:] + canonical[:shift]
+    return sorted(rotated, key=lambda c: c.ledger_prefill_cost)
+
+
+class TieOffsetCounter:
+    """Monotonic per-process counter feeding ``sort_candidates(tie_offset=...)``.
+
+    Single-threaded use only (asyncio hot path); wraps to keep the int small.
+    """
+
+    _WRAP = 1 << 30
+
+    def __init__(self, start: int = 0) -> None:
+        self._value = start % self._WRAP
+
+    def next(self) -> int:
+        value = self._value
+        self._value = (value + 1) % self._WRAP
+        return value
 
 
 def pick_gated(
@@ -142,7 +172,7 @@ def pick_gated(
     Averages are taken over the candidates' current ledgers (``endpoint.workload``), so the
     caller decides which view is authoritative (worker SHM cache vs scheduler ledger).
     Fallback order when nothing passes both gates: active_tokens gate only, then the head of the
-    list (lowest ledger prefill_cost).
+    list (lowest ledger prefill_cost; among equals, whichever ``sort_candidates`` rotated first).
     """
     if not candidates:
         return None
@@ -185,6 +215,7 @@ class SMetricGatedPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         super().__init__(instance_provider=instance_provider)
         self._active_tokens_mean_factor = DEFAULT_MEAN_FACTOR
         self._cpu_hit_blocks_mean_factor = DEFAULT_MEAN_FACTOR
+        self._tie_offsets = TieOffsetCounter()
         logger.info("SMetricGatedPolicy started.")
 
     def set_mean_factors(self, active_tokens_mean_factor: float, cpu_hit_blocks_mean_factor: float) -> None:
@@ -262,17 +293,21 @@ class SMetricGatedPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         top_k: int = 1,
         active_tokens_mean_factor: float = DEFAULT_MEAN_FACTOR,
         cpu_hit_blocks_mean_factor: float = DEFAULT_MEAN_FACTOR,
+        tie_offset: int = 0,
     ) -> list[tuple[Instance, Endpoint, float]] | None:
         """
         Worker-side proposal: the gated pick first, then the rest in ledger prefill_cost order.
 
         The ledger view here is the worker's SHM cache (it carries prefill_cost and active_tokens
         but not ``cpu_hit_blocks``, so only the active_tokens gate can bite on the worker); the
-        Scheduler re-ranks and re-gates on its own ledger.
+        Scheduler re-ranks and re-gates on its own ledger. ``tie_offset`` rotates equal-cost
+        endpoints (see ``sort_candidates``).
         """
         ranked = SMetricGatedPolicy.score_endpoints(instances, req_info)
         if not ranked:
             return None
+        if tie_offset:
+            ranked = sort_candidates(ranked, tie_offset)
         picked = pick_gated(ranked, active_tokens_mean_factor, cpu_hit_blocks_mean_factor)
         if picked is None:
             return None
@@ -295,6 +330,7 @@ class SMetricGatedPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         req_info: RequestInfo,
         active_tokens_mean_factor: float = DEFAULT_MEAN_FACTOR,
         cpu_hit_blocks_mean_factor: float = DEFAULT_MEAN_FACTOR,
+        tie_offset: int = 0,
     ) -> tuple[Instance, Endpoint] | None:
         ranked = SMetricGatedPolicy.select_endpoint_candidates_from_list(
             instances,
@@ -302,6 +338,7 @@ class SMetricGatedPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
             top_k=1,
             active_tokens_mean_factor=active_tokens_mean_factor,
             cpu_hit_blocks_mean_factor=cpu_hit_blocks_mean_factor,
+            tie_offset=tie_offset,
         )
         if not ranked:
             return None
@@ -326,6 +363,7 @@ class SMetricGatedPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
                 req_info,
                 active_tokens_mean_factor=self._active_tokens_mean_factor,
                 cpu_hit_blocks_mean_factor=self._cpu_hit_blocks_mean_factor,
+                tie_offset=self._tie_offsets.next(),
             )
             if selected is not None:
                 return selected

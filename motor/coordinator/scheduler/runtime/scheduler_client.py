@@ -57,7 +57,11 @@ from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.kv_cache_affinity import KvCacheAffinityPolicy
 from motor.coordinator.scheduler.policy.smetric import SMetricPolicy
-from motor.coordinator.scheduler.policy.smetric_gated import SMETRIC_GATED_ROLES, SMetricGatedPolicy
+from motor.coordinator.scheduler.policy.smetric_gated import (
+    SMETRIC_GATED_ROLES,
+    SMetricGatedPolicy,
+    TieOffsetCounter,
+)
 from motor.coordinator.domain.workload_calculator import (
     allocated_cpu_hit_blocks,
     allocated_prefill_cost,
@@ -708,6 +712,8 @@ class AsyncSchedulerClient:
         gated = config.smetric_gated or SMetricGatedConfig()
         self._smetric_gated_active_factor = max(0.0, float(gated.active_tokens_mean_factor))
         self._smetric_gated_cpu_factor = max(0.0, float(gated.cpu_hit_blocks_mean_factor))
+        # Staggered by client index so sibling workers do not all start their tie rotation at 0.
+        self._smetric_gated_tie_offsets = TieOffsetCounter(start=self._client_index)
 
         self._serializer = ZMQMessageSerializer()
         self._transport = _SchedulerTransport(config.scheduler_address, config.timeout, self._serializer)
@@ -1724,6 +1730,7 @@ class AsyncSchedulerClient:
                     top_k=max(1, top_k),
                     active_tokens_mean_factor=self._smetric_gated_active_factor,
                     cpu_hit_blocks_mean_factor=self._smetric_gated_cpu_factor,
+                    tie_offset=self._smetric_gated_tie_offsets.next(),
                 )
                 if ranked:
                     return ranked, CANDIDATE_POLICY_SMETRIC_GATED

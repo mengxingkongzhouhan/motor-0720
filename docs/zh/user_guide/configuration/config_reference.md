@@ -400,7 +400,7 @@ motor_coordinator_config字段配置样例如下所示：
 | **reschedule_config字段** |-|-|
 | enable | bool | 故障场景重调度功能开关。默认：`false`。<br>模型重计算由引擎侧负责，该配置不控制引擎侧重计算；`recompute_enabled`仅作为`reschedule_enabled`的旧配置兼容别名；`recompute_max_retry`已移除并会被忽略。 |
 | **scheduler_config字段** |-|-|
-| scheduler_type | string | 调度类型，默认值：load_balance<ul><li>load_balance：负载均衡；</li><li>round_robin：轮询；</li><li>kv_cache_affinity：KV Cache 亲和调度；</li><li>smetric：按本请求剩余 prefill 成本（isl - 命中 token）最小调度；</li><li>smetric_gated：按 endpoint 账本中当前未完成的剩余 prefill（`prefill_cost`）从小到大排序，依序选出第一个同时满足账本 `active_tokens < 均值 × active_tokens_mean_factor` 且 `cpu_hit_blocks`（在跑请求命中的 CPU 侧 KV 块数）`< 均值 × cpu_hit_blocks_mean_factor` 的 endpoint；都不满足时退化为只看 `active_tokens` 门限、再退化为账本 `prefill_cost` 最小者。Conductor 仅用于给被选 endpoint 记账（本请求的 `isl - 命中 token` 与 `cpu_blocks`）。系数见 `smetric_gated` 字段。</li></ul> |
+| scheduler_type | string | 调度类型，默认值：load_balance<ul><li>load_balance：负载均衡；</li><li>round_robin：轮询；</li><li>kv_cache_affinity：KV Cache 亲和调度；</li><li>smetric：按本请求剩余 prefill 成本（isl - 命中 token）最小调度；</li><li>smetric_gated：按 endpoint 账本中当前未完成的剩余 prefill（`prefill_cost`）从小到大排序，依序选出第一个同时满足账本 `active_tokens <= 均值 × active_tokens_mean_factor` 且 `cpu_hit_blocks`（在跑请求命中的 CPU 侧 KV 块数）`<= 均值 × cpu_hit_blocks_mean_factor` 的 endpoint（取等号，保证全空闲集群也能通过门限）；都不满足时退化为只看 `active_tokens` 门限、再退化为账本 `prefill_cost` 最小者。Conductor 仅用于给被选 endpoint 记账（本请求的 `isl - 命中 token` 与 `cpu_blocks`）。系数见 `smetric_gated` 字段。</li></ul> |
 | enable_pd_separation_fallback_to_hybrid | bool | PD分离场景下，当D实例不可用或P/D实例不满足调度条件时，是否允许降级使用混部路由，默认值为 `true` |
 | endpoint_instance_score_weight | float | endpoint 优先负载均衡时实例平均负载权重。默认：`0.05` |
 | kv_affinity | object | KV Cache 亲和性调度参数（见下表） |

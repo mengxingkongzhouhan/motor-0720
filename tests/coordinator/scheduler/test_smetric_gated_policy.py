@@ -220,8 +220,8 @@ class TestPickGated:
         assert reason == PICK_BOTH_GATES
         assert mean_active == 30 and mean_cpu == 25
 
-    def test_gate_is_strict(self):
-        # ep1 sits exactly on both averages -> rejected; ep2 strictly below -> chosen.
+    def test_gate_is_inclusive(self):
+        # ep1 sits exactly on both averages -> accepted (<=), even though ep2 is further below.
         ranked = sort_candidates(
             [
                 _cand(1, ledger_prefill=1, active=20, cpu=20),
@@ -230,7 +230,25 @@ class TestPickGated:
             ]
         )
         chosen, reason, _a, _c = pick_gated(ranked)
+        assert chosen.endpoint.id == 1 and reason == PICK_BOTH_GATES
+
+    def test_just_above_mean_is_rejected(self):
+        ranked = sort_candidates(
+            [
+                _cand(1, ledger_prefill=1, active=21, cpu=20),
+                _cand(2, ledger_prefill=2, active=9, cpu=10),
+                _cand(3, ledger_prefill=3, active=30, cpu=30),
+            ]
+        )
+        chosen, reason, _a, _c = pick_gated(ranked)
         assert chosen.endpoint.id == 2 and reason == PICK_BOTH_GATES
+
+    def test_idle_cluster_passes_both_gates(self):
+        # All ledgers 0 -> means 0 -> every endpoint passes with <=; the head (lowest prefill) wins.
+        ranked = sort_candidates([_cand(1, ledger_prefill=0), _cand(2, ledger_prefill=0), _cand(3, ledger_prefill=0)])
+        chosen, reason, active_threshold, cpu_threshold = pick_gated(ranked)
+        assert chosen.endpoint.id == 1 and reason == PICK_BOTH_GATES
+        assert (active_threshold, cpu_threshold) == (0.0, 0.0)
 
     def test_fallback_active_gate_only(self):
         # Nobody is under both: ep1 under active but over cpu, ep2 the reverse.
@@ -240,16 +258,24 @@ class TestPickGated:
         chosen, reason, _a, _c = pick_gated(ranked)
         assert chosen.endpoint.id == 1 and reason == PICK_ACTIVE_GATE
 
-    def test_fallback_min_ledger_prefill_when_all_equal(self):
+    def test_all_equal_load_passes_gates_and_takes_lowest_ledger_prefill(self):
         ranked = sort_candidates(
             [_cand(2, ledger_prefill=7, active=5, cpu=5), _cand(1, ledger_prefill=9, active=5, cpu=5)]
         )
         chosen, reason, _a, _c = pick_gated(ranked)
-        assert chosen.endpoint.id == 2 and reason == PICK_MIN_LEDGER_PREFILL
+        assert chosen.endpoint.id == 2 and reason == PICK_BOTH_GATES
 
     def test_idle_cluster_takes_lowest_ledger_prefill(self):
         ranked = sort_candidates([_cand(1, ledger_prefill=50), _cand(2, ledger_prefill=5), _cand(3, ledger_prefill=20)])
         chosen, reason, _a, _c = pick_gated(ranked)
+        assert chosen.endpoint.id == 2 and reason == PICK_BOTH_GATES
+
+    def test_fallback_min_ledger_prefill_when_every_gate_fails(self):
+        # Zero factors make both thresholds 0 while every ledger is positive: nothing passes.
+        ranked = sort_candidates(
+            [_cand(2, ledger_prefill=7, active=5, cpu=5), _cand(1, ledger_prefill=9, active=5, cpu=5)]
+        )
+        chosen, reason, _a, _c = pick_gated(ranked, 0.0, 0.0)
         assert chosen.endpoint.id == 2 and reason == PICK_MIN_LEDGER_PREFILL
 
     def test_empty(self):
@@ -264,18 +290,18 @@ class TestPickGated:
         assert cpu_threshold == 20 * 0.5
 
     def test_factor_above_one_loosens_gate(self):
-        # ep1 (lowest ledger prefill) is exactly on the active mean: rejected at 1.0, accepted at 1.2.
+        # ep1 (lowest ledger prefill) is 10% over the active mean: rejected at 1.0, accepted at 1.2.
         ranked = sort_candidates(
             [
-                _cand(1, ledger_prefill=1, active=20, cpu=0),
-                _cand(2, ledger_prefill=2, active=10, cpu=0),
+                _cand(1, ledger_prefill=1, active=22, cpu=0),
+                _cand(2, ledger_prefill=2, active=8, cpu=0),
                 _cand(3, ledger_prefill=3, active=30, cpu=0),
             ]
         )
-        strict, reason_strict, _a, _c = pick_gated(ranked)
+        plain, reason_plain, _a, _c = pick_gated(ranked)
         loose, reason_loose, _a2, _c2 = pick_gated(ranked, active_tokens_mean_factor=1.2)
-        assert strict.endpoint.id == 2 and reason_strict == PICK_ACTIVE_GATE  # cpu all 0 -> cpu gate never passes
-        assert loose.endpoint.id == 1 and reason_loose == PICK_ACTIVE_GATE
+        assert plain.endpoint.id == 2 and reason_plain == PICK_BOTH_GATES  # cpu all 0 -> cpu gate passes (<=)
+        assert loose.endpoint.id == 1 and reason_loose == PICK_BOTH_GATES
 
     def test_factor_below_one_tightens_gate(self):
         # ep1 is under the plain mean (15 < 20) but not under 0.5 * mean (10); ep2 is.
@@ -310,7 +336,7 @@ class TestPickGated:
             [_cand(1, ledger_prefill=1, active=10, cpu=10), _cand(2, ledger_prefill=2, active=30, cpu=30)]
         )
         _c, _r, active_threshold, cpu_threshold = pick_gated(ranked, -3.0, None)
-        assert active_threshold == 0.0  # negative -> 0: nothing can be strictly below
+        assert active_threshold == 0.0  # negative -> 0: only an idle endpoint (0 <= 0) can pass
         assert cpu_threshold == 20.0  # None -> default 1.0
 
 
@@ -413,9 +439,9 @@ class TestPolicy:
         assert config.scheduler_config.smetric_gated.cpu_hit_blocks_mean_factor == 0.8
 
     def test_in_process_selection_uses_factors(self):
-        # ep10 first in ledger order, exactly on the active mean: only passes with factor > 1.
-        inst_a = _instance(1, [_endpoint(10, active_tokens=20, prefill_cost=1)])
-        inst_b = _instance(2, [_endpoint(20, active_tokens=10, prefill_cost=2)])
+        # ep10 first in ledger order, 10% over the active mean (22 vs 20): only passes with factor > 1.1.
+        inst_a = _instance(1, [_endpoint(10, active_tokens=22, prefill_cost=1)])
+        inst_b = _instance(2, [_endpoint(20, active_tokens=8, prefill_cost=2)])
         inst_c = _instance(3, [_endpoint(30, active_tokens=30, prefill_cost=3)])
         instances = [inst_a, inst_b, inst_c]
 
@@ -675,8 +701,8 @@ class TestServerArbitration:
     async def test_order_follows_ledger_not_request_cost(self):
         inst = _instance(1, [_endpoint(10), _endpoint(11)])
         dispatcher, im, _ = await _dispatcher([inst])
-        # Both idle on active/cpu (gates cannot pass: nothing is strictly below the mean), so the
-        # head of the ledger order wins: ep11 (ledger 5) even though ep10 has the better cache hit.
+        # Both idle on active/cpu (everything passes the <= gates), so the head of the ledger
+        # order wins: ep11 (ledger 5) even though ep10 has the better cache hit.
         await im.update_instance_workload(1, 10, Workload(prefill_cost=50))
         await im.update_instance_workload(1, 11, Workload(prefill_cost=5))
 
@@ -687,7 +713,7 @@ class TestServerArbitration:
         assert response.data["committed_workload"]["prefill_cost"] == 99.0
 
     @pytest.mark.asyncio
-    async def test_equal_active_falls_back_to_min_ledger_prefill(self):
+    async def test_equal_active_lets_cpu_gate_decide(self):
         inst = _instance(1, [_endpoint(10), _endpoint(11)])
         dispatcher, im, _ = await _dispatcher([inst])
         await im.update_instance_workload(1, 10, Workload(active_tokens=10, cpu_hit_blocks=50, prefill_cost=5))
@@ -695,8 +721,8 @@ class TestServerArbitration:
 
         response = await dispatcher.dispatch(_allocate(1, 10, [_cand_payload(1, 10, 5.0), _cand_payload(1, 11, 60.0)]))
 
-        # active equal (neither strictly below the mean) -> active gate fails for both -> min ledger prefill
-        assert response.data["endpoint"]["id"] == 10
+        # active equal -> both pass the active gate (<=); ep10 is over the cpu mean (50 > 25), ep11 under.
+        assert response.data["endpoint"]["id"] == 11
 
     @pytest.mark.asyncio
     async def test_cpu_gate_with_active_headroom_prefers_cold_cpu(self):
@@ -712,9 +738,9 @@ class TestServerArbitration:
 
     @pytest.mark.asyncio
     async def test_mean_factors_change_the_server_pick(self):
-        # ep10 first in ledger order, sits exactly on the active mean (20 of [20, 10, 30]).
+        # ep10 first in ledger order, 10% over the active mean (22 of [22, 8, 30]): needs factor > 1.1.
         inst = _instance(1, [_endpoint(10), _endpoint(11), _endpoint(12)])
-        ledger = {10: 20, 11: 10, 12: 30}
+        ledger = {10: 22, 11: 8, 12: 30}
         candidates = [_cand_payload(1, ep, float(ep)) for ep in ledger]
 
         dispatcher, im, _ = await _dispatcher([inst])

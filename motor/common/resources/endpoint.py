@@ -27,6 +27,11 @@ class Workload(BaseModel):
         default=0,
         description="Remaining prefill cost on this endpoint (KV affinity / SMetric); 0 for RR/LB",
     )
+    cpu_hit_blocks: float = Field(
+        default=0,
+        description="CPU-tier KV blocks the in-flight requests on this endpoint matched (smetric_gated); "
+        "scheduler-ledger only, not carried in the workload SHM",
+    )
 
     def __iadd__(self, other):
         if not isinstance(other, Workload):
@@ -34,6 +39,7 @@ class Workload(BaseModel):
 
         self.active_tokens += other.active_tokens
         self.prefill_cost += other.prefill_cost
+        self.cpu_hit_blocks += other.cpu_hit_blocks
 
         return self
 

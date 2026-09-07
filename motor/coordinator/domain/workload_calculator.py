@@ -34,16 +34,43 @@ def allocated_prefill_cost(
     """
     if req_info is None or instance_id is None or endpoint_id is None:
         return 0.0
+    gated = getattr(req_info, "smetric_gated_debug", None)
+    if isinstance(gated, dict):
+        rec = gated.get((instance_id, endpoint_id))
+        return _non_negative(rec[0] if isinstance(rec, (tuple, list)) and rec else None)
     smetric = getattr(req_info, "smetric_debug", None)
     if isinstance(smetric, dict):
-        rec = smetric.get((instance_id, endpoint_id))
-        if rec is None:
-            return 0.0
-        try:
-            return max(0.0, float(rec))
-        except (TypeError, ValueError):
-            return 0.0
+        return _non_negative(smetric.get((instance_id, endpoint_id)))
     return affinity_prefill_cost(req_info, instance_id, endpoint_id)
+
+
+def allocated_cpu_hit_blocks(
+    req_info: RequestInfo | None,
+    instance_id: int | None = None,
+    endpoint_id: int | None = None,
+) -> float:
+    """
+    CPU-tier matched blocks stamped onto the committed endpoint's workload.
+
+    Only ``smetric_gated`` records these (``req_info.smetric_gated_debug``); other policies leave
+    the ledger field at 0.
+    """
+    if req_info is None or instance_id is None or endpoint_id is None:
+        return 0.0
+    gated = getattr(req_info, "smetric_gated_debug", None)
+    if not isinstance(gated, dict):
+        return 0.0
+    rec = gated.get((instance_id, endpoint_id))
+    return _non_negative(rec[1] if isinstance(rec, (tuple, list)) and len(rec) > 1 else None)
+
+
+def _non_negative(value) -> float:
+    if value is None:
+        return 0.0
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def affinity_prefill_cost(

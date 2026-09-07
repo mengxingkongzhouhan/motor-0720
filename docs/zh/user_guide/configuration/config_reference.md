@@ -243,6 +243,10 @@ motor_coordinator_config字段配置样例如下所示：
       "w_npu": 1.0,
       "w_cpu": 1.0,
       "w_disk": 0.0
+    },
+    "smetric_gated": {
+      "active_tokens_mean_factor": 1.0,
+      "cpu_hit_blocks_mean_factor": 1.0
     }
   },
   "inference_workers_config": {
@@ -396,10 +400,11 @@ motor_coordinator_config字段配置样例如下所示：
 | **reschedule_config字段** |-|-|
 | enable | bool | 故障场景重调度功能开关。默认：`false`。<br>模型重计算由引擎侧负责，该配置不控制引擎侧重计算；`recompute_enabled`仅作为`reschedule_enabled`的旧配置兼容别名；`recompute_max_retry`已移除并会被忽略。 |
 | **scheduler_config字段** |-|-|
-| scheduler_type | string | 调度类型，默认值：load_balance<ul><li>load_balance：负载均衡；</li><li>round_robin：轮询；</li><li>kv_cache_affinity：KV Cache 亲和调度。</li></ul> |
+| scheduler_type | string | 调度类型，默认值：load_balance<ul><li>load_balance：负载均衡；</li><li>round_robin：轮询；</li><li>kv_cache_affinity：KV Cache 亲和调度；</li><li>smetric：按本请求剩余 prefill 成本（isl - 命中 token）最小调度；</li><li>smetric_gated：按 endpoint 账本中当前未完成的剩余 prefill（`prefill_cost`）从小到大排序，依序选出第一个同时满足账本 `active_tokens <= 均值 × active_tokens_mean_factor` 且 `cpu_hit_blocks`（在跑请求命中的 CPU 侧 KV 块数）`<= 均值 × cpu_hit_blocks_mean_factor` 的 endpoint（取等号，保证全空闲集群也能通过门限）；都不满足时退化为只看 `active_tokens` 门限、再退化为账本 `prefill_cost` 最小者。Conductor 仅用于给被选 endpoint 记账（本请求的 `isl - 命中 token` 与 `cpu_blocks`）。系数见 `smetric_gated` 字段。</li></ul> |
 | enable_pd_separation_fallback_to_hybrid | bool | PD分离场景下，当D实例不可用或P/D实例不满足调度条件时，是否允许降级使用混部路由，默认值为 `true` |
 | endpoint_instance_score_weight | float | endpoint 优先负载均衡时实例平均负载权重。默认：`0.05` |
 | kv_affinity | object | KV Cache 亲和性调度参数（见下表） |
+| smetric_gated | object | `scheduler_type=smetric_gated` 时的门限系数（见下表） |
 | **kv_affinity 字段** |-|-|
 | mode | string | `scheduler_type=kv_cache_affinity` 时的子策略：`unified`（默认）或 `load_gated` |
 | load_weight | float | unified 模式下 endpoint 实时负载权重。默认值：`1.0` |
@@ -409,6 +414,9 @@ motor_coordinator_config字段配置样例如下所示：
 | w_npu | float | 互斥 NPU 命中块权重。默认值：`1.0` |
 | w_cpu | float | 互斥 CPU 命中块权重。默认值：`1.0` |
 | w_disk | float | 互斥 Disk 命中块权重。默认值：`0.0` |
+| **smetric_gated 字段** |-|-|
+| active_tokens_mean_factor | float | `active_tokens` 门限 = 候选 endpoint 的 `active_tokens` 均值 × 该系数。大于 1 放宽（更多 endpoint 通过，账本 `prefill_cost` 排序起主导作用），小于 1 收紧。默认值：`1.0` |
+| cpu_hit_blocks_mean_factor | float | `cpu_hit_blocks` 门限 = 候选 endpoint 的 `cpu_hit_blocks` 均值 × 该系数，语义同上。默认值：`1.0` |
 | **inference_workers_config字段** |-|-|
 | num_workers | int | Coordinator中业务面worker个数，默认值：4。 |
 | worker_metaserver_base_port | int | vLLM layerwise/trigger PD 时每个 Inference Worker 的 metaserver 起始端口。默认值：`12000`。Worker `i` 监听 `base+i`，仅暴露 `POST /v1/metaserver`。设为 `0` 关闭。须保证 `base+num_workers-1 <= 65535`。同一集群不可混部 handoff 与 trigger。监听地址优先 `POD_IP`，否则用 `coordinator_api_host`（不绑 loopback）。`coordinator_api_host=0.0.0.0`/`::` 仍可启动；走 Trigger 时须有 `POD_IP` 或可达的 `coordinator_api_host`，否则该请求返回 503。端口占用或 metaserver 启动失败时推理口继续服务，该 Worker 的 Trigger 请求返回 503。 |

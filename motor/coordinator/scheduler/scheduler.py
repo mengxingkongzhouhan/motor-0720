@@ -25,7 +25,11 @@ from motor.coordinator.domain.scheduling_pin import (
     resolve_pinned_instance,
     select_endpoint_for_instance,
 )
-from motor.coordinator.domain.workload_calculator import allocated_prefill_cost, calculate_demand_workload
+from motor.coordinator.domain.workload_calculator import (
+    allocated_cpu_hit_blocks,
+    allocated_prefill_cost,
+    calculate_demand_workload,
+)
 from motor.config.coordinator import CoordinatorConfig, SchedulerType
 from motor.coordinator.domain import InstanceProvider
 from motor.coordinator.models.request import RequestInfo
@@ -70,6 +74,12 @@ class Scheduler:
         if self._config and hasattr(self._scheduling_policy, "set_endpoint_instance_score_weight"):
             self._scheduling_policy.set_endpoint_instance_score_weight(
                 self._config.scheduler_config.endpoint_instance_score_weight
+            )
+        if self._config and hasattr(self._scheduling_policy, "set_mean_factors"):
+            gated = self._config.scheduler_config.smetric_gated
+            self._scheduling_policy.set_mean_factors(
+                gated.active_tokens_mean_factor,
+                gated.cpu_hit_blocks_mean_factor,
             )
         # Global per-PD-group precision state (shared across inference workers).
         self._sample_exit_last_time: dict[tuple[int | None, int], float] = {}
@@ -178,6 +188,8 @@ class Scheduler:
         )
         # KV affinity / SMetric stamp the committed endpoint's prefill_cost; other policies stay 0.
         workload.prefill_cost = allocated_prefill_cost(req_info, instance.id, endpoint.id)
+        # smetric_gated additionally tracks the request's CPU-tier KV hits on the endpoint.
+        workload.cpu_hit_blocks = allocated_cpu_hit_blocks(req_info, instance.id, endpoint.id)
         params = UpdateWorkloadParams(
             instance_id=instance.id,
             endpoint_id=endpoint.id,

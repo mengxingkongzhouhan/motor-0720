@@ -39,6 +39,12 @@ from motor.coordinator.domain.instance_manager import InstanceManager
 from motor.coordinator.scheduler.scheduler import Scheduler
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.policy.smetric import SMetricPrefillCostTracker
+from motor.coordinator.scheduler.policy.smetric_gated import (
+    GatedCandidate,
+    format_candidates,
+    pick_gated,
+    sort_candidates,
+)
 from motor.coordinator.scheduler.runtime.workload_shm import WorkloadSharedMemoryWriter
 from motor.coordinator.scheduler.runtime.workload_shm.layout import (
     DEFAULT_WORKLOAD_SHM_MAX_ENTRIES,
@@ -51,6 +57,7 @@ from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_LOAD_BALANCE,
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
     CANDIDATE_POLICY_SMETRIC,
+    CANDIDATE_POLICY_SMETRIC_GATED,
     KNOWN_CANDIDATE_POLICIES,
     INSTANCE_CHANGE_TOPIC,
     CIRCUIT_BREAKER_TOPIC,
@@ -133,6 +140,8 @@ _KEY_MATCHED_TOKENS = "matched_tokens"
 # kv_cache_affinity unified global selection: worker sends per-candidate affinity prefill cost
 # plus the two scalars so the scheduler recomputes prefill_load_scale*prefill_cost + load_weight*load.
 _KEY_PREFILL_COST = "prefill_cost"
+# smetric_gated: per-candidate CPU-tier matched blocks, stamped on the committed endpoint ledger.
+_KEY_CPU_HIT_BLOCKS = "cpu_hit_blocks"
 _KEY_LOAD_WEIGHT = "load_weight"
 _KEY_PREFILL_LOAD_SCALE = "prefill_load_scale"
 _KEY_REQUIRED_ENGINE_TYPE = "required_engine_type"
@@ -232,6 +241,10 @@ class _SchedulerRequestDispatcher:
         self._is_load_balance_scheduler = getattr(scheduler_type, "value", scheduler_type) == "load_balance"
         # One running average for all Workers that ALLOCATE_ONLY into this Scheduler process.
         self._smetric_prefill = SMetricPrefillCostTracker()
+        # smetric_gated gate thresholds are ``candidate mean * factor``.
+        gated = getattr(config.scheduler_config, "smetric_gated", None)
+        self._smetric_gated_active_factor = max(0.0, float(getattr(gated, "active_tokens_mean_factor", 1.0)))
+        self._smetric_gated_cpu_factor = max(0.0, float(getattr(gated, "cpu_hit_blocks_mean_factor", 1.0)))
 
     async def dispatch(self, request: SchedulerRequest) -> SchedulerResponse:
         """Dispatch request to the appropriate handler (async handlers supported)."""
@@ -720,6 +733,7 @@ class _SchedulerRequestDispatcher:
         # Per-endpoint prefill_cost from the worker (kv_cache_affinity unified, or smetric).
         affinity_candidates = self._extract_affinity_candidates(request.data)
         matched_tokens_map = self._extract_candidate_matched_tokens(request.data)
+        cpu_hit_blocks_map = self._extract_candidate_float_field(request.data, _KEY_CPU_HIT_BLOCKS)
         fast_path = self._can_use_worker_top1_fast_path(
             worker_workload_sequence,
             worker_role_workload_sequence,
@@ -739,6 +753,18 @@ class _SchedulerRequestDispatcher:
             )
             if selected is None or (selected[0].id, selected[1].id) != selected_candidate:
                 fast_path = False
+        elif candidate_policy == CANDIDATE_POLICY_SMETRIC_GATED:
+            # The gates read cpu_hit_blocks, which only this ledger has (not in the workload SHM),
+            # so the worker's view can never be "fresh" for this policy: always re-gate here.
+            selected = self._select_smetric_gated(
+                selected_candidate,
+                affinity_candidates,
+                cpu_hit_blocks_map,
+                role,
+                req_id,
+                required_engine_type,
+            )
+            fast_path = False
         else:
             selected = (
                 self._select_valid_candidate(selected_candidate, role, required_engine_type)
@@ -795,6 +821,8 @@ class _SchedulerRequestDispatcher:
             workload = worker_demand
         # KV affinity / SMetric stamp the committed endpoint's prefill_cost; other policies leave 0.
         workload.prefill_cost = self._lookup_candidate_prefill_cost(affinity_candidates, instance.id, endpoint.id)
+        # smetric_gated also tracks this request's CPU-tier KV hits on the endpoint (0 elsewhere).
+        workload.cpu_hit_blocks = cpu_hit_blocks_map.get((instance.id, endpoint.id), 0.0)
         params = UpdateWorkloadParams(
             instance_id=instance.id,
             endpoint_id=endpoint.id,
@@ -891,6 +919,11 @@ class _SchedulerRequestDispatcher:
     @staticmethod
     def _extract_candidate_matched_tokens(data: dict) -> dict[tuple[int, int], float]:
         """Parse per-candidate matched_tokens for authoritative ISL-matched commit."""
+        return _SchedulerRequestDispatcher._extract_candidate_float_field(data, _KEY_MATCHED_TOKENS)
+
+    @staticmethod
+    def _extract_candidate_float_field(data: dict, field: str) -> dict[tuple[int, int], float]:
+        """Parse one numeric per-candidate field into ``{(instance_id, endpoint_id): value}``."""
         raw = data.get(_KEY_CANDIDATES)
         result: dict[tuple[int, int], float] = {}
         if not isinstance(raw, list):
@@ -900,11 +933,11 @@ class _SchedulerRequestDispatcher:
                 continue
             instance_id = item.get("instance_id")
             endpoint_id = item.get("endpoint_id")
-            matched = item.get(_KEY_MATCHED_TOKENS)
-            if instance_id is None or endpoint_id is None or matched is None:
+            value = item.get(field)
+            if instance_id is None or endpoint_id is None or value is None:
                 continue
             try:
-                result[(int(instance_id), int(endpoint_id))] = float(matched)
+                result[(int(instance_id), int(endpoint_id))] = float(value)
             except (TypeError, ValueError):
                 continue
         return result
@@ -1086,6 +1119,75 @@ class _SchedulerRequestDispatcher:
                     return picked
             return self._select_smetric_min_cost(smetric_candidates, role, required_engine_type)
         return self._select_min_ledger_prefill_cost(role, smetric_candidates, required_engine_type)
+
+    def _select_smetric_gated(
+        self,
+        worker_candidate: tuple[int, int],
+        cost_candidates: list[tuple[int, int, float]] | None,
+        cpu_hit_blocks_map: dict[tuple[int, int], float],
+        role: PDRole,
+        req_id: str,
+        required_engine_type: str | None = None,
+    ) -> tuple[Instance, Endpoint, float] | None:
+        """
+        smetric_gated arbitration on the authoritative ledger.
+
+        Resolve every worker-scored endpoint that is still schedulable, sort by the endpoint's
+        ledger ``prefill_cost`` and take the first one at or below both scaled ledger averages
+        (active_tokens, cpu_hit_blocks); see ``smetric_gated.pick_gated`` for the fallback order.
+        The worker-supplied per-endpoint cost / cpu_blocks are only the values stamped on the
+        committed ledger. The returned score is the committed endpoint's ledger prefill_cost.
+        """
+        if not cost_candidates:
+            logger.warning(
+                "smetric_gated: no endpoint costs in ALLOCATE_ONLY req_id=%s; validating worker candidate %s",
+                req_id,
+                worker_candidate,
+            )
+            return self._select_valid_candidate(worker_candidate, role, required_engine_type)
+        candidates: list[GatedCandidate] = []
+        for instance_id, endpoint_id, prefill_cost in cost_candidates:
+            if self._is_instance_circuit_open(instance_id):
+                continue
+            found = self._find_available_instance_endpoint(instance_id, endpoint_id)
+            if found is None:
+                continue
+            instance, endpoint = found
+            if not self._matches_engine_type(instance, required_engine_type):
+                continue
+            try:
+                instance_role = PDRole(instance.role)
+            except ValueError:
+                instance_role = PDRole.ROLE_U
+            if instance_role != role:
+                continue
+            candidates.append(
+                GatedCandidate(
+                    instance=instance,
+                    endpoint=endpoint,
+                    prefill_cost=prefill_cost,
+                    cpu_hit_blocks=cpu_hit_blocks_map.get((instance_id, endpoint_id), 0.0),
+                )
+            )
+        ranked = sort_candidates(candidates)
+        picked = pick_gated(ranked, self._smetric_gated_active_factor, self._smetric_gated_cpu_factor)
+        if picked is None:
+            return None
+        chosen, reason, active_threshold, cpu_threshold = picked
+        logger.info(
+            "smetric_gated: req_id=%s pick=%s-%s reason=%s active_threshold=%.1f cpu_threshold=%.1f "
+            "factors=%.2f/%.2f ranked[ins-ep:ledger_prefill/active/cpu(+req_cost/+req_cpu)]=%s",
+            req_id,
+            chosen.instance.id,
+            chosen.endpoint.id,
+            reason,
+            active_threshold,
+            cpu_threshold,
+            self._smetric_gated_active_factor,
+            self._smetric_gated_cpu_factor,
+            format_candidates(ranked),
+        )
+        return (chosen.instance, chosen.endpoint, chosen.ledger_prefill_cost)
 
     def _select_smetric_min_cost(
         self,

@@ -1520,3 +1520,65 @@ fn test_disk_only_coverage_matched_tokens() {
     assert_eq!(dp0.disk_blocks, 1);
     assert_eq!(dp0.matched_tokens, 4);
 }
+
+/// Registration pod → DP table is the query target list. A store-only
+/// worker that owns the CPU chain is walked ownership-blind for the
+/// registered prefill, but must not appear as its own routing instance.
+#[test]
+fn test_query_dps_from_hbm_ip_index_skips_store_only_workers() {
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("qwen3", "default");
+
+    let tokens: Vec<i64> = (0..12).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+    assert_eq!(hashes.len(), 3);
+
+    store_chain(
+        &entry,
+        &worker_of("vllm-prefill-2", 0, StorageMedium::Npu),
+        None,
+        &[(100, hashes[0].0)],
+    );
+    store_chain(
+        &entry,
+        &worker_of("vllm-decode-1", 0, StorageMedium::Npu),
+        None,
+        &[(200, hashes[0].0), (201, hashes[1].0), (202, hashes[2].0)],
+    );
+    store_chain(
+        &entry,
+        &worker_of("vllm-decode-1", 0, StorageMedium::Cpu),
+        None,
+        &[(300, hashes[0].0), (301, hashes[1].0), (302, hashes[2].0)],
+    );
+
+    // Tree fallback still sees every owner (indexer-only tests).
+    let all = indexer.query("qwen3", "default", &tokens, 4).unwrap();
+    assert!(
+        all.tenants["default"].contains_key("vllm-decode-1"),
+        "without the pod→DP table, tree keys still include the store owner"
+    );
+
+    let mut query_dps = rustc_hash::FxHashSet::default();
+    query_dps.insert(("vllm-prefill-2".into(), 0));
+    let resp = indexer
+        .query_with_dps("qwen3", "default", &tokens, 4, Some(&query_dps))
+        .unwrap();
+    let tenant = &resp.tenants["default"];
+    assert!(
+        !tenant.contains_key("vllm-decode-1"),
+        "store-only workers are not routing targets: {:?}",
+        tenant.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(tenant.len(), 1);
+
+    let dp0 = &tenant["vllm-prefill-2"].dp["0"];
+    assert_eq!(dp0.npu_blocks, 1);
+    assert_eq!(
+        dp0.cpu_blocks, 2,
+        "registered prefill still sees decode-owned CPU edges"
+    );
+    assert_eq!(dp0.matched_tokens, 12);
+    assert_eq!(dp0.cpu_local_blocks, 0);
+    assert_eq!(dp0.cpu_remote_blocks, 2);
+}

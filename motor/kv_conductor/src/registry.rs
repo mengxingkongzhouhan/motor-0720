@@ -17,11 +17,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock as ParkingRwLock;
+use rustc_hash::FxHashSet;
 
 use crate::backend::{MatchMode, StoreBackend};
 use crate::error::KvConductorError;
 use crate::indexer::{CacheMaintenanceConfig, Indexer, IndexerKey};
 use crate::protocols::*;
+
+/// Flattened `(instance_id, dp_rank)` snapshot of [`HbmIpIndex`].
+///
+/// Rebuilt only when that table changes (register / unregister). `/query`
+/// clones the `Arc`, it does not walk the pod → DP map again.
+type QueryDpSet = ParkingRwLock<Arc<FxHashSet<(String, u32)>>>;
 
 /// Extract the IP/host portion from a ZMQ endpoint URL.
 /// e.g. "tcp://10.0.0.1:5557" → "10.0.0.1"
@@ -38,9 +45,15 @@ fn extract_ip_from_endpoint(endpoint: &str) -> Option<String> {
     Some(without_prefix[..colon_pos].to_string())
 }
 
+/// Replace the query-DP snapshot from the current `hbm_ip_index`.
+fn refresh_query_dps(ip_index: &HbmIpIndex, query_dps: &QueryDpSet) {
+    *query_dps.write() = Arc::new(query_dps_from_hbm_ip_index(ip_index));
+}
+
 /// Add `(instance_id, dp_rank)` entries to `hbm_ip_index` for each NPU endpoint.
 fn add_hbm_ip_index_entries(
     ip_index: &HbmIpIndex,
+    query_dps: &QueryDpSet,
     medium_endpoints: &HashMap<String, String>,
     instance_id: &str,
     dp_rank: u32,
@@ -59,6 +72,7 @@ fn add_hbm_ip_index_entries(
             .push((instance_id.to_string(), dp_rank));
         tracing::info!(instance_id = %instance_id, dp_rank, ip = %ip, "HBM IP indexed for pool auto-attach");
     }
+    refresh_query_dps(ip_index, query_dps);
 }
 
 /// For each NPU endpoint in `medium_endpoints`, remove the (instance_id, dp_rank)
@@ -66,6 +80,7 @@ fn add_hbm_ip_index_entries(
 /// dropped entirely.
 fn remove_hbm_ip_index_entries(
     ip_index: &HbmIpIndex,
+    query_dps: &QueryDpSet,
     medium_endpoints: &HashMap<String, String>,
     instance_id: &str,
     dp_rank: u32,
@@ -86,6 +101,7 @@ fn remove_hbm_ip_index_entries(
         }
         tracing::info!(instance_id = %instance_id, dp_rank, ip = %ip, "HBM IP removed from index");
     }
+    refresh_query_dps(ip_index, query_dps);
 }
 
 /// Record `(pod_ip → node_id)` and `(node_id → dp)` for each NPU endpoint.
@@ -188,6 +204,9 @@ pub struct WorkerRegistry {
     /// Built from HBM endpoint registrations; consumed by the pool subscriber
     /// to map `backend_id` in events to the correct DP(s).
     hbm_ip_index: HbmIpIndex,
+    /// Snapshot of unique DPs in `hbm_ip_index`. Refreshed on register /
+    /// unregister only; `/query` reads this instead of flattening the map.
+    query_dps: QueryDpSet,
     /// Pod IP → node, and node → DPs. Built from `node_id` in registrations;
     /// empty when clients do not send it. Exposed via `GET /workers`.
     node_topology: SharedNodeTopology,
@@ -245,6 +264,7 @@ impl WorkerRegistry {
             indexer: Arc::new(Indexer::with_config(config)),
             zmq_subscribers: tokio::sync::RwLock::new(HashMap::new()),
             hbm_ip_index: Arc::new(ParkingRwLock::new(HashMap::new())),
+            query_dps: ParkingRwLock::new(Arc::new(FxHashSet::default())),
             node_topology: Arc::new(ParkingRwLock::new(NodeTopology::default())),
         }
     }
@@ -319,6 +339,7 @@ impl WorkerRegistry {
                     }
                     remove_hbm_ip_index_entries(
                         &self.hbm_ip_index,
+                        &self.query_dps,
                         &old_medium_endpoints,
                         &req.instance_id,
                         req.dp_rank,
@@ -337,6 +358,7 @@ impl WorkerRegistry {
         if sb.index_hbm_ip() && !is_pool {
             add_hbm_ip_index_entries(
                 &self.hbm_ip_index,
+                &self.query_dps,
                 &req.medium_endpoints,
                 &req.instance_id,
                 req.dp_rank,
@@ -480,6 +502,7 @@ impl WorkerRegistry {
                 if let Some(info) = entry.endpoints.get(&req.dp_rank) {
                     remove_hbm_ip_index_entries(
                         &self.hbm_ip_index,
+                        &self.query_dps,
                         &info.medium_endpoints,
                         &req.instance_id,
                         req.dp_rank,
@@ -555,9 +578,20 @@ impl WorkerRegistry {
     }
 
     /// Query KV cache overlap for a token sequence.
+    ///
+    /// Target DPs are the snapshot rebuilt when `hbm_ip_index` changes.
+    /// An empty snapshot falls back to tree-derived DPs so YuanRong —
+    /// which does not index HBM IPs — still queries every worker the
+    /// indexer has seen.
     pub async fn query(&self, req: &QueryRequest) -> Result<QueryResponse, KvConductorError> {
-        self.indexer
-            .query(&req.model, &req.tenant_id, &req.token_ids, req.block_size)
+        let query_dps = self.query_dps.read().clone();
+        self.indexer.query_with_dps(
+            &req.model,
+            &req.tenant_id,
+            &req.token_ids,
+            req.block_size,
+            Some(query_dps.as_ref()),
+        )
     }
 
     /// Query KV cache overlap using pre-computed block hashes.
@@ -570,8 +604,13 @@ impl WorkerRegistry {
             .iter()
             .map(|&h| LocalBlockHash(h))
             .collect();
-        self.indexer
-            .query_by_hash(&req.model, &req.tenant_id, &hashes)
+        let query_dps = self.query_dps.read().clone();
+        self.indexer.query_by_hash_with_dps(
+            &req.model,
+            &req.tenant_id,
+            &hashes,
+            Some(query_dps.as_ref()),
+        )
     }
 
     /// Apply a batch of KV cache events (engine-style, HTTP POST /events).
@@ -683,6 +722,12 @@ impl WorkerRegistry {
     /// Access the underlying indexer (for advanced use).
     pub fn indexer(&self) -> &Arc<Indexer> {
         &self.indexer
+    }
+
+    /// Snapshot of query DPs last rebuilt from `hbm_ip_index`.
+    #[cfg(test)]
+    fn query_dp_snapshot(&self) -> Arc<FxHashSet<(String, u32)>> {
+        self.query_dps.read().clone()
     }
 
     /// Sweep stale caches and reclaim indexers which have no active registration.
@@ -910,5 +955,142 @@ mod tests {
         eps.insert("disk".to_string(), "tcp://10.244.0.9:15559".to_string());
         add_node_topology_entries(&topo, Some("node-1"), &eps, "vllm-prefill-1", 0);
         assert!(topo.read().is_empty());
+    }
+
+    fn prefill_register(instance_id: &str, npu_url: &str) -> RegisterRequest {
+        RegisterRequest {
+            instance_id: instance_id.into(),
+            medium_endpoints: npu_endpoints(npu_url),
+            endpoint: None,
+            engine_type: "vllm".into(),
+            modelname: "qwen3".into(),
+            block_size: 4,
+            dp_rank: 0,
+            store_backend: "Memcache".into(),
+            replay_endpoint: None,
+            tenant_id: "default".into(),
+            node_id: None,
+        }
+    }
+
+    fn store_on(
+        indexer: &Indexer,
+        instance_id: &str,
+        medium: StorageMedium,
+        tokens_hashes: &[u64],
+    ) {
+        let entry = indexer.get_or_create("qwen3", "default");
+        let worker = WorkerKey {
+            instance_id: instance_id.into(),
+            backend_id: instance_id.into(),
+            dp_rank: 0,
+            medium,
+        };
+        let blocks = tokens_hashes
+            .iter()
+            .enumerate()
+            .map(|(i, &tokens_hash)| KvCacheStoredBlockData {
+                block_hash: 100 + i as u64,
+                tokens_hash,
+            })
+            .collect();
+        entry
+            .apply_event(
+                &worker,
+                &KvCacheEventData::Stored(KvCacheStoreData {
+                    parent_hash: None,
+                    start_position: None,
+                    blocks,
+                }),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_query_targets_dps_from_hbm_ip_index() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(&prefill_register(
+                "vllm-prefill-2",
+                "tcp://10.244.55.60:5557",
+            ))
+            .await
+            .unwrap();
+
+        let tokens: Vec<i64> = (0..12).collect();
+        let hashes: Vec<u64> = crate::hashing::compute_block_hash_for_seq(&tokens, 4)
+            .iter()
+            .map(|h| h.0)
+            .collect();
+        assert_eq!(hashes.len(), 3);
+
+        let indexer = registry.indexer();
+        store_on(indexer, "vllm-prefill-2", StorageMedium::Npu, &hashes[..1]);
+        store_on(indexer, "vllm-decode-1", StorageMedium::Cpu, &hashes);
+
+        let resp = registry
+            .query(&QueryRequest {
+                model: "qwen3".into(),
+                block_size: 4,
+                token_ids: tokens,
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        let tenant = &resp.tenants["default"];
+        assert!(
+            !tenant.contains_key("vllm-decode-1"),
+            "decode-owned CPU edges must not produce a routing instance: {:?}",
+            tenant.keys().collect::<Vec<_>>()
+        );
+        let dp0 = &tenant["vllm-prefill-2"].dp["0"];
+        assert_eq!(dp0.npu_blocks, 1);
+        assert_eq!(
+            dp0.cpu_blocks, 2,
+            "registered prefill still sees the pooled CPU prefix"
+        );
+        assert_eq!(dp0.matched_tokens, 12);
+    }
+
+    #[tokio::test]
+    async fn test_query_dp_snapshot_updates_only_on_hbm_index_change() {
+        let registry = WorkerRegistry::new();
+        assert!(
+            registry.query_dp_snapshot().is_empty(),
+            "no registrations yet"
+        );
+
+        registry
+            .register(&prefill_register(
+                "vllm-prefill-2",
+                "tcp://10.244.55.60:5557",
+            ))
+            .await
+            .unwrap();
+        {
+            let dps = registry.query_dp_snapshot();
+            assert_eq!(dps.len(), 1);
+            assert!(dps.contains(&("vllm-prefill-2".into(), 0)));
+            assert!(
+                !dps.iter().any(|(id, _)| id.starts_with("vllm-decode-")),
+                "Coordinator never registers ROLE_D into hbm_ip_index"
+            );
+        }
+
+        registry
+            .unregister(&UnregisterRequest {
+                instance_id: "vllm-prefill-2".into(),
+                engine_type: "vllm".into(),
+                modelname: "qwen3".into(),
+                block_size: 4,
+                dp_rank: 0,
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            registry.query_dp_snapshot().is_empty(),
+            "unregister must drop the cached query DP"
+        );
     }
 }

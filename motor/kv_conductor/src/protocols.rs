@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock as ParkingRwLock;
 use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use tracing;
 
@@ -43,7 +44,24 @@ use crate::hashing::compute_block_hash_for_seq;
 /// Maps node IP → list of (instance_id, dp_rank) for HBM-registered endpoints.
 /// When a Mooncake pool subscriber receives an event with `backend_id=<ip>`,
 /// the event is applied to every DP whose HBM endpoint resolves to that IP.
+///
+/// `/query` also flattens this table to decide which DPs to score: only
+/// HBM-registered engine DPs are affinity targets, not store-only workers.
 pub type HbmIpIndex = Arc<ParkingRwLock<HashMap<String, Vec<(String, u32)>>>>;
+
+/// Unique `(instance_id, dp_rank)` values recorded in the pod → DP index.
+///
+/// One Pod may host several DPs; the same DP may appear under more than one
+/// HBM medium key. The set collapses those duplicates. Called when the
+/// index changes (register / unregister), not on each `/query`.
+pub fn query_dps_from_hbm_ip_index(index: &HbmIpIndex) -> FxHashSet<(String, u32)> {
+    index
+        .read()
+        .values()
+        .flatten()
+        .map(|(instance_id, dp_rank)| (instance_id.clone(), *dp_rank))
+        .collect()
+}
 
 /// Where one DP runs. `pod_ip` is kept alongside the node so unregistration can
 /// tell when a Pod's last DP is gone, and so the debug view shows both levels.
@@ -822,6 +840,37 @@ impl OverlapBlocks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_query_dps_from_hbm_ip_index_dedups_pods() {
+        let index = HbmIpIndex::default();
+        {
+            let mut guard = index.write();
+            guard
+                .entry("10.244.0.5".into())
+                .or_default()
+                .extend([("vllm-prefill-1".into(), 0), ("vllm-prefill-1".into(), 1)]);
+            guard
+                .entry("10.244.0.6".into())
+                .or_default()
+                .push(("vllm-prefill-2".into(), 0));
+            // Same DP listed twice (npu + gpu keys) must collapse.
+            guard
+                .entry("10.244.0.5".into())
+                .or_default()
+                .push(("vllm-prefill-1".into(), 0));
+        }
+        let dps = query_dps_from_hbm_ip_index(&index);
+        assert_eq!(dps.len(), 3);
+        assert!(dps.contains(&("vllm-prefill-1".into(), 0)));
+        assert!(dps.contains(&("vllm-prefill-1".into(), 1)));
+        assert!(dps.contains(&("vllm-prefill-2".into(), 0)));
+    }
+
+    #[test]
+    fn test_query_dps_from_empty_hbm_ip_index() {
+        assert!(query_dps_from_hbm_ip_index(&HbmIpIndex::default()).is_empty());
+    }
 
     // ── StorageMedium ─────────────────────────────────────────────────
 

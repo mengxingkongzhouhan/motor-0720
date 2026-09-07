@@ -12,7 +12,9 @@
 
 import pytest
 
-from motor.common.resources.endpoint import Endpoint, EndpointStatus, Workload
+import logging
+
+from motor.common.resources.endpoint import Endpoint, EndpointStatus, Workload, WorkloadAction
 from motor.common.resources.http_msg_spec import EventType
 from motor.common.resources.instance import Instance, InsStatus, PDRole, ParallelConfig
 from motor.config.coordinator import CoordinatorConfig, SchedulerType
@@ -700,3 +702,181 @@ async def test_allocate_only_fast_path_accepts_encode_candidate():
     assert selected_role == PDRole.ROLE_E
     assert selected_workload.active_tokens == 3
     assert workload_writer.writes == [(1, 10)]
+
+
+def _running_snapshot_from_logs(caplog) -> str:
+    for record in reversed(caplog.records):
+        marker = "endpoints[ins/ep:running/workload]="
+        if marker in record.message:
+            return record.message.split(marker, 1)[1]
+    raise AssertionError("ALLOCATE_ONLY selected snapshot log not found")
+
+
+def _parse_running_counts(snapshot: str) -> dict[tuple[int, int], tuple[int, float]]:
+    parsed: dict[tuple[int, int], tuple[int, float]] = {}
+    for part in snapshot.split():
+        ins_ep, running_workload = part.split(":", 1)
+        instance_id, endpoint_id = ins_ep.split("/", 1)
+        running, workload = running_workload.split("/", 1)
+        parsed[(int(instance_id), int(endpoint_id))] = (int(running), float(workload))
+    return parsed
+
+
+async def _make_running_count_dispatcher():
+    config = CoordinatorConfig()
+    config.scheduler_config.scheduler_type = SchedulerType.LOAD_BALANCE
+    config.scheduler_config.endpoint_instance_score_weight = 0.0
+    instance_manager = InstanceManager(config)
+    inst = _make_prefill_instance(1, (10, 11))
+    await instance_manager.refresh_instances(EventType.ADD, [inst])
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager,
+        scheduler,
+        config,
+        workload_writer=_DummyWorkloadWriter(),
+    )
+    return dispatcher, instance_manager
+
+
+def _allocate_request(req_id: str, instance_id: int = 1, endpoint_id: int = 10, tokens: float = 4.0):
+    return SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id=f"alloc-{req_id}",
+        data={
+            "instance_id": instance_id,
+            "endpoint_id": endpoint_id,
+            "role": PDRole.ROLE_P.value,
+            "req_id": req_id,
+            "workload_active_tokens": tokens,
+        },
+    )
+
+
+def _release_request(req_id: str, instance_id: int, endpoint_id: int, tokens: float):
+    return SchedulerRequest(
+        request_type=SchedulerRequestType.UPDATE_WORKLOAD,
+        request_id=f"release-{req_id}",
+        data={
+            "instance_id": instance_id,
+            "endpoint_id": endpoint_id,
+            "role": PDRole.ROLE_P.value,
+            "req_id": req_id,
+            "workload_action": WorkloadAction.RELEASE_TOKENS.value,
+            "workload_change": Workload(active_tokens=-tokens).model_dump(mode="json"),
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_log_includes_current_request_in_running_count(caplog):
+    """Snapshot is taken after commit, so the selected endpoint already counts this request."""
+    caplog.set_level(logging.INFO)
+    dispatcher, _ = await _make_running_count_dispatcher()
+
+    response = await dispatcher.dispatch(_allocate_request("req-1", tokens=5.0))
+
+    assert response.response_type == SchedulerResponseType.SUCCESS
+    assert response.data["instance"]["id"] == 1
+    selected_ep = response.data["endpoint"]["id"]
+    counts = _parse_running_counts(_running_snapshot_from_logs(caplog))
+    assert counts[(1, selected_ep)][0] == 1
+    assert counts[(1, selected_ep)][1] == 5.0
+    other_ep = 11 if selected_ep == 10 else 10
+    assert counts[(1, other_ep)] == (0, 0.0)
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_log_accumulates_in_flight_running_counts(caplog):
+    caplog.set_level(logging.INFO)
+    dispatcher, _ = await _make_running_count_dispatcher()
+
+    first = await dispatcher.dispatch(_allocate_request("req-1", tokens=5.0))
+    first_ep = first.data["endpoint"]["id"]
+    caplog.clear()
+    second = await dispatcher.dispatch(_allocate_request("req-2", tokens=7.0))
+    second_ep = second.data["endpoint"]["id"]
+
+    counts = _parse_running_counts(_running_snapshot_from_logs(caplog))
+    if first_ep == second_ep:
+        assert counts[(1, first_ep)][0] == 2
+        assert counts[(1, first_ep)][1] == 12.0
+    else:
+        assert counts[(1, first_ep)][0] == 1
+        assert counts[(1, second_ep)][0] == 1
+        assert counts[(1, first_ep)][1] == 5.0
+        assert counts[(1, second_ep)][1] == 7.0
+
+
+@pytest.mark.asyncio
+async def test_release_tokens_drops_running_count_before_next_allocate(caplog):
+    caplog.set_level(logging.INFO)
+    dispatcher, _ = await _make_running_count_dispatcher()
+
+    first = await dispatcher.dispatch(_allocate_request("req-1", tokens=5.0))
+    first_ep = first.data["endpoint"]["id"]
+    release = await dispatcher.dispatch(_release_request("req-1", 1, first_ep, 5.0))
+    assert release.data["success"] is True
+
+    caplog.clear()
+    second = await dispatcher.dispatch(_allocate_request("req-2", tokens=3.0))
+    second_ep = second.data["endpoint"]["id"]
+    counts = _parse_running_counts(_running_snapshot_from_logs(caplog))
+    assert counts[(1, second_ep)][0] == 1
+    assert sum(running for running, _ in counts.values()) == 1
+
+
+@pytest.mark.asyncio
+async def test_duplicate_allocation_of_same_req_id_does_not_double_count(caplog):
+    caplog.set_level(logging.INFO)
+    dispatcher, _ = await _make_running_count_dispatcher()
+
+    first = await dispatcher.dispatch(_allocate_request("req-1", tokens=5.0))
+    first_ep = first.data["endpoint"]["id"]
+    duplicate = await dispatcher.dispatch(
+        SchedulerRequest(
+            request_type=SchedulerRequestType.UPDATE_WORKLOAD,
+            request_id="alloc-dup-req-1",
+            data={
+                "instance_id": 1,
+                "endpoint_id": first_ep,
+                "role": PDRole.ROLE_P.value,
+                "req_id": "req-1",
+                "workload_action": WorkloadAction.ALLOCATION.value,
+                "workload_change": Workload(active_tokens=5.0).model_dump(mode="json"),
+            },
+        )
+    )
+    assert duplicate.data["success"] is True
+
+    caplog.clear()
+    second = await dispatcher.dispatch(_allocate_request("req-2", tokens=3.0))
+    counts = _parse_running_counts(_running_snapshot_from_logs(caplog))
+    assert sum(running for running, _ in counts.values()) == 2
+    assert counts[(1, second.data["endpoint"]["id"])][0] >= 1
+
+
+@pytest.mark.asyncio
+async def test_set_refresh_keeps_running_count_for_live_instances(caplog):
+    caplog.set_level(logging.INFO)
+    dispatcher, instance_manager = await _make_running_count_dispatcher()
+
+    await dispatcher.dispatch(_allocate_request("req-1", tokens=5.0))
+    live = await instance_manager.snapshot_instances()
+    refresh = await dispatcher.dispatch(
+        SchedulerRequest(
+            request_type=SchedulerRequestType.REFRESH_INSTANCES,
+            request_id="refresh-set",
+            data={
+                "event_type": EventType.SET.value,
+                "instances": [inst.model_dump(mode="json") for inst in live],
+            },
+        )
+    )
+    assert refresh.response_type == SchedulerResponseType.SUCCESS
+
+    caplog.clear()
+    second = await dispatcher.dispatch(_allocate_request("req-2", tokens=3.0))
+    counts = _parse_running_counts(_running_snapshot_from_logs(caplog))
+    assert sum(running for running, _ in counts.values()) == 2
+    assert counts[(1, second.data["endpoint"]["id"])][0] >= 1

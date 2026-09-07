@@ -14,11 +14,12 @@ SMetric-gated scheduling policy: rank endpoints by their ledger, gate on two led
 1. Sort the endpoints of the request's role by the ledger ``workload.prefill_cost`` ascending,
    i.e. the remaining prefill currently outstanding on each endpoint (sum over its in-flight
    requests of ``isl - matched_tokens``).
-2. Walk that order and commit the first endpoint whose ledger is strictly below BOTH scaled
+2. Walk that order and commit the first endpoint whose ledger is at or below BOTH scaled
    averages over the ranked endpoints:
-   ``active_tokens < mean(active_tokens) * active_tokens_mean_factor`` and
-   ``cpu_hit_blocks < mean(cpu_hit_blocks) * cpu_hit_blocks_mean_factor``
-   (factors from ``SchedulerConfig.smetric_gated``, default 1.0).
+   ``active_tokens <= mean(active_tokens) * active_tokens_mean_factor`` and
+   ``cpu_hit_blocks <= mean(cpu_hit_blocks) * cpu_hit_blocks_mean_factor``
+   (factors from ``SchedulerConfig.smetric_gated``, default 1.0). ``<=`` so that an idle
+   cluster (every ledger 0, mean 0) still passes the gates instead of relying on the fallback.
 
 All three inputs are ledger fields, so the ranking itself needs no per-request affinity math.
 The KV Conductor is queried once per request only to know what to ADD to the committed
@@ -165,7 +166,7 @@ def pick_gated(
 ) -> tuple[GatedCandidate, str, float, float] | None:
     """
     Walk ``candidates`` (already in ledger prefill_cost order) and return the first one whose
-    ledger is strictly below both scaled averages, plus the pick reason and the two thresholds
+    ledger is at or below both scaled averages, plus the pick reason and the two thresholds
     actually used (``mean * factor``).
 
     Averages are taken over the candidates' current ledgers (``endpoint.workload``), so the
@@ -180,8 +181,9 @@ def pick_gated(
     cpu_threshold = (sum(c.ledger_cpu_hit_blocks for c in candidates) / n) * _factor(cpu_hit_blocks_mean_factor)
     active_only: GatedCandidate | None = None
     for cand in candidates:
-        under_active = cand.ledger_active_tokens < active_threshold
-        under_cpu = cand.ledger_cpu_hit_blocks < cpu_threshold
+        # <= (not <): on an idle cluster every ledger equals the 0 mean and must still pass.
+        under_active = cand.ledger_active_tokens <= active_threshold
+        under_cpu = cand.ledger_cpu_hit_blocks <= cpu_threshold
         if under_active and under_cpu:
             return (cand, PICK_BOTH_GATES, active_threshold, cpu_threshold)
         if under_active and active_only is None:

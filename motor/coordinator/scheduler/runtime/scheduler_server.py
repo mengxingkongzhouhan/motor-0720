@@ -1136,7 +1136,7 @@ class _SchedulerRequestDispatcher:
         smetric_gated arbitration on the authoritative ledger.
 
         Resolve every worker-scored endpoint that is still schedulable, sort by the endpoint's
-        ledger ``prefill_cost`` and take the first one strictly below both ledger averages
+        ledger ``prefill_cost`` and take the first one at or below both scaled ledger averages
         (active_tokens, cpu_hit_blocks); see ``smetric_gated.pick_gated`` for the fallback order.
         The worker-supplied per-endpoint cost / cpu_blocks are only the values stamped on the
         committed ledger. The returned score is the committed endpoint's ledger prefill_cost.

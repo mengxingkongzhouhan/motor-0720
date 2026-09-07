@@ -38,6 +38,7 @@ from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_ROUND_ROBIN,
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
     CANDIDATE_POLICY_SMETRIC,
+    CANDIDATE_POLICY_PREFILL_COST_BALANCE,
     pack_send_frames,
     unpack_recv_payload,
     ZMQMessageSerializer,
@@ -47,6 +48,7 @@ from motor.config.coordinator import (
     KV_AFFINITY_MODE_UNIFIED,
     KV_AFFINITY_MODES,
     KvAffinityConfig,
+    PrefillCostBalanceConfig,
 )
 from motor.coordinator.fault_tolerance.precision.streak_result import (
     PrecisionStreakResult,
@@ -54,6 +56,10 @@ from motor.coordinator.fault_tolerance.precision.streak_result import (
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.kv_cache_affinity import KvCacheAffinityPolicy
+from motor.coordinator.scheduler.policy.prefill_cost_balance import (
+    PREFILL_COST_ROLES,
+    PrefillCostBalancePolicy,
+)
 from motor.coordinator.scheduler.policy.smetric import SMetricPolicy
 from motor.coordinator.domain.workload_calculator import allocated_prefill_cost, calculate_demand_workload
 from motor.coordinator.domain.scheduling_pin import (
@@ -655,6 +661,8 @@ class SchedulerClientConfig:
     endpoint_instance_score_weight: float = 0.05
     # kv_cache_affinity tunables (see SchedulerConfig.kv_affinity).
     kv_affinity: KvAffinityConfig | None = None
+    # prefill_cost_balance tunables (see SchedulerConfig.prefill_cost_balance).
+    prefill_cost_balance: PrefillCostBalanceConfig | None = None
     tls_config: Any | None = None
     on_instance_refreshed: OnInstanceRefreshedCallback | None = None
 
@@ -696,6 +704,8 @@ class AsyncSchedulerClient:
         self._kv_affinity_w_npu = max(0.0, float(affinity.w_npu))
         self._kv_affinity_w_cpu = max(0.0, float(affinity.w_cpu))
         self._kv_affinity_w_disk = max(0.0, float(affinity.w_disk))
+        prefill_cost_balance = config.prefill_cost_balance or PrefillCostBalanceConfig()
+        self._prefill_cost_active_tokens_weight = max(0.0, float(prefill_cost_balance.active_tokens_weight))
 
         self._serializer = ZMQMessageSerializer()
         self._transport = _SchedulerTransport(config.scheduler_address, config.timeout, self._serializer)
@@ -986,7 +996,12 @@ class AsyncSchedulerClient:
                 if normalized_engine_type
                 else set()
             )
-            if candidate_policy == CANDIDATE_POLICY_SMETRIC and isinstance(smetric_debug, dict):
+            # smetric ranks by these costs; prefill_cost_balance (P/U only) forwards them so the
+            # scheduler can stamp the committed endpoint's remaining prefill after its ledger re-rank.
+            forward_all_costs = candidate_policy == CANDIDATE_POLICY_SMETRIC or (
+                candidate_policy == CANDIDATE_POLICY_PREFILL_COST_BALANCE and role in PREFILL_COST_ROLES
+            )
+            if forward_all_costs and isinstance(smetric_debug, dict):
                 candidate_endpoints = [
                     {
                         "instance_id": ins_id,
@@ -1686,6 +1701,15 @@ class AsyncSchedulerClient:
             if candidates:
                 return candidates, CANDIDATE_POLICY_LOAD_BALANCE
             logger.warning("load_balance unavailable, falling back to round-robin")
+        elif st == "prefill_cost_balance":
+            if role in PREFILL_COST_ROLES:
+                # Conductor lookup only feeds the ledger stamp for the committed endpoint; the
+                # ranking below is purely ledger-based, so a miss does not change the candidate.
+                PrefillCostBalancePolicy.collect_request_prefill_costs(instances, req_info)
+            candidates = self._select_endpoint_candidates_by_prefill_cost_balance(instances, top_k)
+            if candidates:
+                return candidates, CANDIDATE_POLICY_PREFILL_COST_BALANCE
+            logger.warning("prefill_cost_balance unavailable, falling back to round-robin")
         elif st == "kv_cache_affinity":
             # Affinity ranking applies to KVA-eligible roles only; others fall through to
             # the load_balance -> round_robin chain below.
@@ -1737,7 +1761,7 @@ class AsyncSchedulerClient:
         if not all_endpoints:
             return None
         st = self._scheduler_type or "round_robin"
-        if st in ("load_balance", "kv_cache_affinity", "smetric"):
+        if st in ("load_balance", "kv_cache_affinity", "smetric", "prefill_cost_balance"):
             ep = LoadBalancePolicy.select_endpoint_from_instance(instance)
             if ep:
                 return (instance, ep)
@@ -1771,3 +1795,19 @@ class AsyncSchedulerClient:
             is_blocked=self.is_instance_blocked,
         )
         return [(candidate.instance, candidate.endpoint, candidate.score) for candidate in candidates]
+
+    def _select_endpoint_candidates_by_prefill_cost_balance(
+        self,
+        instances: list[Instance],
+        top_k: int = 1,
+    ) -> list[tuple[Instance, Endpoint, float]]:
+        """Rank by the cached ledger view: ``prefill_cost + x * active_tokens`` per endpoint."""
+        n = len(instances)
+        start_index = (n * self._client_index) // self._client_count if n else 0
+        return PrefillCostBalancePolicy.select_endpoint_candidates_from_list(
+            instances,
+            top_k=max(1, top_k),
+            active_tokens_weight=self._prefill_cost_active_tokens_weight,
+            start_index=start_index,
+            is_blocked=self.is_instance_blocked,
+        )

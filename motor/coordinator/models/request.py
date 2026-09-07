@@ -70,7 +70,9 @@ class RequestInfo(BaseModel):
         exclude=True,
         description="Per-endpoint prefill_cost cached by the smetric policy at selection; the "
         "worker forwards every scored endpoint cost plus isl so the central Scheduler can "
-        "gate min-cost ranking vs min ledger prefill_cost. Keyed by (instance_id, endpoint_id).",
+        "gate min-cost ranking vs min ledger prefill_cost. prefill_cost_balance reuses the same "
+        "cost model/cache only to stamp the committed endpoint's ledger prefill_cost. "
+        "Keyed by (instance_id, endpoint_id).",
     )
     api: str = Field(..., description="API need to be forwarded")
     entry_api: str = Field(

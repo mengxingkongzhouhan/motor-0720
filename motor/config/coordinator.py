@@ -196,6 +196,7 @@ class SchedulerType(Enum):
     ROUND_ROBIN = "round_robin"
     KV_CACHE_AFFINITY = "kv_cache_affinity"
     SMETRIC = "smetric"
+    PREFILL_COST_BALANCE = "prefill_cost_balance"
 
     @classmethod
     def from_string(cls, value: str) -> Optional["SchedulerType"]:
@@ -368,6 +369,20 @@ class KvAffinityConfig:
 
 
 @dataclass
+class PrefillCostBalanceConfig:
+    """Tunables for ``scheduler_type=prefill_cost_balance``.
+
+    Nested under ``scheduler_config.prefill_cost_balance`` in user JSON. The endpoint score is
+    ``workload.prefill_cost + active_tokens_weight * workload.active_tokens`` (lower is better),
+    both read from the scheduler's committed workload ledger.
+    """
+
+    # Coefficient ``x`` applied to the endpoint's outstanding active_tokens. 0 ranks by remaining
+    # prefill only; larger values shift the balance toward total in-flight tokens.
+    active_tokens_weight: float = 1.0
+
+
+@dataclass
 class SchedulerConfig:
     scheduler_type: SchedulerType = field(default=SchedulerType.LOAD_BALANCE)
     enable_pd_separation_fallback_to_hybrid: bool = True
@@ -376,6 +391,8 @@ class SchedulerConfig:
     endpoint_instance_score_weight: float = 0.05
     # kv_cache_affinity tunables (affinity + load + per-medium weights).
     kv_affinity: KvAffinityConfig = field(default_factory=KvAffinityConfig)
+    # prefill_cost_balance tunables (ledger prefill_cost + x * active_tokens).
+    prefill_cost_balance: PrefillCostBalanceConfig = field(default_factory=PrefillCostBalanceConfig)
     # KV event registration config for kv-conductor.
     kv_conductor_config: KvConductorConfig = field(default_factory=KvConductorConfig)
 
@@ -908,6 +925,11 @@ class CoordinatorConfig:
         )
         if affinity.mode not in KV_AFFINITY_MODES:
             self._errors.append(f"kv_affinity.mode must be one of {KV_AFFINITY_MODES}, got {affinity.mode!r}")
+        self._validate_positive_number(
+            self.scheduler_config.prefill_cost_balance.active_tokens_weight,
+            "prefill_cost_balance.active_tokens_weight",
+            allow_zero=True,
+        )
         if self.context_budget_mode not in CONTEXT_BUDGET_MODES:
             self._errors.append(
                 f"context_budget_mode must be one of {CONTEXT_BUDGET_MODES}, got {self.context_budget_mode!r}"
@@ -1125,6 +1147,8 @@ class CoordinatorConfig:
             f"    ├─ KV Affinity W NPU:          {self.scheduler_config.kv_affinity.w_npu}\n"
             f"    ├─ KV Affinity W CPU:          {self.scheduler_config.kv_affinity.w_cpu}\n"
             f"    ├─ KV Affinity W Disk:         {self.scheduler_config.kv_affinity.w_disk}\n"
+            f"    ├─ Prefill Cost Balance X:     "
+            f"{self.scheduler_config.prefill_cost_balance.active_tokens_weight}\n"
             f"    └─ Context Budget Mode:        {self.context_budget_mode}\n"
             "\n"
             "  Multiprocess (Inference Workers):\n"

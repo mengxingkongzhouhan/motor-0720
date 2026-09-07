@@ -126,6 +126,7 @@ Located in `scheduler/policy/`, each policy implements `BaseSchedulingPolicy`:
 | `LoadBalancePolicy` | Reads workload SHM, picks endpoint with minimum active tokens | Heterogeneous workloads, varying request lengths |
 | `KvCacheAffinityPolicy` | Queries KV Conductor (via `ConductorApiClient`) for prefix match; prefers endpoints with cached blocks | High prefix reuse, PD disaggregation |
 | `SMetricPolicy` | Queries KV Conductor and ranks by remaining prefill cost; the central Scheduler gates request-cost ranking against its shared running average and the scored endpoints' ledgers | Prefill routing driven by uncached prompt cost |
+| `PrefillCostBalancePolicy` | Ledger-only score `workload.prefill_cost + x * workload.active_tokens` (x = `prefill_cost_balance.active_tokens_weight`); Conductor is queried only to stamp the committed request's remaining prefill on the ledger (falls back to full `isl`) | Load balance that weighs outstanding uncached prefill against total in-flight tokens |
 
 **Conductor `/query` wire encoding** (`ConductorApiClient.query_conductor`):
 `kv_conductor_config.query_encoding` (default `"msgpack"`) selects the wire
@@ -137,12 +138,14 @@ kv-conductor binaries.<br>
 
 **Factory registration** (`factory.py`): `SchedulingPolicyFactory` maps policy name → class. New policies register here.
 
-The policy is selected by `SchedulerType` (`config/coordinator.py`): `LOAD_BALANCE` / `ROUND_ROBIN` / `KV_CACHE_AFFINITY` (default) / `SMETRIC`. For `scheduler_type=kv_cache_affinity`, a sub-mode is chosen by `kv_affinity.mode`:
+The policy is selected by `SchedulerType` (`config/coordinator.py`): `LOAD_BALANCE` / `ROUND_ROBIN` / `KV_CACHE_AFFINITY` (default) / `SMETRIC` / `PREFILL_COST_BALANCE`. For `scheduler_type=kv_cache_affinity`, a sub-mode is chosen by `kv_affinity.mode`:
 
 - `unified` (default) — single score fusing affinity and live load; pick the minimum
 - `load_gated` — keep the N least-loaded endpoints, then pick the longest cached prefix
 
 Tunables live under `CoordinatorConfig.scheduler_config.kv_affinity`: `mode`, `load_weight`, `overlap_credit`, `prefill_load_scale`, `load_gate_topn`, `w_npu`, `w_cpu`, `w_disk`.
+
+For `scheduler_type=prefill_cost_balance`, the only tunable is `scheduler_config.prefill_cost_balance.active_tokens_weight` (the `x` in `prefill_cost + x * active_tokens`, default `1.0`; `0` ranks by outstanding remaining prefill alone). Workers rank from their SHM ledger view and the Scheduler re-ranks every endpoint of the role on its authoritative ledger unless the worker view was fresh (fast path).
 
 ### Router Strategies (dynamic, by live topology)
 

@@ -271,7 +271,7 @@ impl IndexerEntry {
     }
 
     pub fn find_matches_by_hash(&self, block_hashes: &[LocalBlockHash]) -> OverlapBlocks {
-        self.find_matches_with_coverage(block_hashes).0
+        self.find_matches_with_coverage(block_hashes, None).0
     }
 
     /// Query with per-DP absolute coverage ends per medium (in blocks).
@@ -279,18 +279,31 @@ impl IndexerEntry {
     /// Matching still records per-worker segment lengths in `OverlapBlocks`
     /// (for diagnostics / unit tests). Response assembly uses `MediumEnds`
     /// absolute ends, then exclusive-partitions them into `*_blocks`.
+    ///
+    /// `query_dps` is the registration pod → DP table (`hbm_ip_index`).
+    /// When it is present and non-empty, only those DPs are scored — store-only
+    /// workers that own pooled edges are not affinity targets. An empty /
+    /// absent set falls back to tree-derived DPs so YuanRong and indexer unit
+    /// tests (no HBM IP index) keep working.
     fn find_matches_with_coverage(
         &self,
         block_hashes: &[LocalBlockHash],
+        query_dps: Option<&FxHashSet<(String, DpRank)>>,
     ) -> (OverlapBlocks, FxHashMap<(String, DpRank), MediumEnds>) {
         let mut overlap = OverlapBlocks::default();
         let mut medium_ends: FxHashMap<(String, DpRank), MediumEnds> = FxHashMap::default();
 
-        // 1) HBM prefix match.
+        let known_dps = self.resolve_query_dps(query_dps);
+
+        // 1) HBM prefix match. Skip workers that are not query targets so a
+        // decode / pool-location HBM hit cannot leak into the response.
         let hbm: FxHashMap<WorkerKey, PrefixMatch> =
             self.hbm_tree.find_matches_detailed(block_hashes);
         for (worker, m) in &hbm {
             if m.depth == 0 {
+                continue;
+            }
+            if !known_dps.contains(&(worker.instance_id.clone(), worker.dp_rank)) {
                 continue;
             }
             overlap.add_blocks(worker.clone(), m.depth);
@@ -307,6 +320,7 @@ impl IndexerEntry {
         let hbm_breaks: Vec<TierBreakpoint> = hbm
             .iter()
             .filter(|(_, m)| m.depth > 0)
+            .filter(|(w, _)| known_dps.contains(&(w.instance_id.clone(), w.dp_rank)))
             .filter_map(|(w, m)| {
                 Some(TierBreakpoint {
                     instance_id: w.instance_id.clone(),
@@ -316,11 +330,6 @@ impl IndexerEntry {
                 })
             })
             .collect();
-
-        // Pooled blocks are reachable from any DP, so a DP holding nothing of
-        // its own can still serve a pooled prefix — every known DP must be
-        // considered on the lower tiers, not just the ones owning edges.
-        let known_dps = self.known_dps();
 
         let mut sink = MatchSink {
             overlap: &mut overlap,
@@ -353,8 +362,22 @@ impl IndexerEntry {
         (overlap, medium_ends)
     }
 
+    /// DPs that `/query` should score on the lower tiers.
+    ///
+    /// Prefer the registration pod → DP table. Fall back to every DP the
+    /// trees have seen when that table is empty (YuanRong, replay, tests).
+    fn resolve_query_dps(
+        &self,
+        query_dps: Option<&FxHashSet<(String, DpRank)>>,
+    ) -> FxHashSet<(String, DpRank)> {
+        match query_dps {
+            Some(dps) if !dps.is_empty() => dps.clone(),
+            _ => self.tree_known_dps(),
+        }
+    }
+
     /// Every `(instance_id, dp_rank)` this index has seen, across all media.
-    fn known_dps(&self) -> FxHashSet<(String, DpRank)> {
+    fn tree_known_dps(&self) -> FxHashSet<(String, DpRank)> {
         let mut dps: FxHashSet<(String, DpRank)> = FxHashSet::default();
         for wk in self.lookups.read().keys() {
             dps.insert((wk.instance_id.clone(), wk.dp_rank));
@@ -1085,6 +1108,18 @@ impl Indexer {
         token_ids: &[i64],
         block_size: u32,
     ) -> Result<QueryResponse, KvConductorError> {
+        self.query_with_dps(model_name, tenant_id, token_ids, block_size, None)
+    }
+
+    /// [`query`] restricted to `query_dps` from the registration pod → DP table.
+    pub fn query_with_dps(
+        &self,
+        model_name: &str,
+        tenant_id: &str,
+        token_ids: &[i64],
+        block_size: u32,
+        query_dps: Option<&FxHashSet<(String, DpRank)>>,
+    ) -> Result<QueryResponse, KvConductorError> {
         let t0 = std::time::Instant::now();
 
         let entry = self
@@ -1097,7 +1132,7 @@ impl Indexer {
         let t_hash = std::time::Instant::now();
         let block_hashes = compute_block_hash_for_seq(token_ids, block_size);
         let hash_us = t_hash.elapsed().as_micros();
-        let (overlap, medium_ends) = entry.find_matches_with_coverage(&block_hashes);
+        let (overlap, medium_ends) = entry.find_matches_with_coverage(&block_hashes, query_dps);
         tracing::debug!(
             num_tokens = token_ids.len(),
             block_size,
@@ -1142,6 +1177,17 @@ impl Indexer {
         tenant_id: &str,
         block_hashes: &[LocalBlockHash],
     ) -> Result<QueryResponse, KvConductorError> {
+        self.query_by_hash_with_dps(model_name, tenant_id, block_hashes, None)
+    }
+
+    /// [`query_by_hash`] restricted to `query_dps` from the registration table.
+    pub fn query_by_hash_with_dps(
+        &self,
+        model_name: &str,
+        tenant_id: &str,
+        block_hashes: &[LocalBlockHash],
+        query_dps: Option<&FxHashSet<(String, DpRank)>>,
+    ) -> Result<QueryResponse, KvConductorError> {
         let entry = self
             .get(model_name, tenant_id)
             .ok_or_else(|| KvConductorError::NoIndexer {
@@ -1149,7 +1195,7 @@ impl Indexer {
                 tenant_id: tenant_id.to_string(),
             })?;
 
-        let (overlap, medium_ends) = entry.find_matches_with_coverage(block_hashes);
+        let (overlap, medium_ends) = entry.find_matches_with_coverage(block_hashes, query_dps);
         // Default to 1 token per hash (no scaling) since we don't know the
         // original block_size from the hash alone.
         self.build_response(&overlap, &medium_ends, model_name, tenant_id, 1)

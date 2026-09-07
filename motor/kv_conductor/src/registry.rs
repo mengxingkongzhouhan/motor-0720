@@ -555,9 +555,20 @@ impl WorkerRegistry {
     }
 
     /// Query KV cache overlap for a token sequence.
+    ///
+    /// Target DPs come from `hbm_ip_index` (the pod → DP table built at
+    /// `/register`). An empty table falls back to tree-derived DPs so
+    /// YuanRong — which does not index HBM IPs — still queries every
+    /// worker the indexer has seen.
     pub async fn query(&self, req: &QueryRequest) -> Result<QueryResponse, KvConductorError> {
-        self.indexer
-            .query(&req.model, &req.tenant_id, &req.token_ids, req.block_size)
+        let query_dps = query_dps_from_hbm_ip_index(&self.hbm_ip_index);
+        self.indexer.query_with_dps(
+            &req.model,
+            &req.tenant_id,
+            &req.token_ids,
+            req.block_size,
+            Some(&query_dps),
+        )
     }
 
     /// Query KV cache overlap using pre-computed block hashes.
@@ -570,8 +581,9 @@ impl WorkerRegistry {
             .iter()
             .map(|&h| LocalBlockHash(h))
             .collect();
+        let query_dps = query_dps_from_hbm_ip_index(&self.hbm_ip_index);
         self.indexer
-            .query_by_hash(&req.model, &req.tenant_id, &hashes)
+            .query_by_hash_with_dps(&req.model, &req.tenant_id, &hashes, Some(&query_dps))
     }
 
     /// Apply a batch of KV cache events (engine-style, HTTP POST /events).
@@ -910,5 +922,100 @@ mod tests {
         eps.insert("disk".to_string(), "tcp://10.244.0.9:15559".to_string());
         add_node_topology_entries(&topo, Some("node-1"), &eps, "vllm-prefill-1", 0);
         assert!(topo.read().is_empty());
+    }
+
+    fn prefill_register(instance_id: &str, npu_url: &str) -> RegisterRequest {
+        RegisterRequest {
+            instance_id: instance_id.into(),
+            medium_endpoints: npu_endpoints(npu_url),
+            endpoint: None,
+            engine_type: "vllm".into(),
+            modelname: "qwen3".into(),
+            block_size: 4,
+            dp_rank: 0,
+            store_backend: "Memcache".into(),
+            replay_endpoint: None,
+            tenant_id: "default".into(),
+            node_id: None,
+        }
+    }
+
+    fn store_on(
+        indexer: &Indexer,
+        instance_id: &str,
+        medium: StorageMedium,
+        tokens_hashes: &[u64],
+    ) {
+        let entry = indexer.get_or_create("qwen3", "default");
+        let worker = WorkerKey {
+            instance_id: instance_id.into(),
+            backend_id: instance_id.into(),
+            dp_rank: 0,
+            medium,
+        };
+        let blocks = tokens_hashes
+            .iter()
+            .enumerate()
+            .map(|(i, &tokens_hash)| KvCacheStoredBlockData {
+                block_hash: 100 + i as u64,
+                tokens_hash,
+            })
+            .collect();
+        entry
+            .apply_event(
+                &worker,
+                &KvCacheEventData::Stored(KvCacheStoreData {
+                    parent_hash: None,
+                    start_position: None,
+                    blocks,
+                }),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_query_targets_dps_from_hbm_ip_index() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(&prefill_register(
+                "vllm-prefill-2",
+                "tcp://10.244.55.60:5557",
+            ))
+            .await
+            .unwrap();
+
+        let tokens: Vec<i64> = (0..12).collect();
+        let hashes: Vec<u64> = crate::hashing::compute_block_hash_for_seq(&tokens, 4)
+            .iter()
+            .map(|h| h.0)
+            .collect();
+        assert_eq!(hashes.len(), 3);
+
+        let indexer = registry.indexer();
+        store_on(indexer, "vllm-prefill-2", StorageMedium::Npu, &hashes[..1]);
+        store_on(indexer, "vllm-decode-1", StorageMedium::Cpu, &hashes);
+
+        let resp = registry
+            .query(&QueryRequest {
+                model: "qwen3".into(),
+                block_size: 4,
+                token_ids: tokens,
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        let tenant = &resp.tenants["default"];
+        assert!(
+            !tenant.contains_key("vllm-decode-1"),
+            "decode-owned CPU edges must not produce a routing instance: {:?}",
+            tenant.keys().collect::<Vec<_>>()
+        );
+        let dp0 = &tenant["vllm-prefill-2"].dp["0"];
+        assert_eq!(dp0.npu_blocks, 1);
+        assert_eq!(
+            dp0.cpu_blocks, 2,
+            "registered prefill still sees the pooled CPU prefix"
+        );
+        assert_eq!(dp0.matched_tokens, 12);
     }
 }

@@ -1040,15 +1040,13 @@ class TestTokenizerManagerDsv4(unittest.TestCase):
 
         gated_req = Mock()
         gated_req.req_data = {"prompt": "hello"}
-        KvCacheAffinityPolicy.select_endpoint_from_list(
-            instances, gated_req, mode="load_gated", load_gate_topn=2
-        )
+        KvCacheAffinityPolicy.select_endpoint_from_list(instances, gated_req, mode="load_gated", load_gate_topn=2)
         self.assertTrue(isinstance(gated_req.kv_affinity_debug, dict))
         self.assertTrue(gated_req.kv_affinity_debug)
         for rec in gated_req.kv_affinity_debug.values():
             self.assertIsNotNone(rec[2])
             self.assertGreaterEqual(rec[2], 0.0)
-        # ep2 matched 800 of isl 1000 with overlap_credit 1.0 → remaining prefill 200.
+        # ep2 matched 800 of isl 1000 with overlap_credit 1.0 -> remaining prefill 200.
         inst = instances[0]
         self.assertEqual(gated_req.kv_affinity_debug[(inst.id, 2)][2], 200.0)
 

@@ -545,9 +545,7 @@ class TestAsyncSchedulerClient:
                 {
                     "instance": instance.model_dump(mode="json"),
                     "endpoint": endpoint.model_dump(mode="json"),
-                    "committed_workload": Workload(active_tokens=20, prefill_cost=20).model_dump(
-                        mode="json"
-                    ),
+                    "committed_workload": Workload(active_tokens=20, prefill_cost=20).model_dump(mode="json"),
                 },
             )
 

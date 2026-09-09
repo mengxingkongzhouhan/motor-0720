@@ -61,9 +61,10 @@ class RequestInfo(BaseModel):
         default=None,
         exclude=True,
         description="Per-endpoint (matched_tokens, load_cost, prefill_cost) cached by the "
-        "kv_cache_affinity policy at selection; the worker forwards prefill_cost for the "
-        "scheduler's global fresh-load re-rank and logs matched/load for the committed endpoint. "
-        "Keyed by (instance_id, endpoint_id) tuples, so excluded from serialization.",
+        "kv_cache_affinity policy at selection; the worker forwards prefill_cost so ALLOCATE can "
+        "stamp the committed endpoint ledger (unified also uses it for global fresh-load re-rank) "
+        "and logs matched/load for the committed endpoint. Keyed by (instance_id, endpoint_id) "
+        "tuples, so excluded from serialization.",
     )
     smetric_debug: dict | None = Field(
         default=None,

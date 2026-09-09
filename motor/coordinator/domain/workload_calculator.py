@@ -133,7 +133,9 @@ def calculate_committed_workload(
     Authoritative compute load after final affinity endpoint selection.
 
     ROLE_P / ROLE_U both commit ``ISL - matched_tokens`` (KV reuse reduces remaining
-    prefill compute). Non-affinity paths pass matched_tokens=0 → commit ISL.
+    prefill compute) onto ``active_tokens`` and ``prefill_cost``. The ALLOCATE overlay may
+    then replace ``prefill_cost`` with the affinity-discounted ranking value when the worker
+    forwarded one. Non-affinity paths pass matched_tokens=0 → commit ISL.
     """
     isl_f = max(0.0, float(isl))
     matched = min(max(0.0, float(matched_tokens)), isl_f)
@@ -144,7 +146,7 @@ def calculate_committed_workload(
         # selection and the scheduler's commit guard); any other role here means a caller
         # bypassed both gates. The returned value is still the effective compute load.
         logger.warning("calculate_committed_workload called for unexpected role %s", role)
-    return Workload(active_tokens=effective)
+    return Workload(active_tokens=effective, prefill_cost=effective)
 
 
 def _calculate_encode_scores(req_info: RequestInfo) -> float:

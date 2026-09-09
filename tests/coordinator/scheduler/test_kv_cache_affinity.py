@@ -1017,6 +1017,41 @@ class TestTokenizerManagerDsv4(unittest.TestCase):
         self.assertIsNotNone(ranked)
         self.assertEqual([ep.id for _inst, ep, _score in ranked], [2, 1])
 
+    @patch('motor.coordinator.scheduler.policy.kv_cache_affinity.ConductorApiClient.query_conductor')
+    @patch('motor.coordinator.scheduler.policy.kv_cache_affinity.TokenizerManager')
+    def test_select_endpoint_stashes_prefill_cost_for_unified_and_load_gated(
+        self, mock_tokenizer_manager, mock_query_conductor
+    ):
+        """Both affinity modes cache numeric prefill_cost so ALLOCATE can stamp the ledger."""
+        instances, conductor = self._three_endpoint_instance()
+        mock_tokenizer = Mock()
+        mock_tokenizer.encode.return_value = list(range(1000))
+        mock_tokenizer_manager.return_value = mock_tokenizer
+        mock_query_conductor.return_value = conductor
+
+        unified_req = Mock()
+        unified_req.req_data = {"prompt": "hello"}
+        KvCacheAffinityPolicy.select_endpoint_from_list(instances, unified_req, mode="unified")
+        self.assertTrue(isinstance(unified_req.kv_affinity_debug, dict))
+        self.assertTrue(unified_req.kv_affinity_debug)
+        for rec in unified_req.kv_affinity_debug.values():
+            self.assertIsNotNone(rec[2])
+            self.assertGreaterEqual(rec[2], 0.0)
+
+        gated_req = Mock()
+        gated_req.req_data = {"prompt": "hello"}
+        KvCacheAffinityPolicy.select_endpoint_from_list(
+            instances, gated_req, mode="load_gated", load_gate_topn=2
+        )
+        self.assertTrue(isinstance(gated_req.kv_affinity_debug, dict))
+        self.assertTrue(gated_req.kv_affinity_debug)
+        for rec in gated_req.kv_affinity_debug.values():
+            self.assertIsNotNone(rec[2])
+            self.assertGreaterEqual(rec[2], 0.0)
+        # ep2 matched 800 of isl 1000 with overlap_credit 1.0 → remaining prefill 200.
+        inst = instances[0]
+        self.assertEqual(gated_req.kv_affinity_debug[(inst.id, 2)][2], 200.0)
+
     @patch('motor.coordinator.scheduler.policy.kv_cache_affinity.TokenizerManager')
     def test_ensure_token_ids_caches_and_reuses(self, mock_tokenizer_manager):
         """_ensure_token_ids tokenizes once, caches on req_info, and reuses on later calls."""

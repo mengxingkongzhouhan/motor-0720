@@ -134,6 +134,7 @@ class TestCalculateDemandWorkload:
         """ROLE_P committed load is ISL - matched_tokens (no overlap credit)."""
         w = calculate_committed_workload(PDRole.ROLE_P, isl=1000, matched_tokens=800)
         assert w.active_tokens == 200.0
+        assert w.prefill_cost == 200.0
 
     def test_committed_union_uses_isl_minus_matched(self):
         """ROLE_U commits the same as ROLE_P: ISL - matched_tokens."""
@@ -143,6 +144,7 @@ class TestCalculateDemandWorkload:
             matched_tokens=800,
         )
         assert w.active_tokens == 200.0
+        assert w.prefill_cost == 200.0
 
     def test_allocated_prefill_cost_prefers_smetric_debug(self):
         req_info = MagicMock()

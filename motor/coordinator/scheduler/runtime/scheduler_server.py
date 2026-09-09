@@ -819,12 +819,9 @@ class _SchedulerRequestDispatcher:
             # Non-affinity path (and non-P/U roles, e.g. pinned decode allocation arriving with
             # the affinity policy attached): commit the worker-computed demand as-is.
             workload = worker_demand
-        # Overlay the worker-reported request cost when present (unified KV affinity ranking
-        # cost, SMetric / smetric_gated). Missing stays at calculate_committed_workload's remaining
-        # prefill (unified KV affinity) or the worker demand's 0 (other policies).
-        looked_up_prefill = self._lookup_candidate_prefill_cost(affinity_candidates, instance.id, endpoint.id)
-        if looked_up_prefill is not None:
-            workload.prefill_cost = looked_up_prefill
+        # Unified KV affinity / SMetric stamp the committed endpoint's prefill_cost from the
+        # worker-reported ranking value; other policies (and missing candidates) leave 0.
+        workload.prefill_cost = self._lookup_candidate_prefill_cost(affinity_candidates, instance.id, endpoint.id)
         # smetric_gated also tracks this request's CPU-tier KV hits on the endpoint (0 elsewhere).
         workload.cpu_hit_blocks = cpu_hit_blocks_map.get((instance.id, endpoint.id), 0.0)
         params = UpdateWorkloadParams(
@@ -1089,14 +1086,14 @@ class _SchedulerRequestDispatcher:
         candidates: list[tuple[int, int, float]] | None,
         instance_id: int,
         endpoint_id: int,
-    ) -> float | None:
-        """Return the committed endpoint's reported prefill_cost, or None when absent."""
+    ) -> float:
+        """Return the committed endpoint's reported prefill_cost, or 0 when absent."""
         if not candidates:
-            return None
+            return 0.0
         for iid, eid, cost in candidates:
             if iid == instance_id and eid == endpoint_id:
                 return max(0.0, float(cost))
-        return None
+        return 0.0
 
     def _select_smetric_hybrid(
         self,

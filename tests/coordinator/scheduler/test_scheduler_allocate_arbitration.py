@@ -827,57 +827,6 @@ async def test_allocate_only_load_gated_prefill_cost_does_not_trigger_global_ran
 
 
 @pytest.mark.asyncio
-async def test_allocate_only_kv_affinity_stamps_remaining_prefill_without_candidate_cost():
-    """Unified KV affinity records ISL-matched remaining prefill when candidates omit prefill_cost."""
-    config = CoordinatorConfig()
-    config.scheduler_config.scheduler_type = SchedulerType.KV_CACHE_AFFINITY
-    config.scheduler_config.endpoint_instance_score_weight = 0.0
-    instance_manager = InstanceManager(config)
-
-    inst = _make_prefill_instance(1, (10, 11))
-    await instance_manager.refresh_instances(EventType.ADD, [inst])
-    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=5))
-
-    scheduler = Scheduler(instance_provider=instance_manager, config=config)
-    workload_writer = _DummyWorkloadWriter()
-    dispatcher = _SchedulerRequestDispatcher(
-        instance_manager,
-        scheduler,
-        config,
-        workload_writer=workload_writer,
-    )
-    request = SchedulerRequest(
-        request_type=SchedulerRequestType.ALLOCATE_ONLY,
-        request_id="alloc-kv-remaining-prefill",
-        data={
-            "instance_id": 1,
-            "endpoint_id": 10,
-            "candidates": [
-                {"instance_id": 1, "endpoint_id": 10, "matched_tokens": 800},
-            ],
-            "role": PDRole.ROLE_P.value,
-            "req_id": "req-kv-remaining-prefill",
-            "workload_sequence": workload_writer.sequence,
-            "instance_version": workload_writer.instance_version,
-            "workload_active_tokens": 3.0,
-            "candidate_policy": CANDIDATE_POLICY_KV_CACHE_AFFINITY,
-            "isl": 1000,
-            "prefill_load_scale": 1.0,
-            "load_weight": 1.0,
-        },
-    )
-
-    response = await dispatcher.dispatch(request)
-
-    assert response.response_type == SchedulerResponseType.SUCCESS
-    assert response.data["instance"]["id"] == 1
-    assert response.data["endpoint"]["id"] == 10
-    _, selected_workload = await instance_manager.get_endpoint_workload(1, 10)
-    assert selected_workload.active_tokens == 205.0
-    assert selected_workload.prefill_cost == 200.0
-
-
-@pytest.mark.asyncio
 async def test_in_process_kv_affinity_stamps_prefill_cost_from_debug_cache():
     """In-process KV affinity ALLOCATE writes kv_affinity_debug prefill_cost onto the ledger."""
     config = CoordinatorConfig()

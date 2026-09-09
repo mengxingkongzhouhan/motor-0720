@@ -16,6 +16,7 @@ from motor.common.resources.instance import PDRole, Instance, InsStatus, Paralle
 from motor.coordinator.domain.workload_calculator import (
     affinity_prefill_cost,
     allocated_prefill_cost,
+    allocated_request_tokens,
     calculate_committed_workload,
     calculate_demand_workload,
 )
@@ -135,6 +136,7 @@ class TestCalculateDemandWorkload:
         w = calculate_committed_workload(PDRole.ROLE_P, isl=1000, matched_tokens=800)
         assert w.active_tokens == 200.0
         assert w.prefill_cost == 0.0
+        assert w.request_tokens == 0.0
 
     def test_committed_union_uses_isl_minus_matched(self):
         """ROLE_U commits the same as ROLE_P: ISL - matched_tokens."""
@@ -159,6 +161,20 @@ class TestCalculateDemandWorkload:
         req_info.smetric_debug = None
         assert affinity_prefill_cost(req_info, 2, 20) == 42
         assert allocated_prefill_cost(req_info, 2, 20) == 42
+
+    def test_allocated_request_tokens_uses_token_ids_length(self):
+        req_info = MagicMock()
+        req_info.token_ids = list(range(64))
+        assert allocated_request_tokens(req_info) == 64.0
+        req_info.token_ids = []
+        assert allocated_request_tokens(req_info) == 0.0
+        assert allocated_request_tokens(None) == 0.0
+
+    def test_workload_iadd_accumulates_request_tokens(self):
+        w = Workload(active_tokens=1, prefill_cost=2, request_tokens=64)
+        w += Workload(active_tokens=1, prefill_cost=1, request_tokens=10)
+        assert (w.active_tokens, w.prefill_cost, w.request_tokens) == (2, 3, 74)
+        assert Workload().request_tokens == 0
 
 
 class TestWorkloadActionHandler:
@@ -338,6 +354,37 @@ class TestWorkloadActionHandler:
 
         assert role == PDRole.ROLE_P
         assert workload_change == Workload(active_tokens=-100, prefill_cost=-12.5)
+        mock_request_manager.del_req_workload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_release_tokens_includes_negative_request_tokens(self, mock_request_manager):
+        """RELEASE_TOKENS returns -request_tokens with the token delta so the ledger can unwind."""
+        instance = Instance(
+            job_name="test",
+            model_name="m",
+            id=1,
+            role=PDRole.ROLE_P,
+            status=InsStatus.ACTIVE,
+            parallel_config=ParallelConfig(dp_size=1),
+        )
+        endpoint = Endpoint(
+            id=1,
+            ip="127.0.0.1",
+            business_port="8080",
+            status=EndpointStatus.NORMAL,
+        )
+        resource = ScheduledResource(instance=instance, endpoint=endpoint)
+        current = Workload(active_tokens=53, prefill_cost=42, request_tokens=64)
+        mock_request_manager.get_req_workload = AsyncMock(return_value=current)
+        handler = WorkloadActionHandler(mock_request_manager)
+        req_info = MagicMock()
+
+        workload_change, role = await handler.compute_and_update(
+            resource, "req-1", WorkloadAction.RELEASE_TOKENS, req_info=req_info
+        )
+
+        assert role == PDRole.ROLE_P
+        assert workload_change == Workload(active_tokens=-53, prefill_cost=-42, request_tokens=-64)
         mock_request_manager.del_req_workload.assert_not_called()
 
     @pytest.mark.asyncio

@@ -114,6 +114,7 @@ class WorkloadActionHandler:
                 active_tokens=-current_workload.active_tokens,
                 prefill_cost=-float(getattr(current_workload, "prefill_cost", 0) or 0),
                 cpu_hit_blocks=-float(getattr(current_workload, "cpu_hit_blocks", 0) or 0),
+                request_tokens=-float(getattr(current_workload, "request_tokens", 0) or 0),
             )
             # Keep the local record until the scheduler ACKs the release (finalize_release).
             # If the RPC fails permanently or the task is cancelled mid-flight, a later

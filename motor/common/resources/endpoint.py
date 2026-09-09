@@ -32,6 +32,11 @@ class Workload(BaseModel):
         description="CPU-tier KV blocks the in-flight requests on this endpoint matched (smetric_gated); "
         "scheduler-ledger only, not carried in the workload SHM",
     )
+    request_tokens: float = Field(
+        default=0,
+        description="Sum of in-flight request ISLs on this endpoint (KV affinity unified); "
+        "scheduler-ledger only, not carried in the workload SHM",
+    )
 
     def __iadd__(self, other):
         if not isinstance(other, Workload):
@@ -40,6 +45,7 @@ class Workload(BaseModel):
         self.active_tokens += other.active_tokens
         self.prefill_cost += other.prefill_cost
         self.cpu_hit_blocks += other.cpu_hit_blocks
+        self.request_tokens += other.request_tokens
 
         return self
 

@@ -765,8 +765,10 @@ async def test_allocate_only_stamps_selected_endpoint_prefill_cost():
     _, selected_workload = await instance_manager.get_endpoint_workload(2, 20)
     assert selected_workload.prefill_cost == 42
     assert selected_workload.active_tokens == 53.0
+    assert selected_workload.request_tokens == 0
     _, other_workload = await instance_manager.get_endpoint_workload(1, 10)
     assert other_workload.prefill_cost == 0
+    assert other_workload.request_tokens == 0
 
 
 @pytest.mark.asyncio
@@ -821,9 +823,11 @@ async def test_allocate_only_load_gated_prefill_cost_does_not_trigger_global_ran
     _, selected_workload = await instance_manager.get_endpoint_workload(2, 20)
     assert selected_workload.active_tokens == 13
     assert selected_workload.prefill_cost == 99
+    assert selected_workload.request_tokens == 0
     _, skipped = await instance_manager.get_endpoint_workload(1, 11)
     assert skipped.active_tokens == 5
     assert skipped.prefill_cost == 0
+    assert skipped.request_tokens == 0
 
 
 @pytest.mark.asyncio
@@ -855,8 +859,233 @@ async def test_in_process_kv_affinity_stamps_prefill_cost_from_debug_cache():
 
     assert result is not None
     assert result[2].prefill_cost == 20.0
+    assert result[2].request_tokens == 100.0
     _, ledger = await instance_manager.get_endpoint_workload(1, 10)
     assert ledger.prefill_cost == 20.0
+    assert ledger.request_tokens == 100.0
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_unified_stamps_inflight_request_tokens():
+    """KV unified ALLOCATE adds this request's ISL onto the endpoint request_tokens ledger."""
+    config = CoordinatorConfig()
+    config.scheduler_config.scheduler_type = SchedulerType.KV_CACHE_AFFINITY
+    config.scheduler_config.endpoint_instance_score_weight = 0.0
+    instance_manager = InstanceManager(config)
+
+    inst_a = _make_prefill_instance(1, (10, 11))
+    inst_b = _make_prefill_instance(2, (20, 21))
+    await instance_manager.refresh_instances(EventType.ADD, [inst_a, inst_b])
+    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=1))
+    await instance_manager.update_instance_workload(1, 11, Workload(active_tokens=1))
+    await instance_manager.update_instance_workload(2, 20, Workload(active_tokens=50))
+    await instance_manager.update_instance_workload(2, 21, Workload(active_tokens=1))
+
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    workload_writer = _DummyWorkloadWriter()
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager,
+        scheduler,
+        config,
+        workload_writer=workload_writer,
+    )
+    request = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-kv-request-tokens",
+        data={
+            "instance_id": 1,
+            "endpoint_id": 10,
+            "candidates": [
+                {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 10000.0, "matched_tokens": 0},
+                {"instance_id": 1, "endpoint_id": 11, "prefill_cost": 10000.0, "matched_tokens": 0},
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 42, "matched_tokens": 11},
+                {"instance_id": 2, "endpoint_id": 21, "prefill_cost": 10000.0, "matched_tokens": 0},
+            ],
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-kv-request-tokens",
+            "workload_sequence": workload_writer.sequence - 2,
+            "instance_version": workload_writer.instance_version,
+            "workload_active_tokens": 3.0,
+            "candidate_policy": CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+            "prefill_load_scale": 1.0,
+            "load_weight": 0.0,
+            "isl": 64,
+        },
+    )
+
+    response = await dispatcher.dispatch(request)
+
+    assert response.response_type == SchedulerResponseType.SUCCESS
+    assert response.data["instance"]["id"] == 2
+    assert response.data["endpoint"]["id"] == 20
+    committed = response.data["committed_workload"]
+    assert committed["request_tokens"] == 64.0
+    assert committed["active_tokens"] == 53.0  # isl 64 - matched 11
+    assert committed["prefill_cost"] == 42
+    _, selected_workload = await instance_manager.get_endpoint_workload(2, 20)
+    # Prior load 50 + remaining compute 53.
+    assert selected_workload.active_tokens == 103.0
+    assert selected_workload.prefill_cost == 42
+    assert selected_workload.request_tokens == 64.0
+    _, other_workload = await instance_manager.get_endpoint_workload(1, 10)
+    assert other_workload.request_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_unified_accumulates_request_tokens():
+    """Two unified ALLOCATEs on the same endpoint add both request ISLs."""
+    config = CoordinatorConfig()
+    config.scheduler_config.scheduler_type = SchedulerType.KV_CACHE_AFFINITY
+    config.scheduler_config.endpoint_instance_score_weight = 0.0
+    instance_manager = InstanceManager(config)
+
+    inst = _make_prefill_instance(1, (10, 11))
+    await instance_manager.refresh_instances(EventType.ADD, [inst])
+
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    workload_writer = _DummyWorkloadWriter()
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager,
+        scheduler,
+        config,
+        workload_writer=workload_writer,
+    )
+
+    async def _allocate(req_id: str, isl: float) -> None:
+        request = SchedulerRequest(
+            request_type=SchedulerRequestType.ALLOCATE_ONLY,
+            request_id=req_id,
+            data={
+                "instance_id": 1,
+                "endpoint_id": 10,
+                "candidates": [
+                    {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 1.0, "matched_tokens": 0},
+                    {"instance_id": 1, "endpoint_id": 11, "prefill_cost": 10000.0, "matched_tokens": 0},
+                ],
+                "role": PDRole.ROLE_P.value,
+                "req_id": req_id,
+                "workload_sequence": workload_writer.sequence - 2,
+                "instance_version": workload_writer.instance_version,
+                "workload_active_tokens": isl,
+                "candidate_policy": CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+                "prefill_load_scale": 1.0,
+                "load_weight": 0.0,
+                "isl": isl,
+            },
+        )
+        response = await dispatcher.dispatch(request)
+        assert response.response_type == SchedulerResponseType.SUCCESS
+        assert response.data["endpoint"]["id"] == 10
+
+    await _allocate("req-isl-64", 64)
+    await _allocate("req-isl-10", 10)
+
+    _, ledger = await instance_manager.get_endpoint_workload(1, 10)
+    assert ledger.request_tokens == 74.0
+    assert ledger.active_tokens == 74.0  # no cache hits, remaining compute == ISL
+
+
+@pytest.mark.asyncio
+async def test_allocate_only_load_gated_with_isl_skips_request_tokens():
+    """load_gated may send isl for remaining-compute commit without the unified length ledger."""
+    config = CoordinatorConfig()
+    config.scheduler_config.scheduler_type = SchedulerType.KV_CACHE_AFFINITY
+    config.scheduler_config.endpoint_instance_score_weight = 0.0
+    instance_manager = InstanceManager(config)
+
+    inst_a = _make_prefill_instance(1, (10, 11))
+    inst_b = _make_prefill_instance(2, (20, 21))
+    await instance_manager.refresh_instances(EventType.ADD, [inst_a, inst_b])
+    await instance_manager.update_instance_workload(1, 10, Workload(active_tokens=20))
+    await instance_manager.update_instance_workload(1, 11, Workload(active_tokens=5))
+    await instance_manager.update_instance_workload(2, 20, Workload(active_tokens=10))
+    await instance_manager.update_instance_workload(2, 21, Workload(active_tokens=40))
+
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    workload_writer = _DummyWorkloadWriter()
+    dispatcher = _SchedulerRequestDispatcher(
+        instance_manager,
+        scheduler,
+        config,
+        workload_writer=workload_writer,
+    )
+    request = SchedulerRequest(
+        request_type=SchedulerRequestType.ALLOCATE_ONLY,
+        request_id="alloc-kv-load-gated-isl",
+        data={
+            "instance_id": 1,
+            "endpoint_id": 10,
+            "candidates": [
+                {"instance_id": 1, "endpoint_id": 10, "prefill_cost": 0.0, "matched_tokens": 0},
+                {"instance_id": 2, "endpoint_id": 20, "prefill_cost": 99, "matched_tokens": 4},
+            ],
+            "role": PDRole.ROLE_P.value,
+            "req_id": "req-kv-load-gated-isl",
+            "workload_sequence": workload_writer.sequence - 2,
+            "instance_version": workload_writer.instance_version,
+            "workload_active_tokens": 3.0,
+            "candidate_policy": CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+            "isl": 64,
+            # No prefill_load_scale: load_gated (least-loaded among proposed).
+        },
+    )
+
+    response = await dispatcher.dispatch(request)
+
+    assert response.response_type == SchedulerResponseType.SUCCESS
+    assert response.data["endpoint"]["id"] == 20
+    _, selected_workload = await instance_manager.get_endpoint_workload(2, 20)
+    assert selected_workload.active_tokens == 70.0  # prior 10 + (64 - 4)
+    assert selected_workload.prefill_cost == 99
+    assert selected_workload.request_tokens == 0
+    assert response.data["committed_workload"]["request_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_in_process_load_gated_does_not_stamp_request_tokens():
+    """In-process load_gated ALLOCATE leaves request_tokens at 0."""
+    config = CoordinatorConfig()
+    config.scheduler_config.scheduler_type = SchedulerType.KV_CACHE_AFFINITY
+    config.scheduler_config.kv_affinity.mode = "load_gated"
+    instance_manager = InstanceManager(config)
+    inst = _make_prefill_instance(1, (10, 11))
+    await instance_manager.refresh_instances(EventType.ADD, [inst])
+    scheduler = Scheduler(instance_provider=instance_manager, config=config)
+    endpoint = next(ep for ep in inst.get_all_endpoints() if ep.id == 10)
+    req_info = SimpleNamespace(
+        req_id="req-kva-load-gated-inprocess",
+        req_data={},
+        req_len=100,
+        token_ids=list(range(100)),
+        smetric_debug=None,
+        smetric_gated_debug=None,
+        kv_affinity_debug={(1, 10): (80, 0.0, None)},
+    )
+
+    with patch.object(
+        KvCacheAffinityPolicy,
+        "select_instance_and_endpoint_from_list",
+        return_value=(inst, endpoint),
+    ):
+        result = await scheduler.select_and_allocate(PDRole.ROLE_P, req_info)
+
+    assert result is not None
+    assert result[2].request_tokens == 0
+    _, ledger = await instance_manager.get_endpoint_workload(1, 10)
+    assert ledger.request_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_instance_manager_floors_negative_request_tokens():
+    """Over-release of request_tokens clamps the endpoint ledger to 0."""
+    config = CoordinatorConfig()
+    instance_manager = InstanceManager(config)
+    inst = _make_prefill_instance(1, (10, 11))
+    await instance_manager.refresh_instances(EventType.ADD, [inst])
+    await instance_manager.update_instance_workload(1, 10, Workload(request_tokens=64))
+    await instance_manager.update_instance_workload(1, 10, Workload(request_tokens=-80))
+    _, ledger = await instance_manager.get_endpoint_workload(1, 10)
+    assert ledger.request_tokens == 0
 
 
 @pytest.mark.asyncio

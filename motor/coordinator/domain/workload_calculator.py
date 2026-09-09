@@ -44,6 +44,20 @@ def allocated_prefill_cost(
     return affinity_prefill_cost(req_info, instance_id, endpoint_id)
 
 
+def allocated_request_tokens(req_info: RequestInfo | None) -> float:
+    """
+    Full prompt ISL of one in-flight request, for the KV unified ``request_tokens`` ledger.
+
+    ``token_ids`` is the request length; missing/empty ids yield 0 (no byte-length heuristic).
+    """
+    if req_info is None:
+        return 0.0
+    token_ids = getattr(req_info, "token_ids", None)
+    if isinstance(token_ids, list) and token_ids:
+        return float(len(token_ids))
+    return 0.0
+
+
 def allocated_cpu_hit_blocks(
     req_info: RequestInfo | None,
     instance_id: int | None = None,
@@ -133,9 +147,10 @@ def calculate_committed_workload(
     Authoritative compute load after final affinity endpoint selection.
 
     ROLE_P / ROLE_U both commit ``ISL - matched_tokens`` onto ``active_tokens`` (KV reuse
-    reduces remaining prefill compute). ``prefill_cost`` is not set here: unified ALLOCATE
-    overlays the affinity-discounted ranking value (``isl - overlap_credit * matched``)
-    from the worker candidate. Non-affinity paths pass matched_tokens=0 → commit ISL.
+    reduces remaining prefill compute). ``prefill_cost`` and ``request_tokens`` are not set
+    here: unified ALLOCATE overlays the affinity-discounted ranking value
+    (``isl - overlap_credit * matched``) and the full request ISL (in-flight length sum)
+    from the worker candidate / ``isl``. Non-affinity paths pass matched_tokens=0 → commit ISL.
     """
     isl_f = max(0.0, float(isl))
     matched = min(max(0.0, float(matched_tokens)), isl_f)

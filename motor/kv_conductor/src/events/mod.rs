@@ -42,6 +42,22 @@ mod helpers;
 pub(crate) mod pool;
 pub(crate) mod vllm;
 
+/// Tracing target for per-event ingest logs (`kv_event received/parsed/...`).
+///
+/// Default `RUST_LOG=info` already hides TRACE/DEBUG. To mute these while
+/// keeping other debug/trace output:
+///
+/// ```text
+/// RUST_LOG=debug,kv_event=off
+/// ```
+///
+/// To enable event tracing without turning on the whole crate:
+///
+/// ```text
+/// RUST_LOG=info,kv_event=trace
+/// ```
+pub(crate) const KV_EVENT_TARGET: &str = "kv_event";
+
 // Re-export key types so callers don't need to reach into sub-modules.
 #[allow(unused_imports)]
 pub(crate) use flex_hash::FlexHash; // used by tests via `use super::*`

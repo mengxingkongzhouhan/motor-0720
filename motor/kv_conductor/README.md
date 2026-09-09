@@ -43,7 +43,28 @@ bash build.sh
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `RUST_LOG` | `info` | 日志级别 |
+| `RUST_LOG` | `info` | 日志级别（Rust `tracing` EnvFilter） |
+
+生产环境保持 `info`（或 `warn`）。`kv_event received` / `parsed` / `event_parsed` 等是每条 KV 事件的 TRACE/DEBUG，事件量大时会刷屏。
+
+```bash
+# 关掉 TRACE/DEBUG（推荐）
+export RUST_LOG=info
+
+# 已开 debug/trace 时，只静音 kv_event 刷屏，保留其它调试日志
+export RUST_LOG=debug,kv_event=off
+
+# 排查事件解析时再打开（不必把整个 crate 打到 debug）
+export RUST_LOG=info,kv_event=trace
+```
+
+K8s Deployment 里改环境变量 `RUST_LOG` 后重启 kv-conductor；或在 `env.json` 写入：
+
+```json
+"motor_kv_conductor_env": {
+  "RUST_LOG": "info"
+}
+```
 
 ### 3. 安装 wheel
 

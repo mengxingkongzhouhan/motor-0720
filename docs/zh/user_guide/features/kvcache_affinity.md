@@ -399,6 +399,20 @@ score = prefill_load_scale × prefill_cost + load_weight × load_cost
 2. 检查 `kv_conductor_config.http_server_port` 是否配置正确且未被占用
 3. 查看 kv-conductor 日志：`kubectl logs <kv-conductor-pod>`
 
+### kv-conductor 日志刷屏（`kv_event received/parsed/...`）
+
+这些是每条 KV 事件的 TRACE/DEBUG，不是错误。用 `RUST_LOG` 控制：
+
+```bash
+# 生产：只保留 info/warn
+export RUST_LOG=info
+
+# 已开 debug/trace 时只关掉事件刷屏
+export RUST_LOG=debug,kv_event=off
+```
+
+K8s 改 Deployment 的 `RUST_LOG` 环境变量，或在 `env.json` 的 `motor_kv_conductor_env` 中设置 `RUST_LOG`，然后重启 kv-conductor。排查解析问题时再用 `RUST_LOG=info,kv_event=trace`。
+
 ### P 实例发布 KV Cache 事件失败
 
 检查 `kv-events-config` 中 `endpoint` 和 `replay_endpoint` 配置是否正确（P 侧绑定），`kv_conductor_config.npu_endpoint` 是否与其一致，以及 **conductor → P** 方向的网络是否可达（conductor 主动 connect P 的事件端口）。

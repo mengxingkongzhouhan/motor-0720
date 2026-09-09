@@ -25,6 +25,7 @@ use crate::protocols::*;
 
 use super::flex_hash::FlexHash;
 use super::helpers::{resolve_medium, resolve_workers};
+use super::KV_EVENT_TARGET;
 
 /// Memcache KvEvent batch — wire format `{"events": [PoolEvent, ...]}`.
 ///
@@ -145,7 +146,8 @@ pub(crate) fn apply_pool_event(
     }
 
     if seq_hashes.is_empty() {
-        tracing::debug!(
+        tracing::trace!(
+            target: KV_EVENT_TARGET,
             event_type,
             backend_id = pool_event.backend_id.as_deref().unwrap_or(backend_id),
             dp_rank = pool_event.dp_rank.unwrap_or(subscriber_dp_rank),
@@ -163,7 +165,8 @@ pub(crate) fn apply_pool_event(
             let blocks = entry.ingest_pool_blocks(&block_hashes, worker);
 
             if blocks.is_empty() {
-                tracing::debug!(
+                tracing::trace!(
+                    target: KV_EVENT_TARGET,
                     model = %mn, tenant = %tid,
                     event_type,
                     total = seq_hashes.len(),
@@ -174,6 +177,7 @@ pub(crate) fn apply_pool_event(
                 );
             } else {
                 tracing::info!(
+                    target: KV_EVENT_TARGET,
                     model = %mn, tenant = %tid,
                     matched = blocks.len(),
                     total = seq_hashes.len(),
@@ -201,7 +205,8 @@ pub(crate) fn apply_pool_event(
             let tree_hashes = entry.evict_pending_blocks(&block_hashes, worker);
 
             if tree_hashes.is_empty() {
-                tracing::debug!(
+                tracing::trace!(
+                    target: KV_EVENT_TARGET,
                     model = %mn, tenant = %tid,
                     event_type,
                     total = seq_hashes.len(),
@@ -210,7 +215,8 @@ pub(crate) fn apply_pool_event(
                     "kv_event dropped"
                 );
             } else {
-                tracing::debug!(
+                tracing::trace!(
+                    target: KV_EVENT_TARGET,
                     model = %mn, tenant = %tid,
                     event_type,
                     tree_blocks = tree_hashes.len(),
@@ -226,7 +232,8 @@ pub(crate) fn apply_pool_event(
                 )?;
             }
         } else {
-            tracing::debug!(
+            tracing::trace!(
+                target: KV_EVENT_TARGET,
                 event_type,
                 model = %mn,
                 backend_id = %be_id,

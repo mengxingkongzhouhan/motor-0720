@@ -311,6 +311,7 @@ fn process_payload(
     // Log the first byte so we can see which msgpack type is arriving.
     let (source, backend) = subscriber_source_backend(backend_id);
     tracing::trace!(
+        target: events::KV_EVENT_TARGET,
         %backend_id, dp_rank,
         source,
         backend,
@@ -334,7 +335,8 @@ fn process_payload(
         // Format 3 — Memcache KvEvent batch: {"events": [PoolEvent, ...]}
         if let Ok(batch) = rmp_serde::from_slice::<events::MemcacheEventBatch>(payload_bytes) {
             *batch_count += 1;
-            tracing::debug!(
+            tracing::trace!(
+                target: events::KV_EVENT_TARGET,
                 %backend_id, dp_rank,
                 num_events = batch.events.len(),
                 event_backend_id = %batch
@@ -349,6 +351,7 @@ fn process_payload(
                 // Log the event's own backend_id (the originating LocalService's
                 // Pod IP) — distinct from the subscriber's `backend_id` context.
                 tracing::trace!(
+                    target: events::KV_EVENT_TARGET,
                     %backend_id, dp_rank,
                     event_backend_id = %zmq_event.backend_id.as_deref().unwrap_or(""),
                     event_type = %zmq_event.event_type.as_deref().unwrap_or("unknown"),
@@ -402,7 +405,8 @@ fn process_payload(
             rmp_serde::from_slice::<(i64, Vec<PoolEvent>, u32)>(payload_bytes)
         {
             *batch_count += 1;
-            tracing::debug!(
+            tracing::trace!(
+                target: events::KV_EVENT_TARGET,
                 %backend_id, dp_rank, bdp,
                 num_events = events_vec.len(),
                 "kv_event parsed backend=mooncake"

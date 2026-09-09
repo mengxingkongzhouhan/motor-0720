@@ -57,7 +57,8 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
+    // Initialize tracing. Default `info` hides TRACE/DEBUG kv_event ingest
+    // spam. Override with RUST_LOG, e.g. `info,kv_event=trace` or `debug,kv_event=off`.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

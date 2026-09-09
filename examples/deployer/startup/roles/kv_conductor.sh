@@ -23,7 +23,10 @@ fi
 echo "Starting KV Conductor on ${KV_CONDUCTOR_HOST}:${KV_CONDUCTOR_PORT}"
 
 # kv-conductor is bundled inside the motor Python package.
-# RUST_LOG can be set via env to control tracing verbosity (default: info).
+# RUST_LOG controls tracing verbosity (default: info). Per-event ingest
+# lines use target `kv_event`; mute them with RUST_LOG=info or
+# RUST_LOG=debug,kv_event=off. See motor/kv_conductor/README.md.
+export RUST_LOG="${RUST_LOG:-info}"
 exec python -m motor.kv_conductor \
     --host "$KV_CONDUCTOR_HOST" \
     --port "$KV_CONDUCTOR_PORT"

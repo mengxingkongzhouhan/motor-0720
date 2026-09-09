@@ -405,18 +405,15 @@ class KvCacheAffinityPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         """
         Cache per-endpoint ``(matched_tokens, load_cost, prefill_cost)`` on ``req_info``.
 
-        Two consumers:
-        * the worker's final allocation log, which reports the KV-affinity prefix hit and load of
-          the endpoint the scheduler actually committed (may differ from the worker's top-1 after
-          the scheduler's fresh-ledger re-pick);
+        Consumers:
+        * the worker's final allocation log (committed endpoint's prefix hit and load);
         * unified-mode :meth:`AsyncSchedulerClient.select_and_allocate`, which forwards every
-          endpoint's affinity-discounted ``prefill_cost`` to the scheduler so it can re-rank all of
-          them by its own fresh load (``prefill_load_scale * prefill_cost + load_weight * load``) --
-          a global selection with no fixed top-k.
+          endpoint's affinity-discounted ``prefill_cost`` so the scheduler can re-rank globally
+          (``prefill_load_scale * prefill_cost + load_weight * load``) and stamp that cost on the
+          committed endpoint's ``Workload`` ledger.
 
-        ``prefill_cost`` is stored only when ``with_prefill`` is set; it is None otherwise (e.g.
-        load_gated, whose hard load bound must not be relaxed into a soft unified score on the
-        scheduler). Best-effort: never fail selection over a debug cache.
+        ``prefill_cost`` is stored only when ``with_prefill`` is set (unified). It is None
+        otherwise (load_gated). Best-effort: never fail selection over a debug cache.
         """
         if req_info is None:
             return

@@ -28,9 +28,10 @@ from motor.coordinator.domain.scheduling_pin import (
 from motor.coordinator.domain.workload_calculator import (
     allocated_cpu_hit_blocks,
     allocated_prefill_cost,
+    allocated_request_tokens,
     calculate_demand_workload,
 )
-from motor.config.coordinator import CoordinatorConfig, SchedulerType
+from motor.config.coordinator import CoordinatorConfig, KV_AFFINITY_MODE_LOAD_GATED, SchedulerType
 from motor.coordinator.domain import InstanceProvider
 from motor.coordinator.models.request import RequestInfo
 
@@ -102,6 +103,15 @@ class Scheduler:
             Current scheduling policy
         """
         return self._scheduling_policy
+
+    def _is_kv_affinity_unified(self) -> bool:
+        """True when this scheduler is KV affinity in unified mode (unknown modes fall through)."""
+        if self._policy_type != SchedulerType.KV_CACHE_AFFINITY:
+            return False
+        if self._config is None:
+            return True
+        mode = str(getattr(self._config.scheduler_config.kv_affinity, "mode", "") or "").lower()
+        return mode != KV_AFFINITY_MODE_LOAD_GATED
 
     async def select_instance_and_endpoint(self, role: PDRole = None):
         """
@@ -190,6 +200,9 @@ class Scheduler:
         workload.prefill_cost = allocated_prefill_cost(req_info, instance.id, endpoint.id)
         # smetric_gated additionally tracks the request's CPU-tier KV hits on the endpoint.
         workload.cpu_hit_blocks = allocated_cpu_hit_blocks(req_info, instance.id, endpoint.id)
+        # KV unified also records this request's full ISL on the endpoint (in-flight length sum).
+        if self._is_kv_affinity_unified() and role in (PDRole.ROLE_P, PDRole.ROLE_U):
+            workload.request_tokens = allocated_request_tokens(req_info)
         params = UpdateWorkloadParams(
             instance_id=instance.id,
             endpoint_id=endpoint.id,

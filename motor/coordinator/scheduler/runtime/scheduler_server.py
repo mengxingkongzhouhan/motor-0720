@@ -819,10 +819,14 @@ class _SchedulerRequestDispatcher:
             # Non-affinity path (and non-P/U roles, e.g. pinned decode allocation arriving with
             # the affinity policy attached): commit the worker-computed demand as-is.
             workload = worker_demand
-        # KV affinity / SMetric stamp the committed endpoint's prefill_cost; other policies leave 0.
+        # Unified KV affinity / SMetric stamp the committed endpoint's prefill_cost from the
+        # worker-reported ranking value; other policies (and missing candidates) leave 0.
         workload.prefill_cost = self._lookup_candidate_prefill_cost(affinity_candidates, instance.id, endpoint.id)
         # smetric_gated also tracks this request's CPU-tier KV hits on the endpoint (0 elsewhere).
         workload.cpu_hit_blocks = cpu_hit_blocks_map.get((instance.id, endpoint.id), 0.0)
+        # KV unified records this request's full ISL so the endpoint ledger can sum in-flight
+        # request lengths. Remaining compute stays on active_tokens (isl - matched).
+        workload.request_tokens = self._allocated_request_tokens(candidate_policy, role, isl, worker_prefill_load_scale)
         params = UpdateWorkloadParams(
             instance_id=instance.id,
             endpoint_id=endpoint.id,
@@ -888,6 +892,23 @@ class _SchedulerRequestDispatcher:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _allocated_request_tokens(
+        candidate_policy,
+        role: PDRole,
+        isl: float | None,
+        prefill_load_scale: float | None,
+    ) -> float:
+        """Full request ISL for the KV unified in-flight length ledger; 0 otherwise."""
+        if (
+            candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY
+            and prefill_load_scale is not None
+            and isl is not None
+            and role in (PDRole.ROLE_P, PDRole.ROLE_U)
+        ):
+            return max(0.0, float(isl))
+        return 0.0
 
     @staticmethod
     def _extract_affinity_candidates(data: dict) -> list[tuple[int, int, float]]:
@@ -1086,7 +1107,7 @@ class _SchedulerRequestDispatcher:
         instance_id: int,
         endpoint_id: int,
     ) -> float:
-        """Return the committed endpoint's prefill_cost, or 0 when absent."""
+        """Return the committed endpoint's reported prefill_cost, or 0 when absent."""
         if not candidates:
             return 0.0
         for iid, eid, cost in candidates:

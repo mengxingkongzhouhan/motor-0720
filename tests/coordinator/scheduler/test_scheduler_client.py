@@ -498,7 +498,9 @@ class TestAsyncSchedulerClient:
             {
                 "instance": instance.model_dump(mode="json"),
                 "endpoint": endpoint.model_dump(mode="json"),
-                "committed_workload": Workload(active_tokens=20, prefill_cost=7).model_dump(mode="json"),
+                "committed_workload": Workload(active_tokens=20, prefill_cost=7, request_tokens=100).model_dump(
+                    mode="json"
+                ),
             },
         )
 
@@ -511,6 +513,7 @@ class TestAsyncSchedulerClient:
 
         assert result is not None
         assert result[2].prefill_cost == 7
+        assert result[2].request_tokens == 100
 
     @pytest.mark.asyncio
     async def test_select_and_allocate_no_selection(self):

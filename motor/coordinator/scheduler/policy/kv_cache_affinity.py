@@ -400,6 +400,7 @@ class KvCacheAffinityPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
     def _stash_affinity_debug(
         req_info: RequestInfo | None,
         raw: list[tuple[float, int, float, Instance, Endpoint]],
+        with_prefill: bool = False,
     ) -> None:
         """
         Cache per-endpoint ``(matched_tokens, load_cost, prefill_cost)`` on ``req_info``.
@@ -408,18 +409,17 @@ class KvCacheAffinityPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
         * the worker's final allocation log (committed endpoint's prefix hit and load);
         * unified-mode :meth:`AsyncSchedulerClient.select_and_allocate`, which forwards every
           endpoint's affinity-discounted ``prefill_cost`` so the scheduler can re-rank globally
-          (``prefill_load_scale * prefill_cost + load_weight * load``);
-        * both affinity modes, which also forward ``prefill_cost`` so ALLOCATE can stamp it on
-          the committed endpoint's ``Workload`` ledger. load_gated does not send the unified
-          scalars, so this does not relax its hard load bound into a global re-rank.
+          (``prefill_load_scale * prefill_cost + load_weight * load``) and stamp that cost on the
+          committed endpoint's ``Workload`` ledger.
 
-        Best-effort: never fail selection over a debug cache.
+        ``prefill_cost`` is stored only when ``with_prefill`` is set (unified). It is None
+        otherwise (load_gated). Best-effort: never fail selection over a debug cache.
         """
         if req_info is None:
             return
         try:
             req_info.kv_affinity_debug = {
-                (instance.id, ep.id): (matched_tokens, load_cost, prefill_cost)
+                (instance.id, ep.id): (matched_tokens, load_cost, prefill_cost if with_prefill else None)
                 for (load_cost, matched_tokens, prefill_cost, instance, ep) in raw
             }
         except Exception as e:  # pragma: no cover - req_info may be immutable in some callers
@@ -484,7 +484,7 @@ class KvCacheAffinityPolicy(WorkloadLedgerMixin, BaseSchedulingPolicy):
             len(ranked),
             len(candidates),
         )
-        KvCacheAffinityPolicy._stash_affinity_debug(req_info, raw)
+        KvCacheAffinityPolicy._stash_affinity_debug(req_info, raw, with_prefill=True)
         return [(inst, ep, score) for (score, inst, ep, _matched) in ranked]
 
     @staticmethod

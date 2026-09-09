@@ -828,7 +828,7 @@ async def test_allocate_only_load_gated_prefill_cost_does_not_trigger_global_ran
 
 @pytest.mark.asyncio
 async def test_allocate_only_kv_affinity_stamps_remaining_prefill_without_candidate_cost():
-    """KV affinity still records ISL-matched remaining prefill when candidates omit prefill_cost."""
+    """Unified KV affinity records ISL-matched remaining prefill when candidates omit prefill_cost."""
     config = CoordinatorConfig()
     config.scheduler_config.scheduler_type = SchedulerType.KV_CACHE_AFFINITY
     config.scheduler_config.endpoint_instance_score_weight = 0.0
@@ -862,6 +862,8 @@ async def test_allocate_only_kv_affinity_stamps_remaining_prefill_without_candid
             "workload_active_tokens": 3.0,
             "candidate_policy": CANDIDATE_POLICY_KV_CACHE_AFFINITY,
             "isl": 1000,
+            "prefill_load_scale": 1.0,
+            "load_weight": 1.0,
         },
     )
 

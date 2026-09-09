@@ -17,7 +17,6 @@ import pytest
 
 from motor.common.resources.instance import Instance, PDRole
 from motor.common.resources.endpoint import Endpoint, Workload, WorkloadAction, EndpointStatus
-from motor.config.coordinator import KV_AFFINITY_MODE_LOAD_GATED
 from motor.coordinator.domain import InstanceReadiness, UpdateWorkloadParams
 from motor.coordinator.models.request import RequestInfo
 from motor.coordinator.scheduler.runtime.zmq_protocol import (
@@ -512,64 +511,6 @@ class TestAsyncSchedulerClient:
 
         assert result is not None
         assert result[2].prefill_cost == 7
-
-    @pytest.mark.asyncio
-    async def test_select_and_allocate_load_gated_forwards_prefill_cost_without_unified_scalars(self):
-        """load_gated sends prefill_cost for ledger stamp without unified global-rank scalars."""
-        endpoint = _make_endpoint(endpoint_id=10)
-        other = _make_endpoint(endpoint_id=11)
-        instance = _make_instance(
-            instance_id=1,
-            role="prefill",
-            endpoints={"pod1": {endpoint.id: endpoint, other.id: other}},
-        )
-        self.client._scheduler_type = "kv_cache_affinity"
-        self.client._kv_affinity_mode = KV_AFFINITY_MODE_LOAD_GATED
-        req_info = Mock(spec=RequestInfo)
-        req_info.req_id = "req-load-gated-cost"
-        req_info.req_len = 100
-        req_info.req_data = {}
-        req_info.token_ids = list(range(100))
-        req_info.smetric_debug = None
-        req_info.smetric_gated_debug = None
-        req_info.kv_affinity_debug = {
-            (1, 10): (80, 5.0, 20.0),
-            (1, 11): (10, 1.0, 90.0),
-        }
-        captured: dict = {}
-
-        async def fake_send(request):
-            captured["data"] = request.data
-            return _build_mock_scheduler_response(
-                SchedulerResponseType.SUCCESS,
-                {
-                    "instance": instance.model_dump(mode="json"),
-                    "endpoint": endpoint.model_dump(mode="json"),
-                    "committed_workload": Workload(active_tokens=20, prefill_cost=20).model_dump(mode="json"),
-                },
-            )
-
-        self.client._transport.send_request = fake_send
-        with patch.object(
-            self.client,
-            "_select_endpoint_candidates_with_policy",
-            return_value=(
-                [(instance, endpoint, 5.0), (instance, other, 1.0)],
-                "kv_cache_affinity",
-            ),
-        ):
-            result = await self.client.select_and_allocate(PDRole.ROLE_P, req_info)
-
-        assert result is not None
-        data = captured["data"]
-        assert data["candidate_policy"] == "kv_cache_affinity"
-        assert "prefill_load_scale" not in data
-        assert "load_weight" not in data
-        by_ep = {(item["instance_id"], item["endpoint_id"]): item for item in data["candidates"]}
-        assert by_ep[(1, 10)]["prefill_cost"] == 20.0
-        assert by_ep[(1, 10)]["matched_tokens"] == 80
-        assert by_ep[(1, 11)]["prefill_cost"] == 90.0
-        assert by_ep[(1, 11)]["matched_tokens"] == 10
 
     @pytest.mark.asyncio
     async def test_select_and_allocate_no_selection(self):

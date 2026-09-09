@@ -819,9 +819,9 @@ class _SchedulerRequestDispatcher:
             # Non-affinity path (and non-P/U roles, e.g. pinned decode allocation arriving with
             # the affinity policy attached): commit the worker-computed demand as-is.
             workload = worker_demand
-        # Overlay the worker-reported request cost when present (KV affinity ranking cost,
-        # SMetric / smetric_gated). Missing stays at calculate_committed_workload's remaining
-        # prefill (KV affinity) or the worker demand's 0 (other policies).
+        # Overlay the worker-reported request cost when present (unified KV affinity ranking
+        # cost, SMetric / smetric_gated). Missing stays at calculate_committed_workload's remaining
+        # prefill (unified KV affinity) or the worker demand's 0 (other policies).
         looked_up_prefill = self._lookup_candidate_prefill_cost(affinity_candidates, instance.id, endpoint.id)
         if looked_up_prefill is not None:
             workload.prefill_cost = looked_up_prefill

@@ -58,13 +58,21 @@ export RUST_LOG=debug,kv_event=off
 export RUST_LOG=info,kv_event=trace
 ```
 
-K8s Deployment 里改环境变量 `RUST_LOG` 后重启 kv-conductor；或在 `env.json` 写入：
+K8s 里 **只改 Deployment 的 `RUST_LOG` 经常不生效**：启动脚本会先执行 ConfigMap 注入的 `set_kv_conductor_env`，它把 `env.json` 的 `motor_common_env` / `motor_kv_conductor_env` export 进去，可能把 Pod spec 里的 `info` 盖成 `debug`/`trace`。改完后必须删 Pod 重建，并用下面命令确认进程里的值：
+
+```bash
+kubectl exec -n <ns> <kv-conductor-pod> -- printenv RUST_LOG
+```
+
+应输出 `info`。若仍是 `trace`/`debug`，在 `env.json` 里显式写上（deploy 会注入 ConfigMap）：
 
 ```json
 "motor_kv_conductor_env": {
   "RUST_LOG": "info"
 }
 ```
+
+启动后第一条 `KV conductor starting on ... rust_log=...` 会打印实际生效的 filter。`POST /register` 的 `INFO register request` / `HBM IP indexed` / `ZMQ subscriber connected` 是 info 级，关它们需 `RUST_LOG=warn`。HTTP `DEBUG request` / `TRACE connection` 来自 hyper/tower-http，二进制会把这两个 crate 压到 info，不再跟 `RUST_LOG=trace` 一起刷屏。
 
 ### 3. 安装 wheel
 

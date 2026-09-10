@@ -30,7 +30,6 @@ use axum::{
     Json, Router,
 };
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::trace::TraceLayer;
 
 /// Maximum request body size (64 MB). Large queries (402400+ token IDs)
 /// exceed axum's default 2 MB limit.
@@ -66,10 +65,11 @@ pub fn create_router(state: AppState) -> Router {
     // IDs (~2.4 MB JSON body), beyond axum's 2 MB default.
     router = router.layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES));
 
-    router
-        .layer(TraceLayer::new_for_http())
-        .layer(cors)
-        .with_state(state)
+    // Do not attach TraceLayer: it logs every POST /register and hyper
+    // connection at DEBUG/TRACE, which floods conductor stdout even when
+    // operators set RUST_LOG=info but a ConfigMap later overrides it to
+    // debug/trace. Register/query already emit their own info logs.
+    router.layer(cors).with_state(state)
 }
 
 // ---------------------------------------------------------------------------

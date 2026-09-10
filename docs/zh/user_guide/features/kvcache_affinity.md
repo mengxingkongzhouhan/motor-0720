@@ -411,7 +411,15 @@ export RUST_LOG=info
 export RUST_LOG=debug,kv_event=off
 ```
 
-K8s 改 Deployment 的 `RUST_LOG` 环境变量，或在 `env.json` 的 `motor_kv_conductor_env` 中设置 `RUST_LOG`，然后重启 kv-conductor。排查解析问题时再用 `RUST_LOG=info,kv_event=trace`。
+K8s 改完必须 **删 Pod 重建**。只改 Deployment 经常被 ConfigMap 里 `set_kv_conductor_env` 覆盖。进容器确认：
+
+```bash
+kubectl exec -n <ns> <kv-conductor-pod> -- printenv RUST_LOG
+```
+
+应为 `info`。若是 `trace`/`debug`，在 `env.json` 的 `motor_kv_conductor_env` 里同样写成 `"RUST_LOG": "info"` 再 deploy。
+
+`INFO register request` / `ZMQ subscriber connected` 是 info 级正常日志，要关掉用 `RUST_LOG=warn`。`DEBUG request` / `TRACE connection` 是 HTTP 访问日志，不是 kv_event。
 
 ### P 实例发布 KV Cache 事件失败
 

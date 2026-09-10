@@ -9,6 +9,12 @@
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
 
+# Capture Deployment env before ConfigMap injection. `set_kv_conductor_env`
+# copies motor_common_env / motor_kv_conductor_env and can overwrite RUST_LOG
+# (e.g. leftover RUST_LOG=trace), which is why setting it only on the Pod spec
+# often has no effect.
+KV_CONDUCTOR_CONTAINER_RUST_LOG="${RUST_LOG:-}"
+
 set_kv_conductor_env
 
 KV_CONDUCTOR_PORT=${KV_CONDUCTOR_PORT:-13333}
@@ -23,7 +29,14 @@ fi
 echo "Starting KV Conductor on ${KV_CONDUCTOR_HOST}:${KV_CONDUCTOR_PORT}"
 
 # kv-conductor is bundled inside the motor Python package.
-# RUST_LOG can be set via env to control tracing verbosity (default: info).
+# Precedence: KV_CONDUCTOR_RUST_LOG > Deployment RUST_LOG > env.json > info.
+if [ -n "${KV_CONDUCTOR_RUST_LOG:-}" ]; then
+    export RUST_LOG="$KV_CONDUCTOR_RUST_LOG"
+elif [ -n "${KV_CONDUCTOR_CONTAINER_RUST_LOG}" ]; then
+    export RUST_LOG="$KV_CONDUCTOR_CONTAINER_RUST_LOG"
+else
+    export RUST_LOG="${RUST_LOG:-info}"
+fi
 exec python -m motor.kv_conductor \
     --host "$KV_CONDUCTOR_HOST" \
     --port "$KV_CONDUCTOR_PORT"

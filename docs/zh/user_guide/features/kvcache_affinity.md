@@ -399,6 +399,28 @@ score = prefill_load_scale × prefill_cost + load_weight × load_cost
 2. 检查 `kv_conductor_config.http_server_port` 是否配置正确且未被占用
 3. 查看 kv-conductor 日志：`kubectl logs <kv-conductor-pod>`
 
+### kv-conductor 日志刷屏（`kv_event received/parsed/...`）
+
+这些是每条 KV 事件的 TRACE/DEBUG，不是错误。用 `RUST_LOG` 控制：
+
+```bash
+# 生产：只保留 info/warn
+export RUST_LOG=info
+
+# 已开 debug/trace 时只关掉事件刷屏
+export RUST_LOG=debug,kv_event=off
+```
+
+K8s 改完必须 **删 Pod 重建**。只改 Deployment 经常被 ConfigMap 里 `set_kv_conductor_env` 覆盖。进容器确认：
+
+```bash
+kubectl exec -n <ns> <kv-conductor-pod> -- printenv RUST_LOG
+```
+
+应为 `info`。若是 `trace`/`debug`，在 `env.json` 的 `motor_kv_conductor_env` 里同样写成 `"RUST_LOG": "info"` 再 deploy。
+
+`INFO register request` / `ZMQ subscriber connected` 是 info 级正常日志，要关掉用 `RUST_LOG=warn`。`DEBUG request` / `TRACE connection` 是 HTTP 访问日志，不是 kv_event。
+
 ### P 实例发布 KV Cache 事件失败
 
 检查 `kv-events-config` 中 `endpoint` 和 `replay_endpoint` 配置是否正确（P 侧绑定），`kv_conductor_config.npu_endpoint` 是否与其一致，以及 **conductor → P** 方向的网络是否可达（conductor 主动 connect P 的事件端口）。

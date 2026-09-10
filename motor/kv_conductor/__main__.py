@@ -29,6 +29,9 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+    # Default matches the Rust binary (EnvFilter "info"). TRACE/DEBUG
+    # kv_event ingest lines only appear when RUST_LOG enables them.
+    os.environ.setdefault("RUST_LOG", "info")
     # execvp replaces the Python process with the conductor binary
     os.execvp(str(binary), [str(binary)] + sys.argv[1:])
 

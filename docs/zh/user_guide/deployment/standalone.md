@@ -163,7 +163,7 @@ curl http://127.0.0.1:1025/v1/completions \
 ```bash
 source /opt/motor-coord/venv/bin/activate
 python3 -c "from motor.kv_conductor import get_binary_path; p=get_binary_path(); print(p); assert p and p.is_file()"
-export RUST_LOG=info,kv_conductor=debug
+export RUST_LOG=info
 export MOTOR_LOG_PATH=/opt/motor-coord/logs
 nohup python3 -m motor.kv_conductor --host 0.0.0.0 --port 13333 &
 ```

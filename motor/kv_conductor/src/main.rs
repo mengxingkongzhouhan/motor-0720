@@ -57,11 +57,11 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
+    // Initialize tracing. Default `info` hides TRACE/DEBUG kv_event ingest
+    // spam. HTTP access/connection traces from hyper/tower-http are always
+    // capped at info unless the operator names those targets in RUST_LOG.
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(build_env_filter())
         .with_target(false)
         .with_timer(OffsetTime::new(
             time::UtcOffset::from_hms(8, 0, 0).expect("invalid UTC+8 offset"),
@@ -98,7 +98,11 @@ async fn main() {
     let state = AppState { registry };
     let router = create_router(state);
 
-    tracing::info!("KV conductor starting on {}", addr);
+    tracing::info!(
+        rust_log = %std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+        "KV conductor starting on {}",
+        addr
+    );
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -110,6 +114,30 @@ async fn main() {
         .expect("server error");
 
     tracing::info!("KV conductor shut down");
+}
+
+/// Build the tracing filter from `RUST_LOG`, defaulting to `info`.
+///
+/// Caps `hyper` / `tower_http` at info unless the operator names them, so
+/// leftover `RUST_LOG=trace` (ConfigMap overwriting the Pod spec) does not
+/// flood stdout with `TRACE connection accepted/closed` and `DEBUG request`.
+fn build_env_filter() -> EnvFilter {
+    let mut spec = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+    let lowered = spec.to_ascii_lowercase();
+    if !directive_mentions(&lowered, "tower_http") {
+        spec.push_str(",tower_http=info");
+    }
+    if !directive_mentions(&lowered, "hyper") {
+        spec.push_str(",hyper=info");
+    }
+    EnvFilter::try_new(&spec).unwrap_or_else(|_| EnvFilter::new("info"))
+}
+
+fn directive_mentions(spec: &str, crate_name: &str) -> bool {
+    spec.split(',').any(|directive| {
+        let name = directive.split('=').next().unwrap_or("").trim();
+        name == crate_name || name.starts_with(&format!("{crate_name}::"))
+    })
 }
 
 async fn shutdown_signal() {

@@ -32,6 +32,7 @@ use crate::protocols::*;
 
 use super::flex_hash::FlexHash;
 use super::helpers::{resolve_medium, resolve_workers};
+use super::KV_EVENT_TARGET;
 
 // ---------------------------------------------------------------------------
 // vLLM-native event types (msgspec KVEventBatch wire format)
@@ -437,6 +438,7 @@ pub(crate) enum VllmEvent {
 impl VllmEventMap {
     pub(super) fn normalize(&self) -> VllmEvent {
         tracing::trace!(
+            target: KV_EVENT_TARGET,
             event_type = %self.event_type,
             num_block_hashes = self.block_hashes.as_ref().map(|v| v.len()).unwrap_or(0),
             num_token_ids = self.token_ids.as_ref().map(|v| v.len()).unwrap_or(0),
@@ -451,6 +453,7 @@ impl VllmEventMap {
 
         if !is_cleared && !is_main_attention_kind(self.kv_cache_spec_kind.as_deref()) {
             tracing::trace!(
+                target: KV_EVENT_TARGET,
                 spec_kind = %self.kv_cache_spec_kind.as_deref().unwrap_or("-"),
                 reason = "non_main_attention",
                 "kv_event dropped"
@@ -522,7 +525,8 @@ pub(crate) fn parse_vllm_batch(payload: &[u8]) -> Option<(Vec<VllmEvent>, u32)> 
     {
         Ok((_ts, events, dp_rank)) => {
             let parsed: Vec<VllmEvent> = events.iter().map(|e| e.normalize()).collect();
-            tracing::debug!(
+            tracing::trace!(
+                target: KV_EVENT_TARGET,
                 num_events = parsed.len(),
                 dp_rank = dp_rank.unwrap_or(0),
                 layout = "events,dp_rank",
@@ -531,7 +535,7 @@ pub(crate) fn parse_vllm_batch(payload: &[u8]) -> Option<(Vec<VllmEvent>, u32)> 
             return Some((parsed, dp_rank.unwrap_or(0) as u32));
         }
         Err(e) => {
-            tracing::trace!(error = %e, layout = "events,dp_rank", "kv_event parse_failed backend=vllm")
+            tracing::trace!(target: KV_EVENT_TARGET, error = %e, layout = "events,dp_rank", "kv_event parse_failed backend=vllm")
         }
     }
     // Format B: [ts, dp_rank: int|null, events: [...]]
@@ -539,7 +543,8 @@ pub(crate) fn parse_vllm_batch(payload: &[u8]) -> Option<(Vec<VllmEvent>, u32)> 
     {
         Ok((_ts, dp_rank, events)) => {
             let parsed: Vec<VllmEvent> = events.iter().map(|e| e.normalize()).collect();
-            tracing::debug!(
+            tracing::trace!(
+                target: KV_EVENT_TARGET,
                 num_events = parsed.len(),
                 dp_rank = dp_rank.unwrap_or(0),
                 layout = "dp_rank,events",
@@ -548,7 +553,7 @@ pub(crate) fn parse_vllm_batch(payload: &[u8]) -> Option<(Vec<VllmEvent>, u32)> 
             return Some((parsed, dp_rank.unwrap_or(0) as u32));
         }
         Err(e) => {
-            tracing::trace!(error = %e, layout = "dp_rank,events", "kv_event parse_failed backend=vllm")
+            tracing::trace!(target: KV_EVENT_TARGET, error = %e, layout = "dp_rank,events", "kv_event parse_failed backend=vllm")
         }
     }
     None
@@ -602,6 +607,7 @@ pub(crate) fn apply_vllm_event(
         } => {
             if *block_size != 0 && *block_size != registered_block_size {
                 tracing::trace!(
+                    target: KV_EVENT_TARGET,
                     %backend_id, dp = subscriber_dp_rank,
                     block_size,
                     registered = registered_block_size,
@@ -648,6 +654,7 @@ pub(crate) fn apply_vllm_event(
 
                 let preview_hashes: Vec<u64> = triples.iter().take(4).map(|p| p.0).collect();
                 tracing::trace!(
+                    target: KV_EVENT_TARGET,
                     model = %model_name, tenant = %tenant_id,
                     num = triples.len(),
                     ?preview_hashes,
@@ -660,6 +667,7 @@ pub(crate) fn apply_vllm_event(
 
                 if !matched.is_empty() {
                     tracing::info!(
+                        target: KV_EVENT_TARGET,
                         model = %model_name, tenant = %tenant_id,
                         num_blocks = total_matched,
                         num_workers = matched.len(),
@@ -684,7 +692,8 @@ pub(crate) fn apply_vllm_event(
 
                 let cached = num.saturating_sub(total_matched);
                 if cached > 0 {
-                    tracing::debug!(
+                    tracing::trace!(
+                        target: KV_EVENT_TARGET,
                         model = %model_name, tenant = %tenant_id,
                         num_blocks = cached,
                         medium = %StorageMedium::parse(event_medium).log_str(),
@@ -693,6 +702,7 @@ pub(crate) fn apply_vllm_event(
                 }
             } else {
                 tracing::trace!(
+                    target: KV_EVENT_TARGET,
                     model = %model_name, tenant = %tenant_id,
                     num_blocks = num,
                     medium = %StorageMedium::parse(event_medium).log_str(),

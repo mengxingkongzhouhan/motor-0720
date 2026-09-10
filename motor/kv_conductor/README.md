@@ -43,7 +43,36 @@ bash build.sh
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `RUST_LOG` | `info` | 日志级别 |
+| `RUST_LOG` | `info` | 日志级别（Rust `tracing` EnvFilter） |
+
+生产环境保持 `info`（或 `warn`）。`kv_event received` / `parsed` / `event_parsed` 等是每条 KV 事件的 TRACE/DEBUG，事件量大时会刷屏。
+
+```bash
+# 关掉 TRACE/DEBUG（推荐）
+export RUST_LOG=info
+
+# 已开 debug/trace 时，只静音 kv_event 刷屏，保留其它调试日志
+export RUST_LOG=debug,kv_event=off
+
+# 排查事件解析时再打开（不必把整个 crate 打到 debug）
+export RUST_LOG=info,kv_event=trace
+```
+
+K8s 里 **只改 Deployment 的 `RUST_LOG` 经常不生效**：启动脚本会先执行 ConfigMap 注入的 `set_kv_conductor_env`，它把 `env.json` 的 `motor_common_env` / `motor_kv_conductor_env` export 进去，可能把 Pod spec 里的 `info` 盖成 `debug`/`trace`。改完后必须删 Pod 重建，并用下面命令确认进程里的值：
+
+```bash
+kubectl exec -n <ns> <kv-conductor-pod> -- printenv RUST_LOG
+```
+
+应输出 `info`。若仍是 `trace`/`debug`，在 `env.json` 里显式写上（deploy 会注入 ConfigMap）：
+
+```json
+"motor_kv_conductor_env": {
+  "RUST_LOG": "info"
+}
+```
+
+启动后第一条 `KV conductor starting on ... rust_log=...` 会打印实际生效的 filter。`POST /register` 的 `INFO register request` / `HBM IP indexed` / `ZMQ subscriber connected` 是 info 级，关它们需 `RUST_LOG=warn`。HTTP `DEBUG request` / `TRACE connection` 来自 hyper/tower-http，二进制会把这两个 crate 压到 info，不再跟 `RUST_LOG=trace` 一起刷屏。
 
 ### 3. 安装 wheel
 

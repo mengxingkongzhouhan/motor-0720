@@ -726,6 +726,7 @@ impl IndexerEntry {
         let expired_pending = before_pending - state.pending_pool.len();
         if expired_pending > 0 {
             tracing::debug!(
+                target: "kv_event",
                 expired = expired_pending,
                 pending_ttl_secs = pending_ttl.as_secs(),
                 "kv_event pending_expired"

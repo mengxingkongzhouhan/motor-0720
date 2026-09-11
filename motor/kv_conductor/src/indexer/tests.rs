@@ -726,12 +726,22 @@ fn broadcast_to_pod(
     }
 }
 
+/// Indexer with the local / remote CPU split switched on (off by default).
+fn indexer_with_cpu_split() -> Indexer {
+    Indexer::with_options(
+        CacheMaintenanceConfig::default(),
+        QueryOptions {
+            split_cpu_hits: true,
+        },
+    )
+}
+
 #[test]
 fn test_pod_broadcast_splits_local_and_remote_hits() {
     // Pod A holds inst-a's two DPs; Pod B holds inst-c. Every DP has HBM block
     // 0, then the pooled chain [1,4) is split: block 1 was offloaded by Pod A,
     // blocks 2,3 by Pod B. Each event is broadcast to all DPs of its own Pod.
-    let indexer = Indexer::new();
+    let indexer = indexer_with_cpu_split();
     let entry = indexer.get_or_create("model-broadcast", "t1");
 
     let tokens: Vec<i64> = (0..16).collect();
@@ -764,30 +774,111 @@ fn test_pod_broadcast_splits_local_and_remote_hits() {
     assert_eq!(dp_a0.npu_blocks, 1);
     assert_eq!(dp_a0.cpu_blocks, 3);
     assert_eq!(
-        dp_a0.cpu_local_blocks, 1,
+        dp_a0.cpu_local_blocks,
+        Some(1),
         "block 1 is in its own Pod's DRAM"
     );
-    assert_eq!(dp_a0.cpu_remote_blocks, 2, "blocks 2,3 came from Pod B");
+    assert_eq!(
+        dp_a0.cpu_remote_blocks,
+        Some(2),
+        "blocks 2,3 came from Pod B"
+    );
 
     // dp 1 shares Pod A, so the broadcast made it an owner too even though the
     // offload came from its sibling. It must score identically to dp 0.
-    assert_eq!(&tenant["inst-a"].dp["1"].cpu_local_blocks, &1);
-    assert_eq!(&tenant["inst-a"].dp["1"].cpu_remote_blocks, &2);
+    assert_eq!(tenant["inst-a"].dp["1"].cpu_local_blocks, Some(1));
+    assert_eq!(tenant["inst-a"].dp["1"].cpu_remote_blocks, Some(2));
 
     // inst-c is in Pod B, so the split flips.
     let dp_c = &tenant["inst-c"].dp["0"];
-    assert_eq!(dp_c.cpu_local_blocks, 2, "blocks 2,3 are in Pod B's DRAM");
-    assert_eq!(dp_c.cpu_remote_blocks, 1, "block 1 came from Pod A");
+    assert_eq!(
+        dp_c.cpu_local_blocks,
+        Some(2),
+        "blocks 2,3 are in Pod B's DRAM"
+    );
+    assert_eq!(dp_c.cpu_remote_blocks, Some(1), "block 1 came from Pod A");
 
     // The two values always account for exactly the pooled blocks that still
     // need fetching — blocks already in local HBM are excluded from both.
     for imd in tenant.values() {
         for dp in imd.dp.values() {
             assert_eq!(
-                dp.cpu_local_blocks + dp.cpu_remote_blocks,
+                dp.cpu_local_blocks.unwrap() + dp.cpu_remote_blocks.unwrap(),
                 dp.cpu_blocks,
                 "local + remote must equal cpu_blocks: {dp:?}"
             );
+        }
+    }
+}
+
+#[test]
+fn test_cpu_split_is_off_by_default_and_leaves_coverage_unchanged() {
+    // Same layout as the broadcast test above, indexed twice: once with the
+    // default options and once with the split on. Coverage must be identical;
+    // only the presence of the two split fields may differ.
+    fn populate(indexer: &Indexer, tokens: &[i64]) {
+        let entry = indexer.get_or_create("model-split-switch", "t1");
+        let hashes = compute_block_hash_for_seq(tokens, 4);
+        let pod_a = [("inst-a", 0), ("inst-a", 1)];
+        let pod_b = [("inst-c", 0)];
+        for (instance_id, dp_rank) in pod_a.iter().chain(pod_b.iter()) {
+            store_chain(
+                &entry,
+                &worker_of(instance_id, *dp_rank, StorageMedium::Npu),
+                None,
+                &[(100, hashes[0].0)],
+            );
+        }
+        broadcast_to_pod(&entry, &pod_a, Some(100), &[(101, hashes[1].0)]);
+        broadcast_to_pod(
+            &entry,
+            &pod_b,
+            Some(101),
+            &[(102, hashes[2].0), (103, hashes[3].0)],
+        );
+    }
+
+    let tokens: Vec<i64> = (0..16).collect();
+    let default_indexer = Indexer::new();
+    assert!(!default_indexer.query_options().split_cpu_hits);
+    let split_indexer = indexer_with_cpu_split();
+    populate(&default_indexer, &tokens);
+    populate(&split_indexer, &tokens);
+
+    let plain = default_indexer
+        .query("model-split-switch", "t1", &tokens, 4)
+        .unwrap();
+    let split = split_indexer
+        .query("model-split-switch", "t1", &tokens, 4)
+        .unwrap();
+
+    let plain_tenant = &plain.tenants["t1"];
+    let split_tenant = &split.tenants["t1"];
+    assert_eq!(plain_tenant.len(), split_tenant.len());
+    for (instance_id, plain_imd) in plain_tenant {
+        let split_imd = &split_tenant[instance_id];
+        assert_eq!(plain_imd.longest_matched, split_imd.longest_matched);
+        for (rank, plain_dp) in &plain_imd.dp {
+            let split_dp = &split_imd.dp[rank];
+            assert_eq!(plain_dp.matched_tokens, split_dp.matched_tokens);
+            assert_eq!(plain_dp.npu_blocks, split_dp.npu_blocks);
+            assert_eq!(plain_dp.cpu_blocks, split_dp.cpu_blocks);
+            assert_eq!(plain_dp.disk_blocks, split_dp.disk_blocks);
+            assert_eq!(
+                plain_dp.cpu_local_blocks, None,
+                "default must not report the split: {plain_dp:?}"
+            );
+            assert_eq!(plain_dp.cpu_remote_blocks, None);
+            assert!(split_dp.cpu_local_blocks.is_some());
+            assert!(split_dp.cpu_remote_blocks.is_some());
+        }
+    }
+
+    // The default response is byte-for-byte the legacy four-counter shape.
+    let json = serde_json::to_value(&plain).unwrap();
+    for (_, imd) in json["t1"].as_object().unwrap() {
+        for (_, dp) in imd["DP"].as_object().unwrap() {
+            assert_eq!(dp.as_object().unwrap().len(), 4, "{dp}");
         }
     }
 }
@@ -797,7 +888,7 @@ fn test_local_hits_exclude_blocks_already_in_hbm() {
     // A DP owning the whole pooled chain still reports only the part past its
     // HBM coverage: the rest is already local and needs no fetch, so counting it
     // would make `cpu_local_blocks` exceed `cpu_blocks`.
-    let indexer = Indexer::new();
+    let indexer = indexer_with_cpu_split();
     let entry = indexer.get_or_create("model-hbm-overlap", "t1");
 
     let tokens: Vec<i64> = (0..16).collect();
@@ -828,15 +919,19 @@ fn test_local_hits_exclude_blocks_already_in_hbm() {
 
     assert_eq!(dp.npu_blocks, 2);
     assert_eq!(dp.cpu_blocks, 2, "only blocks 2,3 are exclusive to CPU");
-    assert_eq!(dp.cpu_local_blocks, 2, "both are in its own Pod's DRAM");
-    assert_eq!(dp.cpu_remote_blocks, 0);
+    assert_eq!(
+        dp.cpu_local_blocks,
+        Some(2),
+        "both are in its own Pod's DRAM"
+    );
+    assert_eq!(dp.cpu_remote_blocks, Some(0));
 }
 
 #[test]
 fn test_non_owner_pooled_hits_are_all_remote() {
     // inst-b holds nothing but can still fetch the chain from the pool. Every one
     // of those blocks costs a transfer, so none of them count as local.
-    let indexer = Indexer::new();
+    let indexer = indexer_with_cpu_split();
     let entry = indexer.get_or_create("model-all-remote", "t1");
 
     let tokens: Vec<i64> = (0..8).collect();
@@ -859,8 +954,8 @@ fn test_non_owner_pooled_hits_are_all_remote() {
     let dp = &resp.tenants["t1"]["inst-b"].dp["0"];
 
     assert_eq!(dp.cpu_blocks, 2);
-    assert_eq!(dp.cpu_local_blocks, 0);
-    assert_eq!(dp.cpu_remote_blocks, 2);
+    assert_eq!(dp.cpu_local_blocks, Some(0));
+    assert_eq!(dp.cpu_remote_blocks, Some(2));
 }
 
 #[test]
@@ -1579,6 +1674,6 @@ fn test_query_dps_from_hbm_ip_index_skips_store_only_workers() {
         "registered prefill still sees decode-owned CPU edges"
     );
     assert_eq!(dp0.matched_tokens, 12);
-    assert_eq!(dp0.cpu_local_blocks, 0);
-    assert_eq!(dp0.cpu_remote_blocks, 2);
+    assert_eq!(dp0.cpu_local_blocks, None, "split is off by default");
+    assert_eq!(dp0.cpu_remote_blocks, None);
 }

@@ -72,6 +72,17 @@ impl Default for CacheMaintenanceConfig {
     }
 }
 
+/// Knobs that change what `/query` reports, as opposed to how caches age.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryOptions {
+    /// Split `cpu_blocks` into `cpu_local_blocks` / `cpu_remote_blocks` by
+    /// whether the DP's own Pod holds the pooled block.
+    ///
+    /// Off by default: the response then carries only the four legacy
+    /// counters and the owner-count pass over the lower-tier walk is skipped.
+    pub split_cpu_hits: bool,
+}
+
 /// Per-DP absolute coverage ends (in blocks) on each storage medium, plus how
 /// much of the pooled coverage this DP can read without a cross-machine
 /// transfer.
@@ -225,6 +236,7 @@ pub struct IndexerEntry {
     pub(crate) offload_pool_state: Arc<RwLock<OffloadPoolState>>,
 
     maintenance: CacheMaintenanceConfig,
+    query_options: QueryOptions,
 }
 
 impl Default for IndexerEntry {
@@ -239,6 +251,10 @@ impl IndexerEntry {
     }
 
     pub fn with_config(maintenance: CacheMaintenanceConfig) -> Self {
+        Self::with_options(maintenance, QueryOptions::default())
+    }
+
+    pub fn with_options(maintenance: CacheMaintenanceConfig, query_options: QueryOptions) -> Self {
         Self {
             hbm_tree: Arc::new(ConcurrentRadixTree::new()),
             lookups: Arc::new(RwLock::new(FxHashMap::default())),
@@ -246,6 +262,7 @@ impl IndexerEntry {
             disk_tiers: Arc::new(LowerTierIndexer::new()),
             offload_pool_state: Arc::new(RwLock::new(OffloadPoolState::default())),
             maintenance,
+            query_options,
         }
     }
 
@@ -565,13 +582,19 @@ impl IndexerEntry {
             // Blocks before this position are already covered by a
             // higher-priority medium and need no fetch, so they are excluded
             // from the local count — which is what makes it comparable with this
-            // tier's exclusive block count.
-            let ends = sink.medium_ends.get(dp).copied().unwrap_or_default();
-            let exclusive_from = match medium {
-                StorageMedium::Disk => ends.npu.max(ends.cpu),
-                _ => ends.npu,
-            } as usize;
-            let local = tiers.count_owned(&worker, reached.blocks_from(exclusive_from));
+            // tier's exclusive block count. Skipped entirely unless the split
+            // is switched on: the owner lookup is the one per-block cost the
+            // ownership-blind walk would otherwise not pay.
+            let local = if self.query_options.split_cpu_hits {
+                let ends = sink.medium_ends.get(dp).copied().unwrap_or_default();
+                let exclusive_from = match medium {
+                    StorageMedium::Disk => ends.npu.max(ends.cpu),
+                    _ => ends.npu,
+                } as usize;
+                Some(tiers.count_owned(&worker, reached.blocks_from(exclusive_from)))
+            } else {
+                None
+            };
 
             sink.overlap.add_blocks(worker, reached.hit.count as u32);
             Self::note_medium_end(
@@ -581,7 +604,9 @@ impl IndexerEntry {
                 medium,
                 reached.hit.end_pos() as u32,
             );
-            Self::note_local_hits(sink.medium_ends, instance_id, *dp_rank, medium, local);
+            if let Some(local) = local {
+                Self::note_local_hits(sink.medium_ends, instance_id, *dp_rank, medium, local);
+            }
             if let Some(last_seq) = reached.hit.last_matched_hash {
                 breaks.push(TierBreakpoint {
                     instance_id: instance_id.clone(),
@@ -1053,6 +1078,7 @@ impl IndexerEntry {
 pub struct Indexer {
     entries: DashMap<IndexerKey, Arc<IndexerEntry>>,
     maintenance: CacheMaintenanceConfig,
+    query_options: QueryOptions,
 }
 
 impl Indexer {
@@ -1062,10 +1088,20 @@ impl Indexer {
     }
 
     pub fn with_config(maintenance: CacheMaintenanceConfig) -> Self {
+        Self::with_options(maintenance, QueryOptions::default())
+    }
+
+    pub fn with_options(maintenance: CacheMaintenanceConfig, query_options: QueryOptions) -> Self {
         Self {
             entries: DashMap::new(),
             maintenance,
+            query_options,
         }
+    }
+
+    /// Query-shaping options this indexer was built with.
+    pub fn query_options(&self) -> QueryOptions {
+        self.query_options
     }
 
     /// Get or create an indexer entry for the given model and tenant.
@@ -1076,7 +1112,12 @@ impl Indexer {
         };
         self.entries
             .entry(key)
-            .or_insert_with(|| Arc::new(IndexerEntry::with_config(self.maintenance.clone())))
+            .or_insert_with(|| {
+                Arc::new(IndexerEntry::with_options(
+                    self.maintenance.clone(),
+                    self.query_options,
+                ))
+            })
             .value()
             .clone()
     }
@@ -1183,8 +1224,11 @@ impl Indexer {
         let disk_blocks = medium_ends.values().map(|m| m.disk).max().unwrap_or(0);
         // Summed across DPs: a large local total means the pooled hits are
         // mostly on-machine reads, a small one that nearly every hit costs a
-        // cross-machine transfer.
-        let cpu_local_blocks: u32 = medium_ends.values().map(|m| m.cpu_local).sum();
+        // cross-machine transfer. Only meaningful when the split is on.
+        let cpu_local_blocks: Option<u32> = self
+            .query_options
+            .split_cpu_hits
+            .then(|| medium_ends.values().map(|m| m.cpu_local).sum());
 
         tracing::debug!(
             num_tokens = token_ids.len(),
@@ -1270,11 +1314,13 @@ impl Indexer {
             dp_match.cpu_blocks = cpu;
             dp_match.disk_blocks = disk;
             dp_match.matched_tokens = covered.saturating_mul(block_size);
-            // `cpu_local` is counted over the same exclusive range as `cpu`, so
-            // the subtraction cannot underflow; clamp anyway rather than risk a
-            // wrapped count reaching the scheduler.
-            dp_match.cpu_local_blocks = ends.cpu_local.min(cpu);
-            dp_match.cpu_remote_blocks = cpu.saturating_sub(ends.cpu_local);
+            if self.query_options.split_cpu_hits {
+                // `cpu_local` is counted over the same exclusive range as `cpu`,
+                // so the subtraction cannot underflow; clamp anyway rather than
+                // risk a wrapped count reaching the scheduler.
+                dp_match.cpu_local_blocks = Some(ends.cpu_local.min(cpu));
+                dp_match.cpu_remote_blocks = Some(cpu.saturating_sub(ends.cpu_local));
+            }
         }
 
         for imd in instance_data.values_mut() {

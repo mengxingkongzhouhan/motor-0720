@@ -21,7 +21,7 @@ use rustc_hash::FxHashSet;
 
 use crate::backend::{MatchMode, StoreBackend};
 use crate::error::KvConductorError;
-use crate::indexer::{CacheMaintenanceConfig, Indexer, IndexerKey};
+use crate::indexer::{CacheMaintenanceConfig, Indexer, IndexerKey, QueryOptions};
 use crate::protocols::*;
 
 /// Flattened `(instance_id, dp_rank)` snapshot of [`HbmIpIndex`].
@@ -199,9 +199,13 @@ impl WorkerRegistry {
     }
 
     pub fn with_cache_config(config: CacheMaintenanceConfig) -> Self {
+        Self::with_options(config, QueryOptions::default())
+    }
+
+    pub fn with_options(config: CacheMaintenanceConfig, query_options: QueryOptions) -> Self {
         Self {
             instances: tokio::sync::RwLock::new(HashMap::new()),
-            indexer: Arc::new(Indexer::with_config(config)),
+            indexer: Arc::new(Indexer::with_options(config, query_options)),
             zmq_subscribers: tokio::sync::RwLock::new(HashMap::new()),
             hbm_ip_index: Arc::new(ParkingRwLock::new(HashMap::new())),
             query_dps: ParkingRwLock::new(Arc::new(FxHashSet::default())),

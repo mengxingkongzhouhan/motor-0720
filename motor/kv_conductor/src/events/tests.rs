@@ -1185,8 +1185,8 @@ fn test_unmapped_decode_pool_is_visible_to_registered_prefill() {
         "decode-hosted pool should extend the prefix past HBM"
     );
     assert_eq!(dp0.matched_tokens, 12);
-    assert_eq!(dp0.cpu_local_blocks, 0);
-    assert_eq!(dp0.cpu_remote_blocks, 2);
+    assert_eq!(dp0.cpu_local_blocks, None, "split is off by default");
+    assert_eq!(dp0.cpu_remote_blocks, None);
 }
 
 #[test]

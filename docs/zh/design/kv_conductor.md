@@ -417,18 +417,14 @@ root 走查不依赖任何上层覆盖，所以「HBM 全被驱逐、池中保�
   │                    known_dps)                            │
   │                                                          │
   │  root walk: reachable_chain(hashes, 0, None) — 忽略      │
-  │    owner，对所有 DP 相同，只走一次并记下经过的块 hash    │
+  │    owner，对所有 DP 相同，只走一次                       │
   │                                                          │
   │  per known DP (instance, dp_rank):                       │
-  │    own breakpoint (end_pos, last_seq) 的续走：           │
-  │      a) 断点落在 root 链上（root.chain[end_pos-1] ==     │
-  │         last_seq）-> 续走就是 root 链的后缀，直接切片    │
-  │      b) 否则 walk(hashes, end_pos, last_seq)，按          │
-  │         (end_pos, last_seq) 记忆化，同断点 DP 只走一次   │
+  │    从本 DP 自己的断点续走（不借用别人的断点）：          │
+  │      reachable_chain(hashes, end_pos, last_seq)          │
   │    best = 续走与 root 链中终点更远者（tie 取续走）        │
   │  -> medium_ends[dp].cpu = best.end_pos                   │
-  │  -> split 开启时 count_owned(worker, best.chain[npu..])  │
-  │     记为 cpu_local                                       │
+  │  -> count_owned(worker, best.blocks[npu..]) = cpu_local  │
   └──────────────────────────────────────────────────────────┘
                            │
                            ▼
@@ -438,8 +434,9 @@ root 走查不依赖任何上层覆盖，所以「HBM 全被驱逐、池中保�
   │  # per (instance, dp_rank): keep farther end_pos;        │
   │  # prefer CPU on tie -> resume from max(HBM, CPU)        │
   │                                                          │
-  │  lower_tier_lookup(hashes, disk_breaks, disk_tiers)      │
-  │  -> overlap.disk_blocks[worker] = winning length         │
+  │  lower_tier_lookup(hashes, disk_breaks, disk_tiers,      │
+  │                    known_dps)                            │
+  │  -> medium_ends[dp].disk = best.end_pos                  │
   └──────────────────────────────────────────────────────────┘
                            │
                            ▼

@@ -29,6 +29,7 @@
 //! coverage `matched_tokens` (sum of exclusive blocks × `block_size`).
 //! Tier affinity weights are applied by the Coordinator scheduler.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -297,8 +298,11 @@ impl IndexerEntry {
 
         // 1) HBM prefix match. Skip workers that are not query targets so a
         // decode / pool-location HBM hit cannot leak into the response.
+        // Score the hit and record its breakpoint (needs last_seq_hash for
+        // continuation) in the same pass.
         let hbm: FxHashMap<WorkerKey, PrefixMatch> =
             self.hbm_tree.find_matches_detailed(block_hashes);
+        let mut hbm_breaks: Vec<TierBreakpoint> = Vec::new();
         for (worker, m) in &hbm {
             if m.depth == 0 {
                 continue;
@@ -314,22 +318,15 @@ impl IndexerEntry {
                 StorageMedium::Npu,
                 m.depth,
             );
-        }
-
-        // Breakpoints need last_seq_hash for continuation.
-        let hbm_breaks: Vec<TierBreakpoint> = hbm
-            .iter()
-            .filter(|(_, m)| m.depth > 0)
-            .filter(|(w, _)| known_dps.contains(&(w.instance_id.clone(), w.dp_rank)))
-            .filter_map(|(w, m)| {
-                Some(TierBreakpoint {
-                    instance_id: w.instance_id.clone(),
-                    dp_rank: w.dp_rank,
+            if let Some(last_seq) = m.last_seq_hash {
+                hbm_breaks.push(TierBreakpoint {
+                    instance_id: worker.instance_id.clone(),
+                    dp_rank: worker.dp_rank,
                     end_pos: m.depth as usize,
-                    last_seq: m.last_seq_hash?,
-                })
-            })
-            .collect();
+                    last_seq,
+                });
+            }
+        }
 
         let mut sink = MatchSink {
             overlap: &mut overlap,
@@ -366,13 +363,16 @@ impl IndexerEntry {
     ///
     /// Prefer the registration pod → DP table. Fall back to every DP the
     /// trees have seen when that table is empty (YuanRong, replay, tests).
-    fn resolve_query_dps(
+    ///
+    /// The registry set is borrowed rather than cloned: it is shared by every
+    /// concurrent `/query` and can hold hundreds of `(String, u32)` entries.
+    fn resolve_query_dps<'q>(
         &self,
-        query_dps: Option<&FxHashSet<(String, DpRank)>>,
-    ) -> FxHashSet<(String, DpRank)> {
+        query_dps: Option<&'q FxHashSet<(String, DpRank)>>,
+    ) -> Cow<'q, FxHashSet<(String, DpRank)>> {
         match query_dps {
-            Some(dps) if !dps.is_empty() => dps.clone(),
-            _ => self.tree_known_dps(),
+            Some(dps) if !dps.is_empty() => Cow::Borrowed(dps),
+            _ => Cow::Owned(self.tree_known_dps()),
         }
     }
 

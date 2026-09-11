@@ -29,6 +29,7 @@
 //! coverage `matched_tokens` (sum of exclusive blocks × `block_size`).
 //! Tier affinity weights are applied by the Coordinator scheduler.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -41,7 +42,7 @@ use serde::Serialize;
 use crate::concurrent_tree::{ConcurrentRadixTree, PrefixMatch, WorkerLookup};
 use crate::error::KvConductorError;
 use crate::hashing::compute_block_hash_for_seq;
-use crate::lower_tier::LowerTierIndexer;
+use crate::lower_tier::{LowerTierIndexer, ReachableChain};
 use crate::protocols::*;
 
 /// TTL for stale pending pool entries (60 seconds).
@@ -103,6 +104,56 @@ struct MatchSink<'a> {
     overlap: &'a mut OverlapBlocks,
     /// Per-DP absolute coverage ends; the actual source for the response.
     medium_ends: &'a mut FxHashMap<(String, DpRank), MediumEnds>,
+}
+
+/// Borrowed view of one walked span, so a DP can score against the shared
+/// root chain — or a suffix of it — without cloning anything.
+#[derive(Debug, Clone, Copy)]
+struct WalkSpan<'a> {
+    start_pos: usize,
+    end_pos: usize,
+    last_seq: Option<SequenceBlockHash>,
+    /// `chain[i]` is the block at `start_pos + i`; empty when not collected.
+    chain: &'a [SequenceBlockHash],
+}
+
+impl<'a> WalkSpan<'a> {
+    fn of(reached: &'a ReachableChain) -> Self {
+        Self {
+            start_pos: reached.hit.start_pos,
+            end_pos: reached.hit.end_pos(),
+            last_seq: reached.hit.last_matched_hash,
+            chain: &reached.chain,
+        }
+    }
+
+    /// The span a walk resumed at `from` would have produced, given that it
+    /// retraces `reached` from there (see [`ReachableChain::retraces_from`]).
+    ///
+    /// `None` when `reached` ends at `from`: the resumed walk would then fail
+    /// on its very first edge, which is exactly what the walk itself returns.
+    fn suffix_of(reached: &'a ReachableChain, from: usize) -> Option<Self> {
+        if from >= reached.hit.end_pos() {
+            return None;
+        }
+        Some(Self {
+            start_pos: from,
+            end_pos: reached.hit.end_pos(),
+            last_seq: reached.hit.last_matched_hash,
+            chain: reached.blocks_from(from),
+        })
+    }
+
+    fn count(&self) -> usize {
+        self.end_pos - self.start_pos
+    }
+
+    /// Walked blocks from absolute position `from` onwards (see
+    /// [`ReachableChain::blocks_from`]).
+    fn blocks_from(&self, from: usize) -> &'a [SequenceBlockHash] {
+        let offset = from.saturating_sub(self.start_pos);
+        self.chain.get(offset..).unwrap_or(&[])
+    }
 }
 
 /// Upstream-tier match breakpoint used to continue into the next lower tier.
@@ -314,8 +365,11 @@ impl IndexerEntry {
 
         // 1) HBM prefix match. Skip workers that are not query targets so a
         // decode / pool-location HBM hit cannot leak into the response.
+        // Breakpoints (which need `last_seq_hash`) are collected in the same
+        // pass so the DP-membership check runs once per worker.
         let hbm: FxHashMap<WorkerKey, PrefixMatch> =
             self.hbm_tree.find_matches_detailed(block_hashes);
+        let mut hbm_breaks: Vec<TierBreakpoint> = Vec::new();
         for (worker, m) in &hbm {
             if m.depth == 0 {
                 continue;
@@ -331,22 +385,15 @@ impl IndexerEntry {
                 StorageMedium::Npu,
                 m.depth,
             );
-        }
-
-        // Breakpoints need last_seq_hash for continuation.
-        let hbm_breaks: Vec<TierBreakpoint> = hbm
-            .iter()
-            .filter(|(_, m)| m.depth > 0)
-            .filter(|(w, _)| known_dps.contains(&(w.instance_id.clone(), w.dp_rank)))
-            .filter_map(|(w, m)| {
-                Some(TierBreakpoint {
-                    instance_id: w.instance_id.clone(),
-                    dp_rank: w.dp_rank,
+            if let Some(last_seq) = m.last_seq_hash {
+                hbm_breaks.push(TierBreakpoint {
+                    instance_id: worker.instance_id.clone(),
+                    dp_rank: worker.dp_rank,
                     end_pos: m.depth as usize,
-                    last_seq: m.last_seq_hash?,
-                })
-            })
-            .collect();
+                    last_seq,
+                });
+            }
+        }
 
         let mut sink = MatchSink {
             overlap: &mut overlap,
@@ -383,13 +430,17 @@ impl IndexerEntry {
     ///
     /// Prefer the registration pod → DP table. Fall back to every DP the
     /// trees have seen when that table is empty (YuanRong, replay, tests).
-    fn resolve_query_dps(
+    ///
+    /// The registration table is borrowed, not copied: the registry already
+    /// hands out an `Arc` snapshot, so cloning every `(String, u32)` again on
+    /// each `/query` would only add allocations on the hot path.
+    fn resolve_query_dps<'q>(
         &self,
-        query_dps: Option<&FxHashSet<(String, DpRank)>>,
-    ) -> FxHashSet<(String, DpRank)> {
+        query_dps: Option<&'q FxHashSet<(String, DpRank)>>,
+    ) -> Cow<'q, FxHashSet<(String, DpRank)>> {
         match query_dps {
-            Some(dps) if !dps.is_empty() => dps.clone(),
-            _ => self.tree_known_dps(),
+            Some(dps) if !dps.is_empty() => Cow::Borrowed(dps),
+            _ => Cow::Owned(self.tree_known_dps()),
         }
     }
 
@@ -523,8 +574,17 @@ impl IndexerEntry {
         }
 
         // Same for everyone — one walk, reused for every DP below. The chain of
-        // block identities comes along so each DP can ask which of them it owns.
+        // block identities always comes along: it is what lets a DP whose HBM
+        // breakpoint lies on this chain skip its own walk, and (with the split
+        // on) what each DP tests ownership against.
         let root_chain = tiers.reachable_chain(block_hashes, 0, None);
+        let split_cpu_hits = self.query_options.split_cpu_hits;
+
+        // Resumed walks are keyed by where they start, not by who asked: DPs
+        // that share an HBM breakpoint (same depth, same last block) resume
+        // through identical edges, so the second and later ones are free.
+        let mut resumed_walks: FxHashMap<(usize, SequenceBlockHash), Option<ReachableChain>> =
+            FxHashMap::default();
 
         // One breakpoint per DP, keeping the farthest.
         //
@@ -551,13 +611,28 @@ impl IndexerEntry {
             let (instance_id, dp_rank) = dp;
 
             // Own breakpoint beats the shared root walk when it reaches further.
-            let mut best = root_chain.as_ref();
-            let resumed = own_break
-                .get(dp)
-                .and_then(|b| tiers.reachable_chain(block_hashes, b.end_pos, Some(b.last_seq)));
-            if let Some(reached) = &resumed {
+            let mut best = root_chain.as_ref().map(WalkSpan::of);
+            let resumed: Option<WalkSpan<'_>> = match own_break.get(dp) {
+                None => None,
+                Some(b) => match root_chain.as_ref() {
+                    // The breakpoint sits on the root chain: from there the
+                    // resumed walk takes the same edges, so it is that chain's
+                    // suffix — no second walk, no second lock.
+                    Some(root) if root.retraces_from(b.end_pos, b.last_seq) => {
+                        WalkSpan::suffix_of(root, b.end_pos)
+                    }
+                    _ => resumed_walks
+                        .entry((b.end_pos, b.last_seq))
+                        .or_insert_with(|| {
+                            tiers.walk(block_hashes, b.end_pos, Some(b.last_seq), split_cpu_hits)
+                        })
+                        .as_ref()
+                        .map(WalkSpan::of),
+                },
+            };
+            if let Some(reached) = resumed {
                 let farther = match best {
-                    Some(current) => reached.hit.end_pos() >= current.hit.end_pos(),
+                    Some(current) => reached.end_pos >= current.end_pos,
                     None => true,
                 };
                 if farther {
@@ -568,7 +643,7 @@ impl IndexerEntry {
             let Some(reached) = best else {
                 continue;
             };
-            if reached.hit.count == 0 {
+            if reached.count() == 0 {
                 continue;
             }
 
@@ -585,7 +660,7 @@ impl IndexerEntry {
             // tier's exclusive block count. Skipped entirely unless the split
             // is switched on: the owner lookup is the one per-block cost the
             // ownership-blind walk would otherwise not pay.
-            let local = if self.query_options.split_cpu_hits {
+            let local = if split_cpu_hits {
                 let ends = sink.medium_ends.get(dp).copied().unwrap_or_default();
                 let exclusive_from = match medium {
                     StorageMedium::Disk => ends.npu.max(ends.cpu),
@@ -596,22 +671,22 @@ impl IndexerEntry {
                 None
             };
 
-            sink.overlap.add_blocks(worker, reached.hit.count as u32);
+            sink.overlap.add_blocks(worker, reached.count() as u32);
             Self::note_medium_end(
                 sink.medium_ends,
                 instance_id,
                 *dp_rank,
                 medium,
-                reached.hit.end_pos() as u32,
+                reached.end_pos as u32,
             );
             if let Some(local) = local {
                 Self::note_local_hits(sink.medium_ends, instance_id, *dp_rank, medium, local);
             }
-            if let Some(last_seq) = reached.hit.last_matched_hash {
+            if let Some(last_seq) = reached.last_seq {
                 breaks.push(TierBreakpoint {
                     instance_id: instance_id.clone(),
                     dp_rank: *dp_rank,
-                    end_pos: reached.hit.end_pos(),
+                    end_pos: reached.end_pos,
                     last_seq,
                 });
             }

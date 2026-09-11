@@ -203,10 +203,34 @@ impl ReachableChain {
     ///
     /// Callers pass the end of the higher-priority media so the slice covers
     /// exactly the blocks that still need fetching — earlier ones are already
-    /// local in HBM. Empty when the walk ends at or before `from`.
+    /// local in HBM. Empty when the walk ends at or before `from`, or when the
+    /// chain was not collected.
     pub fn blocks_from(&self, from: usize) -> &[SequenceBlockHash] {
         let offset = from.saturating_sub(self.hit.start_pos);
         self.chain.get(offset..).unwrap_or(&[])
+    }
+
+    /// Sequence hash of the walked block at absolute position `pos`.
+    ///
+    /// `None` outside the walked span or when the chain was not collected.
+    pub fn block_at(&self, pos: usize) -> Option<SequenceBlockHash> {
+        pos.checked_sub(self.hit.start_pos)
+            .and_then(|i| self.chain.get(i))
+            .copied()
+    }
+
+    /// Whether a walk resumed at `start_pos` with parent `parent` would
+    /// retrace this chain from that point on.
+    ///
+    /// Edges are keyed by `(parent, local_hash)`, so two walks that stand on
+    /// the same block at the same position take identical steps afterwards:
+    /// the resumed walk is exactly this chain's suffix from `start_pos`. That
+    /// lets a DP whose HBM breakpoint lies on the shared root chain reuse it
+    /// instead of walking again. Requires the chain to have been collected.
+    pub fn retraces_from(&self, start_pos: usize, parent: SequenceBlockHash) -> bool {
+        start_pos > self.hit.start_pos
+            && start_pos <= self.hit.end_pos()
+            && self.block_at(start_pos - 1) == Some(parent)
     }
 }
 
@@ -395,7 +419,7 @@ impl LowerTierIndexer {
         start_pos: usize,
         start_parent: Option<SequenceBlockHash>,
     ) -> Option<ContiguousHit> {
-        self.reachable_chain(local_hashes, start_pos, start_parent)
+        self.walk(local_hashes, start_pos, start_parent, false)
             .map(|reached| reached.hit)
     }
 
@@ -412,6 +436,22 @@ impl LowerTierIndexer {
         local_hashes: &[LocalBlockHash],
         start_pos: usize,
         start_parent: Option<SequenceBlockHash>,
+    ) -> Option<ReachableChain> {
+        self.walk(local_hashes, start_pos, start_parent, true)
+    }
+
+    /// Ownership-blind contiguous walk; the one primitive behind
+    /// [`Self::reachable_from`] and [`Self::reachable_chain`].
+    ///
+    /// `collect_chain = false` skips recording the block identities, leaving
+    /// `chain` empty. Callers that only need the span (no per-DP ownership
+    /// test) use that to avoid one allocation per walk.
+    pub fn walk(
+        &self,
+        local_hashes: &[LocalBlockHash],
+        start_pos: usize,
+        start_parent: Option<SequenceBlockHash>,
+        collect_chain: bool,
     ) -> Option<ReachableChain> {
         if start_pos >= local_hashes.len() {
             return None;
@@ -431,7 +471,9 @@ impl LowerTierIndexer {
                 break;
             };
             let child = edge.child_hash();
-            chain.push(child);
+            if collect_chain {
+                chain.push(child);
+            }
             cur_hash = Some(child);
             cur_pos += 1;
         }
@@ -624,5 +666,72 @@ mod tests {
         let hits = idx.query_contiguous_hits(&[LocalBlockHash(11), LocalBlockHash(12)], &conts);
         assert_eq!(hits.get(&a).map(|h| h.count), Some(0));
         assert_eq!(hits.get(&b).map(|h| h.count), Some(2));
+    }
+
+    #[test]
+    fn walk_without_chain_matches_walk_with_chain() {
+        let idx = LowerTierIndexer::new();
+        idx.store_blocks(
+            &worker("w1"),
+            &store(None, &[(101, 11), (102, 12), (103, 13)]),
+        );
+        let query = [LocalBlockHash(11), LocalBlockHash(12), LocalBlockHash(13)];
+
+        let full = idx.walk(&query, 0, None, true).unwrap();
+        let span_only = idx.walk(&query, 0, None, false).unwrap();
+
+        assert_eq!(full.hit, span_only.hit);
+        assert_eq!(
+            full.chain,
+            vec![
+                SequenceBlockHash(101),
+                SequenceBlockHash(102),
+                SequenceBlockHash(103)
+            ]
+        );
+        assert!(span_only.chain.is_empty(), "chain must not be collected");
+        assert!(span_only.blocks_from(0).is_empty());
+        assert_eq!(span_only.block_at(1), None);
+    }
+
+    #[test]
+    fn retraces_from_matches_resumed_walk() {
+        let idx = LowerTierIndexer::new();
+        idx.store_blocks(
+            &worker("w1"),
+            &store(None, &[(101, 11), (102, 12), (103, 13), (104, 14)]),
+        );
+        let query = [
+            LocalBlockHash(11),
+            LocalBlockHash(12),
+            LocalBlockHash(13),
+            LocalBlockHash(14),
+        ];
+        let root = idx.reachable_chain(&query, 0, None).unwrap();
+        assert_eq!(root.hit.end_pos(), 4);
+
+        // A breakpoint standing on block 102 at position 2 retraces the root
+        // chain; the real resumed walk agrees with the suffix view.
+        assert!(root.retraces_from(2, SequenceBlockHash(102)));
+        let resumed = idx
+            .reachable_chain(&query, 2, Some(SequenceBlockHash(102)))
+            .unwrap();
+        assert_eq!(resumed.hit.end_pos(), root.hit.end_pos());
+        assert_eq!(resumed.hit.last_matched_hash, root.hit.last_matched_hash);
+        assert_eq!(resumed.chain.as_slice(), root.blocks_from(2));
+
+        // Same position but a different upstream block (another engine's
+        // sequence hash): no shortcut, the caller has to walk.
+        assert!(!root.retraces_from(2, SequenceBlockHash(999)));
+        // Resuming from the chain's own start is not a retrace of anything.
+        assert!(!root.retraces_from(0, SequenceBlockHash(101)));
+        // Standing on the last block: the resumed walk would start where the
+        // root walk failed, which is still "retraced" (with an empty suffix).
+        assert!(root.retraces_from(4, SequenceBlockHash(104)));
+        assert!(idx
+            .reachable_chain(&query, 4, Some(SequenceBlockHash(104)))
+            .is_none());
+        // Beyond the chain end there is nothing to retrace.
+        assert!(!root.retraces_from(5, SequenceBlockHash(104)));
     }
 }

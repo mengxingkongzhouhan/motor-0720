@@ -214,7 +214,7 @@ CPU/DISK 不使用完整 RadixTree，而是轻量的 **continuation-edge 图**�
   => inst-a 靠自己的 HBM 桥接缺口而走得更远；亲和信号未被抹平
 ```
 
-**断点仍只归产生它的 DP**：`edge_owners` 返回该边的全部 owner，若允许借用别的 DP 的断点，
+**断点仍只归产生它的 DP**：一条边可以有多个 owner，若允许借用别的 DP 的断点，
 只持有中间段的 worker 会跨过自己**取不到**的空洞谎报前缀——因为空洞那一段在别人的 HBM 里：
 
 ```text
@@ -413,21 +413,22 @@ root 走查不依赖任何上层覆盖，所以「HBM 全被驱逐、池中保�
                            │
                            ▼
   ┌─ Phase 2: CPU Continuation ──────────────────────────────┐
-  │  lower_tier_lookup(hashes, hbm_breaks, cpu_tiers)        │
+  │  lower_tier_lookup(hashes, hbm_breaks, cpu_tiers,        │
+  │                    known_dps)                            │
   │                                                          │
-  │  Continuation sources:                                   │
-  │    a) breakpoint resume: edge(seq300, H3) -> ...         │
-  │       (only when end_pos < N)                            │
-  │    b) root walk: always (report first-block              │
-  │       replicas; longer replicas not masked by            │
-  │       shorter upstream hits)                             │
+  │  root walk: reachable_chain(hashes, 0, None) — 忽略      │
+  │    owner，对所有 DP 相同，只走一次并记下经过的块 hash    │
   │                                                          │
-  │  query_contiguous_hits: per worker, walk each            │
-  │    candidate chain (root + breakpoints); stop at         │
-  │    first missing edge; keep farthest absolute end        │
-  │  -> overlap.cpu_blocks[worker] = winning length          │
-  │    (root win = full span, may overlap NPU; not           │
-  │     "tail continuation only")                            │
+  │  per known DP (instance, dp_rank):                       │
+  │    own breakpoint (end_pos, last_seq) 的续走：           │
+  │      a) 断点落在 root 链上（root.chain[end_pos-1] ==     │
+  │         last_seq）-> 续走就是 root 链的后缀，直接切片    │
+  │      b) 否则 walk(hashes, end_pos, last_seq)，按          │
+  │         (end_pos, last_seq) 记忆化，同断点 DP 只走一次   │
+  │    best = 续走与 root 链中终点更远者（tie 取续走）        │
+  │  -> medium_ends[dp].cpu = best.end_pos                   │
+  │  -> split 开启时 count_owned(worker, best.chain[npu..])  │
+  │     记为 cpu_local                                       │
   └──────────────────────────────────────────────────────────┘
                            │
                            ▼

@@ -32,7 +32,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 time = "0.3"
 thiserror = "2"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 zmq = "0.10"
 rmp = "0.8"

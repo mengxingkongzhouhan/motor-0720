@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock as ParkingRwLock;
 use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use tracing;
 
@@ -43,7 +44,24 @@ use crate::hashing::compute_block_hash_for_seq;
 /// Maps node IP → list of (instance_id, dp_rank) for HBM-registered endpoints.
 /// When a Mooncake pool subscriber receives an event with `backend_id=<ip>`,
 /// the event is applied to every DP whose HBM endpoint resolves to that IP.
+///
+/// `/query` also flattens this table to decide which DPs to score: only
+/// HBM-registered engine DPs are affinity targets, not store-only workers.
 pub type HbmIpIndex = Arc<ParkingRwLock<HashMap<String, Vec<(String, u32)>>>>;
+
+/// Unique `(instance_id, dp_rank)` values recorded in the pod → DP index.
+///
+/// One Pod may host several DPs; the same DP may appear under more than one
+/// HBM medium key. The set collapses those duplicates. Called when the
+/// index changes (register / unregister), not on each `/query`.
+pub fn query_dps_from_hbm_ip_index(index: &HbmIpIndex) -> FxHashSet<(String, u32)> {
+    index
+        .read()
+        .values()
+        .flatten()
+        .map(|(instance_id, dp_rank)| (instance_id.clone(), *dp_rank))
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Hash types
@@ -162,6 +180,23 @@ pub struct WorkerKey {
     pub medium: StorageMedium,
 }
 
+/// Instance-id prefix for blocks stored on a pool node that has no
+/// HBM-registered DP. Decode nodes commonly host memcache LocalService
+/// capacity; their `backend_id` is the store Pod IP, which is not in
+/// `hbm_ip_index`. Edges still go into the shared CPU/Disk graph so the
+/// ownership-blind walk can see them, but these keys are not routing targets.
+pub const POOL_LOCATION_PREFIX: &str = "pool:";
+
+/// `pool:<store_ip>` — owner of unmapped pool-store edges.
+pub fn pool_location_instance_id(store_ip: &str) -> String {
+    format!("{POOL_LOCATION_PREFIX}{store_ip}")
+}
+
+/// Whether `instance_id` is a pool-location placeholder, not a schedulable worker.
+pub fn is_pool_location_instance(instance_id: &str) -> bool {
+    instance_id.starts_with(POOL_LOCATION_PREFIX)
+}
+
 // ---------------------------------------------------------------------------
 // Registration types (matching Python ConductorApiClient)
 // ---------------------------------------------------------------------------
@@ -266,6 +301,43 @@ pub struct DpBlocks {
     pub cpu_blocks: u32,
     /// Exclusive Disk matched block count (beyond max(NPU, CPU) coverage).
     pub disk_blocks: u32,
+    /// How `cpu_blocks` splits by how far the block has to travel.
+    ///
+    /// A pool event fans out to every DP in the Pod that reported it, so "this DP
+    /// owns the block" means "the block is in this DP's own Pod" — and same Pod
+    /// implies same machine, i.e. a near-free DRAM read. Everything else is
+    /// counted remote and costs a transfer over `device_rdma` / `device_sdma` /
+    /// `device_urma`.
+    ///
+    /// Invariant: `cpu_local_blocks + cpu_remote_blocks == cpu_blocks`. Blocks
+    /// already covered by NPU are excluded from both — they need no fetch.
+    ///
+    /// The split is deliberately conservative: a block held by a *different* Pod
+    /// on the same machine is also a cheap read, but the conductor cannot see
+    /// that without a machine identity, so it counts as remote. `local` is
+    /// therefore a lower bound on co-location — never an over-count, which is the
+    /// safe direction (over-counting would tell the scheduler a fetch is free
+    /// when it is not).
+    ///
+    /// Only present when the conductor runs with `--split-cpu-hits`; the
+    /// default response carries just the four counters above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_local_blocks: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_remote_blocks: Option<u32>,
+}
+
+impl DpBlocks {
+    /// Number of map entries the msgpack encoder must emit for this block.
+    ///
+    /// `cpu_local_blocks` / `cpu_remote_blocks` are always set together, so the
+    /// count is 4 or 6 — the same keys serde writes for JSON.
+    fn wire_field_count(&self) -> u32 {
+        let base = 4;
+        let local = u32::from(self.cpu_local_blocks.is_some());
+        let remote = u32::from(self.cpu_remote_blocks.is_some());
+        base + local + remote
+    }
 }
 
 /// Per-instance match data returned in query response.
@@ -351,7 +423,9 @@ pub fn encode_query_response_msgpack(response: &QueryResponse, out: &mut Vec<u8>
                 .expect("write map len");
             for (rank, blocks) in &data.dp {
                 write_str(out, rank).expect("write rank");
-                write_map_len(out, 4).expect("blocks map len");
+                // Field count must match the `Serialize` derive on `DpBlocks`;
+                // the msgpack/JSON shape equality tests guard the two together.
+                write_map_len(out, blocks.wire_field_count()).expect("blocks map len");
                 write_str(out, "matched_tokens").expect("write key");
                 write_u32(out, blocks.matched_tokens).expect("write matched_tokens");
                 write_str(out, "npu_blocks").expect("write key");
@@ -360,6 +434,14 @@ pub fn encode_query_response_msgpack(response: &QueryResponse, out: &mut Vec<u8>
                 write_u32(out, blocks.cpu_blocks).expect("write cpu_blocks");
                 write_str(out, "disk_blocks").expect("write key");
                 write_u32(out, blocks.disk_blocks).expect("write disk_blocks");
+                if let Some(local) = blocks.cpu_local_blocks {
+                    write_str(out, "cpu_local_blocks").expect("write key");
+                    write_u32(out, local).expect("write cpu_local_blocks");
+                }
+                if let Some(remote) = blocks.cpu_remote_blocks {
+                    write_str(out, "cpu_remote_blocks").expect("write key");
+                    write_u32(out, remote).expect("write cpu_remote_blocks");
+                }
             }
         }
     }
@@ -673,6 +755,37 @@ impl OverlapBlocks {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_query_dps_from_hbm_ip_index_dedups_pods() {
+        let index = HbmIpIndex::default();
+        {
+            let mut guard = index.write();
+            guard
+                .entry("10.244.0.5".into())
+                .or_default()
+                .extend([("vllm-prefill-1".into(), 0), ("vllm-prefill-1".into(), 1)]);
+            guard
+                .entry("10.244.0.6".into())
+                .or_default()
+                .push(("vllm-prefill-2".into(), 0));
+            // Same DP listed twice (npu + gpu keys) must collapse.
+            guard
+                .entry("10.244.0.5".into())
+                .or_default()
+                .push(("vllm-prefill-1".into(), 0));
+        }
+        let dps = query_dps_from_hbm_ip_index(&index);
+        assert_eq!(dps.len(), 3);
+        assert!(dps.contains(&("vllm-prefill-1".into(), 0)));
+        assert!(dps.contains(&("vllm-prefill-1".into(), 1)));
+        assert!(dps.contains(&("vllm-prefill-2".into(), 0)));
+    }
+
+    #[test]
+    fn test_query_dps_from_empty_hbm_ip_index() {
+        assert!(query_dps_from_hbm_ip_index(&HbmIpIndex::default()).is_empty());
+    }
+
     // ── StorageMedium ─────────────────────────────────────────────────
 
     #[test]
@@ -780,6 +893,7 @@ mod tests {
                 npu_blocks: 6,
                 cpu_blocks: 0,
                 disk_blocks: 0,
+                ..Default::default()
             },
         );
         imd.dp.insert(
@@ -789,6 +903,8 @@ mod tests {
                 npu_blocks: 0,
                 cpu_blocks: 4,
                 disk_blocks: 0,
+                cpu_local_blocks: Some(1),
+                cpu_remote_blocks: Some(3),
             },
         );
 
@@ -802,8 +918,13 @@ mod tests {
         assert_eq!(parsed["DP"]["0"]["matched_tokens"], 768);
         assert_eq!(parsed["DP"]["0"]["npu_blocks"], 6);
         assert_eq!(parsed["DP"]["0"]["cpu_blocks"], 0);
+        // Split disabled for this DP: the keys are absent, not zero.
+        assert!(parsed["DP"]["0"].get("cpu_local_blocks").is_none());
+        assert!(parsed["DP"]["0"].get("cpu_remote_blocks").is_none());
         assert_eq!(parsed["DP"]["1"]["matched_tokens"], 1024);
         assert_eq!(parsed["DP"]["1"]["cpu_blocks"], 4);
+        assert_eq!(parsed["DP"]["1"]["cpu_local_blocks"], 1);
+        assert_eq!(parsed["DP"]["1"]["cpu_remote_blocks"], 3);
     }
 
     // ── KvEventWirePayload normalization ────────────────────────────────
@@ -1027,6 +1148,7 @@ mod tests {
                 npu_blocks: 3,
                 cpu_blocks: 0,
                 disk_blocks: 0,
+                ..Default::default()
             },
         );
         dp.insert(
@@ -1036,6 +1158,9 @@ mod tests {
                 npu_blocks: 1,
                 cpu_blocks: 3,
                 disk_blocks: 0,
+                // 2 of the 3 pooled blocks are on this DP's own machine.
+                cpu_local_blocks: Some(2),
+                cpu_remote_blocks: Some(1),
             },
         );
         instances.insert(
@@ -1049,22 +1174,60 @@ mod tests {
         QueryResponse { tenants }
     }
 
-    #[test]
-    fn test_query_response_msgpack_matches_json_shape() {
-        let response = sample_query_response();
+    fn assert_msgpack_matches_json(response: &QueryResponse) -> serde_json::Value {
         let mut buf = Vec::new();
-        encode_query_response_msgpack(&response, &mut buf);
+        encode_query_response_msgpack(response, &mut buf);
 
         // Decode the msgpack payload and compare with the JSON wire shape
         // field-by-field. This guards the hand-written encoder against
         // drifting from the serde_json shape (which the Python client parses).
         let msgpack_value = rmpv::decode::read_value(&mut buf.as_slice()).unwrap();
         let msgpack_json = rmpv_to_json(&msgpack_value);
-        let json_value = serde_json::to_value(&response).unwrap();
+        let json_value = serde_json::to_value(response).unwrap();
         assert_eq!(
             msgpack_json, json_value,
             "msgpack response diverges from JSON wire shape"
         );
+        json_value
+    }
+
+    #[test]
+    fn test_query_response_msgpack_matches_json_shape() {
+        let json = assert_msgpack_matches_json(&sample_query_response());
+        let dps = &json["default"]["prefill-0"]["DP"];
+        assert_eq!(dps["0"].as_object().unwrap().len(), 4);
+        assert!(dps["0"].get("cpu_local_blocks").is_none());
+        assert_eq!(dps["1"].as_object().unwrap().len(), 6);
+        assert_eq!(dps["1"]["cpu_local_blocks"], 2);
+        assert_eq!(dps["1"]["cpu_remote_blocks"], 1);
+    }
+
+    #[test]
+    fn test_query_response_msgpack_without_cpu_split_is_legacy_shape() {
+        // With the split switched off every DP carries exactly the four
+        // pre-split counters, so older clients see an unchanged payload.
+        let mut response = sample_query_response();
+        for instances in response.tenants.values_mut() {
+            for imd in instances.values_mut() {
+                for blocks in imd.dp.values_mut() {
+                    blocks.cpu_local_blocks = None;
+                    blocks.cpu_remote_blocks = None;
+                }
+            }
+        }
+        let json = assert_msgpack_matches_json(&response);
+        for (_, blocks) in json["default"]["prefill-0"]["DP"].as_object().unwrap() {
+            let keys: Vec<&str> = blocks
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(keys.len(), 4, "unexpected keys: {keys:?}");
+            for key in ["matched_tokens", "npu_blocks", "cpu_blocks", "disk_blocks"] {
+                assert!(keys.contains(&key), "missing {key}: {keys:?}");
+            }
+        }
     }
 
     #[test]

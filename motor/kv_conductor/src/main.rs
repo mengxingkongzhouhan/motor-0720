@@ -21,7 +21,7 @@ use clap::Parser;
 use tracing_subscriber::fmt::time::OffsetTime;
 use tracing_subscriber::EnvFilter;
 
-use kv_conductor::indexer::CacheMaintenanceConfig;
+use kv_conductor::indexer::{CacheMaintenanceConfig, QueryOptions};
 use kv_conductor::registry::WorkerRegistry;
 use kv_conductor::server::{create_router, AppState};
 
@@ -53,6 +53,14 @@ struct Cli {
     /// Maximum age of an unmatched offload entry in seconds.
     #[arg(long, default_value = "600")]
     offload_ttl_secs: u64,
+
+    /// Split each DP's `cpu_blocks` into `cpu_local_blocks` (own Pod DRAM) and
+    /// `cpu_remote_blocks` (needs a transfer) in `/query` responses.
+    ///
+    /// Off by default; the response then carries only the legacy counters.
+    /// Also settable via `KV_CONDUCTOR_SPLIT_CPU_HITS=true`.
+    #[arg(long, env = "KV_CONDUCTOR_SPLIT_CPU_HITS", default_value_t = false)]
+    split_cpu_hits: bool,
 }
 
 #[tokio::main]
@@ -74,11 +82,17 @@ async fn main() {
     let host: IpAddr = cli.host.parse().expect("invalid host address");
     let addr = SocketAddr::new(host, cli.port);
 
-    let registry = Arc::new(WorkerRegistry::with_cache_config(CacheMaintenanceConfig {
-        pending_ttl: std::time::Duration::from_secs(cli.pending_ttl_secs),
-        content_ttl: std::time::Duration::from_secs(cli.content_ttl_secs),
-        offload_ttl: std::time::Duration::from_secs(cli.offload_ttl_secs),
-    }));
+    let registry = Arc::new(WorkerRegistry::with_options(
+        CacheMaintenanceConfig {
+            pending_ttl: std::time::Duration::from_secs(cli.pending_ttl_secs),
+            content_ttl: std::time::Duration::from_secs(cli.content_ttl_secs),
+            offload_ttl: std::time::Duration::from_secs(cli.offload_ttl_secs),
+        },
+        QueryOptions {
+            split_cpu_hits: cli.split_cpu_hits,
+        },
+    ));
+    tracing::info!(split_cpu_hits = cli.split_cpu_hits, "query options");
     let maintenance_registry = Arc::downgrade(&registry);
     let maintenance_interval = std::time::Duration::from_secs(cli.maintenance_interval_secs.max(1));
     tokio::spawn(async move {

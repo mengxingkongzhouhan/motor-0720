@@ -15,10 +15,11 @@
 //! - **HBM tree** (`hbm_tree`) — prefix-chain radix tree for NPU blocks.
 //! - **CPU / Disk continuation indexes** (`cpu_tiers` / `disk_tiers`) —
 //!   ``(parent_seq_hash, tokens_hash) → child`` edges (see `lower_tier`
-//!   and `THIRD_PARTY_NOTICES.md`). CPU continues from the HBM
-//!   breakpoint; Disk continues from ``max(HBM, CPU)`` (CPU preferred
-//!   when it extends further). Root chains are walked unconditionally so
-//!   longer lower-tier replicas are never hidden by shorter upstream hits.
+//!   and `THIRD_PARTY_NOTICES.md`). CPU continues from the same DP's HBM
+//!   breakpoint; Disk continues from that DP's ``max(HBM, CPU)`` (CPU
+//!   preferred when it extends further) — a breakpoint is never shared
+//!   across DPs. Root chains are walked unconditionally so longer
+//!   lower-tier replicas are never hidden by shorter upstream hits.
 //! - **offload_pool_state** — bidirectional offload/pool event matching
 //!   (see [`OffloadPoolState`]). The `offload` side now also carries the
 //!   originating `parent_hash` so that lower-tier continuation edges are
@@ -40,7 +41,7 @@ use serde::Serialize;
 use crate::concurrent_tree::{ConcurrentRadixTree, PrefixMatch, WorkerLookup};
 use crate::error::KvConductorError;
 use crate::hashing::compute_block_hash_for_seq;
-use crate::lower_tier::{ContiguousHit, LowerTierContinuation, LowerTierIndexer};
+use crate::lower_tier::LowerTierIndexer;
 use crate::protocols::*;
 
 /// TTL for stale pending pool entries (60 seconds).
@@ -70,12 +71,38 @@ impl Default for CacheMaintenanceConfig {
     }
 }
 
-/// Per-DP absolute coverage ends (in blocks) on each storage medium.
+/// Knobs that change what `/query` reports, as opposed to how caches age.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryOptions {
+    /// Split `cpu_blocks` into `cpu_local_blocks` / `cpu_remote_blocks` by
+    /// whether the DP's own Pod holds the pooled block.
+    ///
+    /// Off by default: the response then carries only the four legacy
+    /// counters and the owner-count pass over the lower-tier walk is skipped.
+    pub split_cpu_hits: bool,
+}
+
+/// Per-DP absolute coverage ends (in blocks) on each storage medium, plus how
+/// much of the pooled coverage this DP can read without a cross-machine
+/// transfer.
 #[derive(Debug, Clone, Copy, Default)]
 struct MediumEnds {
     npu: u32,
     cpu: u32,
     disk: u32,
+    /// Blocks in `[npu, cpu)` that this DP itself owns. Because a pool event
+    /// fans out to every DP in the reporting Pod, owning a pooled block means it
+    /// sits in this DP's own Pod — hence on its own machine. The remainder of
+    /// `cpu - npu` is what has to come over the wire.
+    cpu_local: u32,
+}
+
+/// The two accumulators a matching pass writes into.
+struct MatchSink<'a> {
+    /// Per-worker block counts — diagnostics, plus the "any hit at all" gate.
+    overlap: &'a mut OverlapBlocks,
+    /// Per-DP absolute coverage ends; the actual source for the response.
+    medium_ends: &'a mut FxHashMap<(String, DpRank), MediumEnds>,
 }
 
 /// Upstream-tier match breakpoint used to continue into the next lower tier.
@@ -208,6 +235,7 @@ pub struct IndexerEntry {
     pub(crate) offload_pool_state: Arc<RwLock<OffloadPoolState>>,
 
     maintenance: CacheMaintenanceConfig,
+    query_options: QueryOptions,
 }
 
 impl Default for IndexerEntry {
@@ -222,6 +250,10 @@ impl IndexerEntry {
     }
 
     pub fn with_config(maintenance: CacheMaintenanceConfig) -> Self {
+        Self::with_options(maintenance, QueryOptions::default())
+    }
+
+    pub fn with_options(maintenance: CacheMaintenanceConfig, query_options: QueryOptions) -> Self {
         Self {
             hbm_tree: Arc::new(ConcurrentRadixTree::new()),
             lookups: Arc::new(RwLock::new(FxHashMap::default())),
@@ -229,6 +261,7 @@ impl IndexerEntry {
             disk_tiers: Arc::new(LowerTierIndexer::new()),
             offload_pool_state: Arc::new(RwLock::new(OffloadPoolState::default())),
             maintenance,
+            query_options,
         }
     }
 
@@ -255,7 +288,7 @@ impl IndexerEntry {
     }
 
     pub fn find_matches_by_hash(&self, block_hashes: &[LocalBlockHash]) -> OverlapBlocks {
-        self.find_matches_with_coverage(block_hashes).0
+        self.find_matches_with_coverage(block_hashes, None).0
     }
 
     /// Query with per-DP absolute coverage ends per medium (in blocks).
@@ -263,18 +296,31 @@ impl IndexerEntry {
     /// Matching still records per-worker segment lengths in `OverlapBlocks`
     /// (for diagnostics / unit tests). Response assembly uses `MediumEnds`
     /// absolute ends, then exclusive-partitions them into `*_blocks`.
+    ///
+    /// `query_dps` is the registration pod → DP table (`hbm_ip_index`).
+    /// When it is present and non-empty, only those DPs are scored — store-only
+    /// workers that own pooled edges are not affinity targets. An empty /
+    /// absent set falls back to tree-derived DPs so YuanRong and indexer unit
+    /// tests (no HBM IP index) keep working.
     fn find_matches_with_coverage(
         &self,
         block_hashes: &[LocalBlockHash],
+        query_dps: Option<&FxHashSet<(String, DpRank)>>,
     ) -> (OverlapBlocks, FxHashMap<(String, DpRank), MediumEnds>) {
         let mut overlap = OverlapBlocks::default();
         let mut medium_ends: FxHashMap<(String, DpRank), MediumEnds> = FxHashMap::default();
 
-        // 1) HBM prefix match.
+        let known_dps = self.resolve_query_dps(query_dps);
+
+        // 1) HBM prefix match. Skip workers that are not query targets so a
+        // decode / pool-location HBM hit cannot leak into the response.
         let hbm: FxHashMap<WorkerKey, PrefixMatch> =
             self.hbm_tree.find_matches_detailed(block_hashes);
         for (worker, m) in &hbm {
             if m.depth == 0 {
+                continue;
+            }
+            if !known_dps.contains(&(worker.instance_id.clone(), worker.dp_rank)) {
                 continue;
             }
             overlap.add_blocks(worker.clone(), m.depth);
@@ -291,6 +337,7 @@ impl IndexerEntry {
         let hbm_breaks: Vec<TierBreakpoint> = hbm
             .iter()
             .filter(|(_, m)| m.depth > 0)
+            .filter(|(w, _)| known_dps.contains(&(w.instance_id.clone(), w.dp_rank)))
             .filter_map(|(w, m)| {
                 Some(TierBreakpoint {
                     instance_id: w.instance_id.clone(),
@@ -301,29 +348,21 @@ impl IndexerEntry {
             })
             .collect();
 
-        // 2) CPU: continue from HBM breakpoints; root walk runs for every
-        //    worker owning the first edge so longer lower-tier replicas are
-        //    never hidden by a shorter upstream hit.
-        let cpu_hits = self.lower_tier_lookup(
+        let mut sink = MatchSink {
+            overlap: &mut overlap,
+            medium_ends: &mut medium_ends,
+        };
+
+        // 2) CPU: each DP resumes from its own HBM breakpoint (or from root
+        //    when its HBM matched nothing) and then walks ownership-blind.
+        let cpu_breaks = self.lower_tier_lookup(
             block_hashes,
             &hbm_breaks,
             &self.cpu_tiers,
-            &mut overlap,
-            &mut medium_ends,
+            StorageMedium::Cpu,
+            &known_dps,
+            &mut sink,
         );
-
-        let cpu_breaks: Vec<TierBreakpoint> = cpu_hits
-            .iter()
-            .filter(|(_, h)| h.count > 0)
-            .filter_map(|(w, h)| {
-                Some(TierBreakpoint {
-                    instance_id: w.instance_id.clone(),
-                    dp_rank: w.dp_rank,
-                    end_pos: h.end_pos(),
-                    last_seq: h.last_matched_hash?,
-                })
-            })
-            .collect();
 
         // 3) Disk: continue from max(HBM, CPU) per DP (CPU wins when it
         //    extends further — matches vLLM lookup: CPU then Disk after NPU).
@@ -332,11 +371,48 @@ impl IndexerEntry {
             block_hashes,
             &disk_breaks,
             &self.disk_tiers,
-            &mut overlap,
-            &mut medium_ends,
+            StorageMedium::Disk,
+            &known_dps,
+            &mut sink,
         );
 
         (overlap, medium_ends)
+    }
+
+    /// DPs that `/query` should score on the lower tiers.
+    ///
+    /// Prefer the registration pod → DP table. Fall back to every DP the
+    /// trees have seen when that table is empty (YuanRong, replay, tests).
+    fn resolve_query_dps(
+        &self,
+        query_dps: Option<&FxHashSet<(String, DpRank)>>,
+    ) -> FxHashSet<(String, DpRank)> {
+        match query_dps {
+            Some(dps) if !dps.is_empty() => dps.clone(),
+            _ => self.tree_known_dps(),
+        }
+    }
+
+    /// Every `(instance_id, dp_rank)` this index has seen, across all media.
+    /// `pool:<ip>` placeholders own store edges but are never routing targets.
+    fn tree_known_dps(&self) -> FxHashSet<(String, DpRank)> {
+        let mut dps: FxHashSet<(String, DpRank)> = FxHashSet::default();
+        for wk in self.lookups.read().keys() {
+            if !is_pool_location_instance(&wk.instance_id) {
+                dps.insert((wk.instance_id.clone(), wk.dp_rank));
+            }
+        }
+        for wk in self.cpu_tiers.worker_keys() {
+            if !is_pool_location_instance(&wk.instance_id) {
+                dps.insert((wk.instance_id, wk.dp_rank));
+            }
+        }
+        for wk in self.disk_tiers.worker_keys() {
+            if !is_pool_location_instance(&wk.instance_id) {
+                dps.insert((wk.instance_id, wk.dp_rank));
+            }
+        }
+        dps
     }
 
     #[inline]
@@ -363,6 +439,27 @@ impl IndexerEntry {
         }
     }
 
+    /// Record how many of this tier's exclusive blocks the DP can read locally.
+    ///
+    /// Only CPU is reported today: Disk pooling computes the same value in the
+    /// walk, so surfacing it is a one-line change once the scheduler needs it.
+    #[inline]
+    fn note_local_hits(
+        medium_ends: &mut FxHashMap<(String, DpRank), MediumEnds>,
+        instance_id: &str,
+        dp_rank: DpRank,
+        medium: StorageMedium,
+        local: u32,
+    ) {
+        if medium != StorageMedium::Cpu {
+            return;
+        }
+        medium_ends
+            .entry((instance_id.to_string(), dp_rank))
+            .or_default()
+            .cpu_local = local;
+    }
+
     /// Per `(instance_id, dp_rank)`, keep the farther breakpoint.
     ///
     /// `preferred` (CPU) overwrites `fallback` (HBM) when ``end_pos`` is
@@ -387,71 +484,140 @@ impl IndexerEntry {
         best.into_values().collect()
     }
 
-    /// Build continuations and count contiguous lower-tier hits.
+    /// Per-DP reachable span on one lower tier, returning this tier's
+    /// breakpoints for the next one.
     ///
-    /// - Root walks run for **every** worker owning the first edge so a
-    ///   longer replica on this tier is never hidden by an upstream
-    ///   (possibly shorter) hit.
-    /// - Continuation starts from each upstream ``TierBreakpoint``; a worker
-    ///   may hold several candidates (root + breakpoints), and the one with
-    ///   the farthest absolute end wins inside
-    ///   [`LowerTierIndexer::query_contiguous_hits`].
+    /// The walk is **ownership-blind**: pooled blocks are fetchable from any
+    /// node over the backend's transfer protocol (`device_rdma` /
+    /// `device_sdma` / `device_urma`), so a block held by another DP still lets
+    /// this DP skip recomputing it. What a DP reports is therefore "how long a
+    /// prefix can I serve without recompute", not "what do I hold locally".
+    ///
+    /// Two things still make the answer differ between DPs, which is what keeps
+    /// the affinity signal alive:
+    ///
+    /// 1. **Where the walk starts.** A DP resumes from its *own* upstream
+    ///    breakpoint, or from root when its own upstream tier matched nothing.
+    ///    HBM is device memory and is *not* fetchable across nodes, so only the
+    ///    DP that holds those blocks can use them to bridge a gap in the pooled
+    ///    chain — a DP whose HBM covers the gap reaches further than one whose
+    ///    HBM does not.
+    /// 2. **How the span is attributed.** The exclusive partition credits
+    ///    `[0, npu_end)` to NPU (local, free) and the remainder to CPU/Disk
+    ///    (fetched, transfer cost), so `kv_affinity.w_cpu` / `w_disk` are the
+    ///    knob for "prefer the node that already has it locally".
+    ///
+    /// The root walk is ownership-blind and therefore identical for every DP, so
+    /// it is computed once and reused.
     fn lower_tier_lookup(
         &self,
         block_hashes: &[LocalBlockHash],
         upstream_breaks: &[TierBreakpoint],
         tiers: &LowerTierIndexer,
-        overlap: &mut OverlapBlocks,
-        medium_ends: &mut FxHashMap<(String, DpRank), MediumEnds>,
-    ) -> FxHashMap<WorkerKey, ContiguousHit> {
-        if block_hashes.is_empty() {
-            return FxHashMap::default();
+        medium: StorageMedium,
+        known_dps: &FxHashSet<(String, DpRank)>,
+        sink: &mut MatchSink<'_>,
+    ) -> Vec<TierBreakpoint> {
+        if block_hashes.is_empty() || known_dps.is_empty() {
+            return Vec::new();
         }
 
-        let mut continuations: FxHashMap<WorkerKey, Vec<LowerTierContinuation>> =
-            FxHashMap::default();
+        // Same for everyone — one walk, reused for every DP below. The chain of
+        // block identities comes along so each DP can ask which of them it owns.
+        let root_chain = tiers.reachable_chain(block_hashes, 0, None);
 
-        // Root walk: unconditional, so a longer replica on this tier is never
-        // hidden by an upstream (possibly shorter) hit.
-        for w in tiers.root_workers(block_hashes[0]) {
-            continuations
-                .entry(w)
-                .or_default()
-                .push(LowerTierContinuation::from_root(0));
-        }
-
-        // Continue from each upstream breakpoint (candidate list — the walk
-        // keeps the farthest end per worker).
+        // One breakpoint per DP, keeping the farthest.
+        //
+        // A DP can appear more than once in `upstream_breaks`: the HBM matches
+        // it is built from are keyed by `WorkerKey`, which also carries
+        // `backend_id` and `medium` (`Npu` and `Unknown` both land in the HBM
+        // tree). Iteration order over that map is arbitrary, so a plain
+        // last-wins insert would pick the start position nondeterministically.
+        //
+        // The key deliberately omits `backend_id`, which is what collapses
+        // those duplicates onto one DP.
+        let mut own_break: FxHashMap<(String, DpRank), &TierBreakpoint> = FxHashMap::default();
         for b in upstream_breaks {
-            if b.end_pos >= block_hashes.len() {
+            let slot = own_break
+                .entry((b.instance_id.clone(), b.dp_rank))
+                .or_insert(b);
+            if slot.end_pos < b.end_pos {
+                *slot = b;
+            }
+        }
+
+        let mut breaks = Vec::new();
+        for dp in known_dps {
+            let (instance_id, dp_rank) = dp;
+
+            // Own breakpoint beats the shared root walk when it reaches further.
+            let mut best = root_chain.as_ref();
+            let resumed = own_break
+                .get(dp)
+                .and_then(|b| tiers.reachable_chain(block_hashes, b.end_pos, Some(b.last_seq)));
+            if let Some(reached) = &resumed {
+                let farther = match best {
+                    Some(current) => reached.hit.end_pos() >= current.hit.end_pos(),
+                    None => true,
+                };
+                if farther {
+                    best = Some(reached);
+                }
+            }
+
+            let Some(reached) = best else {
+                continue;
+            };
+            if reached.hit.count == 0 {
                 continue;
             }
-            for w in tiers.edge_owners(Some(b.last_seq), block_hashes[b.end_pos]) {
-                continuations
-                    .entry(w)
-                    .or_default()
-                    .push(LowerTierContinuation::new(b.end_pos, b.last_seq));
+
+            let worker = WorkerKey {
+                instance_id: instance_id.clone(),
+                backend_id: instance_id.clone(),
+                dp_rank: *dp_rank,
+                medium,
+            };
+
+            // Blocks before this position are already covered by a
+            // higher-priority medium and need no fetch, so they are excluded
+            // from the local count — which is what makes it comparable with this
+            // tier's exclusive block count. Skipped entirely unless the split
+            // is switched on: the owner lookup is the one per-block cost the
+            // ownership-blind walk would otherwise not pay.
+            let local = if self.query_options.split_cpu_hits {
+                let ends = sink.medium_ends.get(dp).copied().unwrap_or_default();
+                let exclusive_from = match medium {
+                    StorageMedium::Disk => ends.npu.max(ends.cpu),
+                    _ => ends.npu,
+                } as usize;
+                Some(tiers.count_owned(&worker, reached.blocks_from(exclusive_from)))
+            } else {
+                None
+            };
+
+            sink.overlap.add_blocks(worker, reached.hit.count as u32);
+            Self::note_medium_end(
+                sink.medium_ends,
+                instance_id,
+                *dp_rank,
+                medium,
+                reached.hit.end_pos() as u32,
+            );
+            if let Some(local) = local {
+                Self::note_local_hits(sink.medium_ends, instance_id, *dp_rank, medium, local);
+            }
+            if let Some(last_seq) = reached.hit.last_matched_hash {
+                breaks.push(TierBreakpoint {
+                    instance_id: instance_id.clone(),
+                    dp_rank: *dp_rank,
+                    end_pos: reached.hit.end_pos(),
+                    last_seq,
+                });
             }
         }
 
-        if continuations.is_empty() {
-            return FxHashMap::default();
-        }
-
-        let hits = tiers.query_contiguous_hits(block_hashes, &continuations);
-        for (worker, hit) in &hits {
-            if hit.count > 0 {
-                overlap.add_blocks(worker.clone(), hit.count as u32);
-                Self::note_medium_end(
-                    medium_ends,
-                    &worker.instance_id,
-                    worker.dp_rank,
-                    worker.medium,
-                    hit.end_pos() as u32,
-                );
-            }
-        }
-        hits
+        breaks
     }
 
     // -----------------------------------------------------------------------
@@ -685,6 +851,24 @@ impl IndexerEntry {
         state.offload.len() + state.pending_pool.len() + state.content.len()
     }
 
+    /// Per-medium tree sizes plus two-phase matching cache sizes.
+    ///
+    /// `(hbm, cpu, disk, offload, pending_pool, content)`. Used by `/stats`
+    /// so a dump can answer "is the CPU hole missing index entries or still
+    /// sitting in pending_pool?" without grepping event traces.
+    pub fn cache_breakdown(&self) -> (usize, usize, usize, usize, usize, usize) {
+        let hbm = self.lookups.read().values().map(|l| l.len()).sum();
+        let state = self.offload_pool_state.read();
+        (
+            hbm,
+            self.cpu_tiers.total_blocks(),
+            self.disk_tiers.total_blocks(),
+            state.offload.len(),
+            state.pending_pool.len(),
+            state.content.len(),
+        )
+    }
+
     /// Sweep stale matching-cache entries that exceed
     /// their TTLs, returning the total number of entries evicted.
     ///
@@ -725,9 +909,15 @@ impl IndexerEntry {
         });
         let expired_pending = before_pending - state.pending_pool.len();
         if expired_pending > 0 {
-            tracing::debug!(
+            // Pool-first events wait only `pending_ttl` (default 60s). If the
+            // matching vLLM offload is later than that, the block never
+            // enters the CPU index — the same symptom as a truncated root
+            // walk. This used to be debug-only and disappeared from
+            // production dumps.
+            tracing::info!(
                 expired = expired_pending,
                 pending_ttl_secs = pending_ttl.as_secs(),
+                remaining_pending_keys = state.pending_pool.len(),
                 "kv_event pending_expired"
             );
         }
@@ -888,6 +1078,7 @@ impl IndexerEntry {
 pub struct Indexer {
     entries: DashMap<IndexerKey, Arc<IndexerEntry>>,
     maintenance: CacheMaintenanceConfig,
+    query_options: QueryOptions,
 }
 
 impl Indexer {
@@ -897,10 +1088,20 @@ impl Indexer {
     }
 
     pub fn with_config(maintenance: CacheMaintenanceConfig) -> Self {
+        Self::with_options(maintenance, QueryOptions::default())
+    }
+
+    pub fn with_options(maintenance: CacheMaintenanceConfig, query_options: QueryOptions) -> Self {
         Self {
             entries: DashMap::new(),
             maintenance,
+            query_options,
         }
+    }
+
+    /// Query-shaping options this indexer was built with.
+    pub fn query_options(&self) -> QueryOptions {
+        self.query_options
     }
 
     /// Get or create an indexer entry for the given model and tenant.
@@ -911,7 +1112,12 @@ impl Indexer {
         };
         self.entries
             .entry(key)
-            .or_insert_with(|| Arc::new(IndexerEntry::with_config(self.maintenance.clone())))
+            .or_insert_with(|| {
+                Arc::new(IndexerEntry::with_options(
+                    self.maintenance.clone(),
+                    self.query_options,
+                ))
+            })
             .value()
             .clone()
     }
@@ -974,6 +1180,18 @@ impl Indexer {
         token_ids: &[i64],
         block_size: u32,
     ) -> Result<QueryResponse, KvConductorError> {
+        self.query_with_dps(model_name, tenant_id, token_ids, block_size, None)
+    }
+
+    /// [`query`] restricted to `query_dps` from the registration pod → DP table.
+    pub fn query_with_dps(
+        &self,
+        model_name: &str,
+        tenant_id: &str,
+        token_ids: &[i64],
+        block_size: u32,
+        query_dps: Option<&FxHashSet<(String, DpRank)>>,
+    ) -> Result<QueryResponse, KvConductorError> {
         let t0 = std::time::Instant::now();
 
         let entry = self
@@ -986,7 +1204,7 @@ impl Indexer {
         let t_hash = std::time::Instant::now();
         let block_hashes = compute_block_hash_for_seq(token_ids, block_size);
         let hash_us = t_hash.elapsed().as_micros();
-        let (overlap, medium_ends) = entry.find_matches_with_coverage(&block_hashes);
+        let (overlap, medium_ends) = entry.find_matches_with_coverage(&block_hashes, query_dps);
         tracing::debug!(
             num_tokens = token_ids.len(),
             block_size,
@@ -1004,6 +1222,13 @@ impl Indexer {
         let npu_blocks = medium_ends.values().map(|m| m.npu).max().unwrap_or(0);
         let cpu_blocks = medium_ends.values().map(|m| m.cpu).max().unwrap_or(0);
         let disk_blocks = medium_ends.values().map(|m| m.disk).max().unwrap_or(0);
+        // Summed across DPs: a large local total means the pooled hits are
+        // mostly on-machine reads, a small one that nearly every hit costs a
+        // cross-machine transfer. Only meaningful when the split is on.
+        let cpu_local_blocks: Option<u32> = self
+            .query_options
+            .split_cpu_hits
+            .then(|| medium_ends.values().map(|m| m.cpu_local).sum());
 
         tracing::debug!(
             num_tokens = token_ids.len(),
@@ -1014,6 +1239,7 @@ impl Indexer {
             npu_blocks,
             cpu_blocks,
             disk_blocks,
+            cpu_local_blocks,
             "query profile"
         );
         resp
@@ -1026,6 +1252,17 @@ impl Indexer {
         tenant_id: &str,
         block_hashes: &[LocalBlockHash],
     ) -> Result<QueryResponse, KvConductorError> {
+        self.query_by_hash_with_dps(model_name, tenant_id, block_hashes, None)
+    }
+
+    /// [`query_by_hash`] restricted to `query_dps` from the registration table.
+    pub fn query_by_hash_with_dps(
+        &self,
+        model_name: &str,
+        tenant_id: &str,
+        block_hashes: &[LocalBlockHash],
+        query_dps: Option<&FxHashSet<(String, DpRank)>>,
+    ) -> Result<QueryResponse, KvConductorError> {
         let entry = self
             .get(model_name, tenant_id)
             .ok_or_else(|| KvConductorError::NoIndexer {
@@ -1033,7 +1270,7 @@ impl Indexer {
                 tenant_id: tenant_id.to_string(),
             })?;
 
-        let (overlap, medium_ends) = entry.find_matches_with_coverage(block_hashes);
+        let (overlap, medium_ends) = entry.find_matches_with_coverage(block_hashes, query_dps);
         // Default to 1 token per hash (no scaling) since we don't know the
         // original block_size from the hash alone.
         self.build_response(&overlap, &medium_ends, model_name, tenant_id, 1)
@@ -1062,6 +1299,9 @@ impl Indexer {
         let mut instance_data: HashMap<String, InstanceMatchData> = HashMap::new();
 
         for ((instance_id, dp_rank), ends) in medium_ends {
+            if is_pool_location_instance(instance_id) {
+                continue;
+            }
             let npu = ends.npu;
             let cpu = ends.cpu.saturating_sub(ends.npu);
             let disk = ends.disk.saturating_sub(ends.npu.max(ends.cpu));
@@ -1074,6 +1314,13 @@ impl Indexer {
             dp_match.cpu_blocks = cpu;
             dp_match.disk_blocks = disk;
             dp_match.matched_tokens = covered.saturating_mul(block_size);
+            if self.query_options.split_cpu_hits {
+                // `cpu_local` is counted over the same exclusive range as `cpu`,
+                // so the subtraction cannot underflow; clamp anyway rather than
+                // risk a wrapped count reaching the scheduler.
+                dp_match.cpu_local_blocks = Some(ends.cpu_local.min(cpu));
+                dp_match.cpu_remote_blocks = Some(cpu.saturating_sub(ends.cpu_local));
+            }
         }
 
         for imd in instance_data.values_mut() {
@@ -1095,11 +1342,19 @@ impl Indexer {
             .map(|entry| {
                 let key = entry.key();
                 let value = entry.value();
+                let (hbm_blocks, cpu_blocks, disk_blocks, offload, pending_pool, content) =
+                    value.cache_breakdown();
                 IndexerSummary {
                     model_name: key.model_name.clone(),
                     tenant_id: key.tenant_id.clone(),
                     worker_count: value.worker_keys().len(),
                     total_blocks: value.total_blocks(),
+                    hbm_blocks,
+                    cpu_blocks,
+                    disk_blocks,
+                    offload,
+                    pending_pool,
+                    content,
                 }
             })
             .collect()
@@ -1118,6 +1373,15 @@ pub struct IndexerSummary {
     pub tenant_id: String,
     pub worker_count: usize,
     pub total_blocks: usize,
+    pub hbm_blocks: usize,
+    pub cpu_blocks: usize,
+    pub disk_blocks: usize,
+    /// Unconfirmed engine offloads waiting for a pool stored event.
+    pub offload: usize,
+    /// Pool-first hashes waiting for a vLLM offload (default TTL 60s).
+    pub pending_pool: usize,
+    /// Confirmed content retained for a later pool medium.
+    pub content: usize,
 }
 
 #[cfg(test)]

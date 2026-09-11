@@ -130,46 +130,6 @@ impl EdgeOwnersEntry {
             }
         }
     }
-
-    fn contains(&self, owner: &WorkerKey) -> bool {
-        match self {
-            Self::Single {
-                owner: existing_owner,
-                ..
-            } => existing_owner == owner,
-            Self::Multi { owners, .. } => owners.contains(owner),
-        }
-    }
-
-    fn collect_workers(&self) -> Vec<WorkerKey> {
-        match self {
-            Self::Single { owner, .. } => vec![owner.clone()],
-            Self::Multi { owners, .. } => owners.iter().cloned().collect(),
-        }
-    }
-}
-
-/// Where a lower-tier walk should resume for one worker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LowerTierContinuation {
-    pub start_pos: usize,
-    pub last_matched_hash: Option<SequenceBlockHash>,
-}
-
-impl LowerTierContinuation {
-    pub fn new(start_pos: usize, last_matched_hash: SequenceBlockHash) -> Self {
-        Self {
-            start_pos,
-            last_matched_hash: Some(last_matched_hash),
-        }
-    }
-
-    pub fn from_root(start_pos: usize) -> Self {
-        Self {
-            start_pos,
-            last_matched_hash: None,
-        }
-    }
 }
 
 /// Result of a contiguous lower-tier walk for one worker.
@@ -203,10 +163,34 @@ impl ReachableChain {
     ///
     /// Callers pass the end of the higher-priority media so the slice covers
     /// exactly the blocks that still need fetching — earlier ones are already
-    /// local in HBM. Empty when the walk ends at or before `from`.
+    /// local in HBM. Empty when the walk ends at or before `from`, or when the
+    /// chain was not collected.
     pub fn blocks_from(&self, from: usize) -> &[SequenceBlockHash] {
         let offset = from.saturating_sub(self.hit.start_pos);
         self.chain.get(offset..).unwrap_or(&[])
+    }
+
+    /// Sequence hash of the walked block at absolute position `pos`.
+    ///
+    /// `None` outside the walked span or when the chain was not collected.
+    pub fn block_at(&self, pos: usize) -> Option<SequenceBlockHash> {
+        pos.checked_sub(self.hit.start_pos)
+            .and_then(|i| self.chain.get(i))
+            .copied()
+    }
+
+    /// Whether a walk resumed at `start_pos` with parent `parent` would
+    /// retrace this chain from that point on.
+    ///
+    /// Edges are keyed by `(parent, local_hash)`, so two walks that stand on
+    /// the same block at the same position take identical steps afterwards:
+    /// the resumed walk is exactly this chain's suffix from `start_pos`. That
+    /// lets a DP whose HBM breakpoint lies on the shared root chain reuse it
+    /// instead of walking again. Requires the chain to have been collected.
+    pub fn retraces_from(&self, start_pos: usize, parent: SequenceBlockHash) -> bool {
+        start_pos > self.hit.start_pos
+            && start_pos <= self.hit.end_pos()
+            && self.block_at(start_pos - 1) == Some(parent)
     }
 }
 
@@ -221,28 +205,6 @@ pub struct LowerTierIndexer {
 impl LowerTierIndexer {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Workers owning the root edge for ``local_hash`` (parent = None).
-    pub fn root_workers(&self, local_hash: LocalBlockHash) -> Vec<WorkerKey> {
-        self.edge_owners(None, local_hash)
-    }
-
-    /// Workers owning edge ``(parent_hash, local_hash)``.
-    pub fn edge_owners(
-        &self,
-        parent_hash: Option<SequenceBlockHash>,
-        local_hash: LocalBlockHash,
-    ) -> Vec<WorkerKey> {
-        let key = TransitionKey {
-            parent_hash,
-            local_hash,
-        };
-        self.edges
-            .read()
-            .get(&key)
-            .map(|e| e.collect_workers())
-            .unwrap_or_default()
     }
 
     /// Insert a stored chain as continuation edges.
@@ -384,8 +346,8 @@ impl LowerTierIndexer {
     /// (free) or *fetched* (transfer cost), which the caller expresses by
     /// attributing the span to the NPU vs CPU/Disk tier.
     ///
-    /// Contrast [`Self::query_contiguous_hits`], which does gate on ownership
-    /// and answers "what does this worker hold locally".
+    /// Ownership is answered separately by [`Self::count_owned`], which is
+    /// what tells "fetched from the pool" apart from "already in this Pod".
     ///
     /// Returns `None` when the first edge is already missing, so a zero-length
     /// walk never reports its start position as an end.
@@ -395,7 +357,7 @@ impl LowerTierIndexer {
         start_pos: usize,
         start_parent: Option<SequenceBlockHash>,
     ) -> Option<ContiguousHit> {
-        self.reachable_chain(local_hashes, start_pos, start_parent)
+        self.walk(local_hashes, start_pos, start_parent, false)
             .map(|reached| reached.hit)
     }
 
@@ -412,6 +374,22 @@ impl LowerTierIndexer {
         local_hashes: &[LocalBlockHash],
         start_pos: usize,
         start_parent: Option<SequenceBlockHash>,
+    ) -> Option<ReachableChain> {
+        self.walk(local_hashes, start_pos, start_parent, true)
+    }
+
+    /// Ownership-blind contiguous walk; the one primitive behind
+    /// [`Self::reachable_from`] and [`Self::reachable_chain`].
+    ///
+    /// `collect_chain = false` skips recording the block identities, leaving
+    /// `chain` empty. Callers that only need the span (no per-DP ownership
+    /// test) use that to avoid one allocation per walk.
+    pub fn walk(
+        &self,
+        local_hashes: &[LocalBlockHash],
+        start_pos: usize,
+        start_parent: Option<SequenceBlockHash>,
+        collect_chain: bool,
     ) -> Option<ReachableChain> {
         if start_pos >= local_hashes.len() {
             return None;
@@ -431,7 +409,9 @@ impl LowerTierIndexer {
                 break;
             };
             let child = edge.child_hash();
-            chain.push(child);
+            if collect_chain {
+                chain.push(child);
+            }
             cur_hash = Some(child);
             cur_pos += 1;
         }
@@ -465,63 +445,6 @@ impl LowerTierIndexer {
             .iter()
             .filter(|block| owned.contains_key(*block))
             .count() as u32
-    }
-
-    /// For each worker, walk contiguous lower-tier hits from its continuations.
-    ///
-    /// A worker may have several candidate continuations (a root walk plus one
-    /// or more upstream-breakpoint continuations). Each candidate is walked
-    /// independently and the one with the **farthest absolute end** wins —
-    /// coverage semantics stay correct no matter which candidate is longer.
-    pub fn query_contiguous_hits(
-        &self,
-        local_hashes: &[LocalBlockHash],
-        continuations: &FxHashMap<WorkerKey, Vec<LowerTierContinuation>>,
-    ) -> FxHashMap<WorkerKey, ContiguousHit> {
-        let mut hits = FxHashMap::default();
-        let edges = self.edges.read();
-
-        for (worker, conts) in continuations {
-            let mut best: Option<ContiguousHit> = None;
-            for cont in conts {
-                let mut cur_pos = cont.start_pos;
-                let mut cur_hash = cont.last_matched_hash;
-                let start = cur_pos;
-
-                while cur_pos < local_hashes.len() {
-                    let key = TransitionKey {
-                        parent_hash: cur_hash,
-                        local_hash: local_hashes[cur_pos],
-                    };
-                    let Some(edge) = edges.get(&key) else {
-                        break;
-                    };
-                    if !edge.contains(worker) {
-                        break;
-                    }
-                    cur_hash = Some(edge.child_hash());
-                    cur_pos += 1;
-                }
-
-                let hit = ContiguousHit {
-                    count: cur_pos.saturating_sub(start),
-                    start_pos: start,
-                    last_matched_hash: if cur_pos > start { cur_hash } else { None },
-                };
-                // Keep the candidate with the farthest absolute end (ties:
-                // later candidate wins — same end implies the same last hash).
-                best = match best {
-                    Some(b) if hit.end_pos() >= b.end_pos() => Some(hit),
-                    Some(b) => Some(b),
-                    None => Some(hit),
-                };
-            }
-            if let Some(b) = best {
-                hits.insert(worker.clone(), b);
-            }
-        }
-
-        hits
     }
 }
 
@@ -559,10 +482,11 @@ mod tests {
         let w = worker("w1");
         idx.store_blocks(&w, &store(None, &[(101, 11), (102, 12)]));
 
-        let mut conts = FxHashMap::default();
-        conts.insert(w.clone(), vec![LowerTierContinuation::from_root(0)]);
-        let hits = idx.query_contiguous_hits(&[LocalBlockHash(11), LocalBlockHash(12)], &conts);
-        assert_eq!(hits.get(&w).map(|h| h.count), Some(2));
+        let reached = idx
+            .reachable_chain(&[LocalBlockHash(11), LocalBlockHash(12)], 0, None)
+            .unwrap();
+        assert_eq!(reached.hit.count, 2);
+        assert_eq!(idx.count_owned(&w, &reached.chain), 2);
     }
 
     #[test]
@@ -572,24 +496,22 @@ mod tests {
         // Tail only: parent=999, then local 21,22
         idx.store_blocks(&w, &store(Some(999), &[(201, 21), (202, 22)]));
 
-        let mut conts = FxHashMap::default();
-        conts.insert(
-            w.clone(),
-            vec![LowerTierContinuation::new(2, SequenceBlockHash(999))],
-        );
         let query = [
             LocalBlockHash(1),
             LocalBlockHash(2),
             LocalBlockHash(21),
             LocalBlockHash(22),
         ];
-        let hits = idx.query_contiguous_hits(&query, &conts);
-        assert_eq!(hits.get(&w).map(|h| h.count), Some(2));
-        assert_eq!(
-            hits.get(&w).and_then(|h| h.last_matched_hash),
-            Some(SequenceBlockHash(202))
+        assert!(
+            idx.reachable_chain(&query, 0, None).is_none(),
+            "nothing hangs off root"
         );
-        assert_eq!(hits.get(&w).map(|h| h.end_pos()), Some(4));
+        let hit = idx
+            .reachable_from(&query, 2, Some(SequenceBlockHash(999)))
+            .unwrap();
+        assert_eq!(hit.count, 2);
+        assert_eq!(hit.last_matched_hash, Some(SequenceBlockHash(202)));
+        assert_eq!(hit.end_pos(), 4);
     }
 
     #[test]
@@ -599,14 +521,15 @@ mod tests {
         idx.store_blocks(&w, &store(None, &[(101, 11), (102, 12), (103, 13)]));
         idx.remove_blocks(&w, &[102]);
 
-        let mut conts = FxHashMap::default();
-        conts.insert(w.clone(), vec![LowerTierContinuation::from_root(0)]);
-        let hits = idx.query_contiguous_hits(
-            &[LocalBlockHash(11), LocalBlockHash(12), LocalBlockHash(13)],
-            &conts,
-        );
+        let hit = idx
+            .reachable_from(
+                &[LocalBlockHash(11), LocalBlockHash(12), LocalBlockHash(13)],
+                0,
+                None,
+            )
+            .unwrap();
         // First edge remains; walk stops at missing middle edge.
-        assert_eq!(hits.get(&w).map(|h| h.count), Some(1));
+        assert_eq!(hit.count, 1);
     }
 
     #[test]
@@ -618,11 +541,80 @@ mod tests {
         idx.store_blocks(&b, &store(None, &[(101, 11), (102, 12)]));
         idx.remove_blocks(&a, &[101, 102]);
 
-        let mut conts = FxHashMap::default();
-        conts.insert(a.clone(), vec![LowerTierContinuation::from_root(0)]);
-        conts.insert(b.clone(), vec![LowerTierContinuation::from_root(0)]);
-        let hits = idx.query_contiguous_hits(&[LocalBlockHash(11), LocalBlockHash(12)], &conts);
-        assert_eq!(hits.get(&a).map(|h| h.count), Some(0));
-        assert_eq!(hits.get(&b).map(|h| h.count), Some(2));
+        // The edges survive because `b` still owns them; the ownership-blind
+        // walk sees the full chain, and only `b` counts as a local holder.
+        let reached = idx
+            .reachable_chain(&[LocalBlockHash(11), LocalBlockHash(12)], 0, None)
+            .unwrap();
+        assert_eq!(reached.hit.count, 2);
+        assert_eq!(idx.count_owned(&a, &reached.chain), 0);
+        assert_eq!(idx.count_owned(&b, &reached.chain), 2);
+    }
+
+    #[test]
+    fn walk_without_chain_matches_walk_with_chain() {
+        let idx = LowerTierIndexer::new();
+        idx.store_blocks(
+            &worker("w1"),
+            &store(None, &[(101, 11), (102, 12), (103, 13)]),
+        );
+        let query = [LocalBlockHash(11), LocalBlockHash(12), LocalBlockHash(13)];
+
+        let full = idx.walk(&query, 0, None, true).unwrap();
+        let span_only = idx.walk(&query, 0, None, false).unwrap();
+
+        assert_eq!(full.hit, span_only.hit);
+        assert_eq!(
+            full.chain,
+            vec![
+                SequenceBlockHash(101),
+                SequenceBlockHash(102),
+                SequenceBlockHash(103)
+            ]
+        );
+        assert!(span_only.chain.is_empty(), "chain must not be collected");
+        assert!(span_only.blocks_from(0).is_empty());
+        assert_eq!(span_only.block_at(1), None);
+    }
+
+    #[test]
+    fn retraces_from_matches_resumed_walk() {
+        let idx = LowerTierIndexer::new();
+        idx.store_blocks(
+            &worker("w1"),
+            &store(None, &[(101, 11), (102, 12), (103, 13), (104, 14)]),
+        );
+        let query = [
+            LocalBlockHash(11),
+            LocalBlockHash(12),
+            LocalBlockHash(13),
+            LocalBlockHash(14),
+        ];
+        let root = idx.reachable_chain(&query, 0, None).unwrap();
+        assert_eq!(root.hit.end_pos(), 4);
+
+        // A breakpoint standing on block 102 at position 2 retraces the root
+        // chain; the real resumed walk agrees with the suffix view.
+        assert!(root.retraces_from(2, SequenceBlockHash(102)));
+        let resumed = idx
+            .reachable_chain(&query, 2, Some(SequenceBlockHash(102)))
+            .unwrap();
+        assert_eq!(resumed.hit.end_pos(), root.hit.end_pos());
+        assert_eq!(resumed.hit.last_matched_hash, root.hit.last_matched_hash);
+        assert_eq!(resumed.chain.as_slice(), root.blocks_from(2));
+
+        // Same position but a different upstream block (another engine's
+        // sequence hash): no shortcut, the caller has to walk.
+        assert!(!root.retraces_from(2, SequenceBlockHash(999)));
+        // Resuming from the chain's own start is not a retrace of anything.
+        assert!(!root.retraces_from(0, SequenceBlockHash(101)));
+        // Standing on the last block: the resumed walk would start where the
+        // root walk failed, which is still "retraced" (with an empty suffix).
+        assert!(root.retraces_from(4, SequenceBlockHash(104)));
+        assert!(idx
+            .reachable_chain(&query, 4, Some(SequenceBlockHash(104)))
+            .is_none());
+        // Beyond the chain end there is nothing to retrace.
+        assert!(!root.retraces_from(5, SequenceBlockHash(104)));
     }
 }

@@ -998,6 +998,68 @@ fn test_pooled_walk_crosses_ownership_boundary() {
 }
 
 #[test]
+fn test_shared_hbm_breakpoint_off_root_chain_resumes_for_every_dp() {
+    // inst-a's two DPs hold the same HBM prefix [0,2) under engine-side block
+    // hashes (901, 902) that differ from the pool's own hashes for that prefix
+    // (101, 102). The pooled continuation [2,4) is anchored on the *engine*
+    // hash 902, so it is reachable only by resuming from the HBM breakpoint —
+    // the pool root chain stops at 2 because nothing continues from 102.
+    //
+    // Both DPs share the breakpoint (2, 902): the resumed walk is computed
+    // once and reused, and neither DP may lose coverage because of that.
+    // inst-c has no HBM and can only follow the root chain.
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-shared-break", "t1");
+
+    let tokens: Vec<i64> = (0..16).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+    assert_eq!(hashes.len(), 4);
+
+    for dp_rank in [0, 1] {
+        store_chain(
+            &entry,
+            &worker_of("inst-a", dp_rank, StorageMedium::Npu),
+            None,
+            &[(901, hashes[0].0), (902, hashes[1].0)],
+        );
+    }
+    let pool = worker_of("inst-c", 0, StorageMedium::Cpu);
+    store_chain(
+        &entry,
+        &pool,
+        None,
+        &[(101, hashes[0].0), (102, hashes[1].0)],
+    );
+    store_chain(
+        &entry,
+        &pool,
+        Some(902),
+        &[(103, hashes[2].0), (104, hashes[3].0)],
+    );
+
+    let resp = indexer
+        .query("model-shared-break", "t1", &tokens, 4)
+        .unwrap();
+    let tenant = &resp.tenants["t1"];
+
+    for rank in ["0", "1"] {
+        let dp = &tenant["inst-a"].dp[rank];
+        assert_eq!(dp.npu_blocks, 2, "inst-a/{rank} HBM prefix");
+        assert_eq!(
+            dp.cpu_blocks, 2,
+            "inst-a/{rank} must resume from its own HBM breakpoint into [2,4)"
+        );
+        assert_eq!(dp.matched_tokens, 16);
+    }
+    let dp_c = &tenant["inst-c"].dp["0"];
+    assert_eq!(dp_c.npu_blocks, 0);
+    assert_eq!(
+        dp_c.cpu_blocks, 2,
+        "without HBM the root chain ends at the missing (102 -> h2) edge"
+    );
+}
+
+#[test]
 fn test_own_hbm_bridges_pool_gap_and_differentiates_dps() {
     // The pooled chain is broken: [0,2) exists, position 2 is missing, [3,5)
     // exists anchored after position 2. Only inst-a's own HBM covers position 2,

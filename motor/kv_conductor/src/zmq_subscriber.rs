@@ -367,50 +367,11 @@ fn process_payload(
         // Format 3 — Memcache KvEvent batch: {"events": [PoolEvent, ...]}
         if let Ok(batch) = rmp_serde::from_slice::<events::MemcacheEventBatch>(payload_bytes) {
             *batch_count += 1;
-            let mut stored = 0u32;
-            let mut removed = 0u32;
-            let mut cleared = 0u32;
-            let mut other = 0u32;
-            let mut hash_total = 0usize;
-            let mut event_backend_ids: Vec<&str> = Vec::new();
-            for ev in &batch.events {
-                let t = ev
-                    .event_type
-                    .as_deref()
-                    .or(ev.legacy_type.as_deref())
-                    .unwrap_or("");
-                if t.contains("stored") || t.contains("Stored") {
-                    stored += 1;
-                } else if t.contains("removed") || t.contains("Removed") {
-                    removed += 1;
-                } else if t.contains("cleared")
-                    || t.contains("Cleared")
-                    || t.contains("AllBlocksCleared")
-                {
-                    cleared += 1;
-                } else {
-                    other += 1;
-                }
-                hash_total += ev.seq_hashes.as_ref().map(|v| v.len()).unwrap_or(0);
-                hash_total += ev.block_hashes.as_ref().map(|v| v.len()).unwrap_or(0);
-                if let Some(id) = ev.backend_id.as_deref() {
-                    if !event_backend_ids.contains(&id) {
-                        event_backend_ids.push(id);
-                    }
-                }
+            // Per-batch outcome tally is diagnostics only; skip the extra pass
+            // over the batch unless someone is actually reading debug logs.
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                log_memcache_batch_summary(backend_id, dp_rank, &batch);
             }
-            tracing::debug!(
-                %backend_id, dp_rank,
-                num_events = batch.events.len(),
-                stored,
-                removed,
-                cleared,
-                other,
-                hash_total,
-                event_backend_ids = ?event_backend_ids,
-                event_backend_id = %event_backend_ids.first().copied().unwrap_or(""),
-                "kv_event parsed backend=memcache"
-            );
             for zmq_event in &batch.events {
                 *event_count += 1;
                 // Log the event's own backend_id (the originating LocalService's
@@ -524,6 +485,52 @@ fn subscriber_source_backend(backend_id: &str) -> (&'static str, &'static str) {
 }
 
 /// Log an unparsable ZMQ payload with a hex preview and msgpack type hint.
+/// One debug line per Memcache batch, tallied by event type, so a dump can be
+/// counted by outcome without subtracting per-event `queued` lines.
+fn log_memcache_batch_summary(backend_id: &str, dp_rank: u32, batch: &events::MemcacheEventBatch) {
+    let mut stored = 0u32;
+    let mut removed = 0u32;
+    let mut cleared = 0u32;
+    let mut other = 0u32;
+    let mut hash_total = 0usize;
+    let mut event_backend_ids: Vec<&str> = Vec::new();
+    for ev in &batch.events {
+        let t = ev
+            .event_type
+            .as_deref()
+            .or(ev.legacy_type.as_deref())
+            .unwrap_or("");
+        if t.contains("stored") || t.contains("Stored") {
+            stored += 1;
+        } else if t.contains("removed") || t.contains("Removed") {
+            removed += 1;
+        } else if t.contains("cleared") || t.contains("Cleared") || t.contains("AllBlocksCleared") {
+            cleared += 1;
+        } else {
+            other += 1;
+        }
+        hash_total += ev.seq_hashes.as_ref().map(|v| v.len()).unwrap_or(0);
+        hash_total += ev.block_hashes.as_ref().map(|v| v.len()).unwrap_or(0);
+        if let Some(id) = ev.backend_id.as_deref() {
+            if !event_backend_ids.contains(&id) {
+                event_backend_ids.push(id);
+            }
+        }
+    }
+    tracing::debug!(
+        %backend_id, dp_rank,
+        num_events = batch.events.len(),
+        stored,
+        removed,
+        cleared,
+        other,
+        hash_total,
+        event_backend_ids = ?event_backend_ids,
+        event_backend_id = %event_backend_ids.first().copied().unwrap_or(""),
+        "kv_event parsed backend=memcache"
+    );
+}
+
 fn log_unparsed_payload(backend_id: &str, dp_rank: u32, payload_bytes: &[u8], message: &str) {
     let (source, backend) = subscriber_source_backend(backend_id);
     let preview: String = payload_bytes

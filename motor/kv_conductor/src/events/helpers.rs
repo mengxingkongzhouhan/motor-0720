@@ -10,6 +10,11 @@
 
 //! Shared helpers for event application.
 
+use std::sync::OnceLock;
+
+use parking_lot::Mutex;
+use rustc_hash::FxHashSet;
+
 use crate::backend::MatchMode;
 use crate::protocols::*;
 
@@ -79,26 +84,57 @@ pub(super) fn resolve_workers(
     } else {
         "no_matching_dp"
     };
+    let fallback_instance = pool_location_instance_id(backend_id);
     let fallback: Vec<WorkerKey> = target_media
         .iter()
         .map(|&medium| WorkerKey {
-            instance_id: pool_location_instance_id(backend_id),
+            instance_id: fallback_instance.clone(),
             backend_id: backend_id.to_string(),
             dp_rank: 0,
             medium,
         })
         .collect();
-    tracing::info!(
-        %backend_id,
-        dp_rank,
-        ?match_mode,
-        index_present,
-        indexed_ip_count,
-        ip_known,
-        fallback_instance = %pool_location_instance_id(backend_id),
-        media = ?target_media.iter().map(|m| m.log_str()).collect::<Vec<_>>(),
-        reason,
-        "kv_event pool_unmapped"
-    );
+
+    // A decode LocalService emits one of these per pooled block, so the
+    // per-event line would drown the info log. Say it once per store IP at
+    // info — that is the fact an operator needs — and keep the rest at trace.
+    if first_unmapped_sighting(backend_id) {
+        tracing::info!(
+            %backend_id,
+            dp_rank,
+            ?match_mode,
+            index_present,
+            indexed_ip_count,
+            ip_known,
+            fallback_instance = %fallback_instance,
+            media = ?target_media.iter().map(|m| m.log_str()).collect::<Vec<_>>(),
+            reason,
+            "kv_event pool_unmapped (first sighting; further events from this ip at trace)"
+        );
+    } else {
+        tracing::trace!(
+            %backend_id,
+            dp_rank,
+            fallback_instance = %fallback_instance,
+            reason,
+            "kv_event pool_unmapped"
+        );
+    }
     fallback
+}
+
+/// Store IPs that have already fallen back to `pool:<ip>` at least once.
+///
+/// Bounded by the number of distinct pool nodes, so it is never cleared.
+static UNMAPPED_BACKENDS_SEEN: OnceLock<Mutex<FxHashSet<String>>> = OnceLock::new();
+
+/// `true` the first time `backend_id` falls back to a pool placeholder.
+fn first_unmapped_sighting(backend_id: &str) -> bool {
+    let seen = UNMAPPED_BACKENDS_SEEN.get_or_init(|| Mutex::new(FxHashSet::default()));
+    let mut guard = seen.lock();
+    if guard.contains(backend_id) {
+        return false;
+    }
+    guard.insert(backend_id.to_string());
+    true
 }

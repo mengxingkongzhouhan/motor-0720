@@ -430,7 +430,8 @@ msgpack 编码都不输出这两个 key（每个 DP 仍是四字段，与拆分�
   │      reachable_chain(hashes, end_pos, last_seq)          │
   │    best = 续走与 root 链中终点更远者（tie 取续走）        │
   │  -> medium_ends[dp].cpu = best.end_pos                   │
-  │  -> count_owned(worker, best.blocks[npu..]) = cpu_local  │
+  │  -> split 开启时 count_owned(worker, best.blocks[npu..]) │
+  │     记为 cpu_local；关闭则跳过逐块归属查询               │
   └──────────────────────────────────────────────────────────┘
                            │
                            ▼

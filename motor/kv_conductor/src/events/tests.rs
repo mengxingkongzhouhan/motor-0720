@@ -1083,7 +1083,7 @@ fn test_ip_only_without_hbm_index_queues_at_pool_location() {
 #[test]
 fn test_unmapped_decode_pool_is_visible_to_registered_prefill() {
     use crate::indexer::Indexer;
-    use crate::protocols::{pool_location_instance_id, HbmIpIndex};
+    use crate::protocols::{HbmIpIndex, pool_location_instance_id};
 
     let indexer = Indexer::new();
     let entry = indexer.get_or_create("qwen3", "default");

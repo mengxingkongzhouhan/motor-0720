@@ -18,12 +18,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use clap::Parser;
-use tracing_subscriber::fmt::time::OffsetTime;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::time::OffsetTime;
 
 use kv_conductor::indexer::{CacheMaintenanceConfig, QueryOptions};
 use kv_conductor::registry::WorkerRegistry;
-use kv_conductor::server::{create_router, AppState};
+use kv_conductor::server::{AppState, create_router};
 
 /// KV Conductor — Radix-tree-based KV cache indexer for MindIE-PyMotor.
 #[derive(Parser, Debug)]

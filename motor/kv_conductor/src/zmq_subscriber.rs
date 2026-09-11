@@ -15,8 +15,8 @@
 //! module.  Supports Mooncake Master and Memcache MetaService (pool
 //! backends) and vLLM engine (native msgspec) event formats.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -694,7 +694,7 @@ pub fn replay_events(
 
 #[cfg(test)]
 mod tests {
-    use super::{event_source_for_media, EventSource};
+    use super::{EventSource, event_source_for_media};
     use crate::protocols::StorageMedium;
 
     #[test]

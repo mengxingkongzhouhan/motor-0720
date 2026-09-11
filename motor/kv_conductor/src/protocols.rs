@@ -318,8 +318,26 @@ pub struct DpBlocks {
     /// therefore a lower bound on co-location — never an over-count, which is the
     /// safe direction (over-counting would tell the scheduler a fetch is free
     /// when it is not).
-    pub cpu_local_blocks: u32,
-    pub cpu_remote_blocks: u32,
+    ///
+    /// Only present when the conductor runs with `--split-cpu-hits`; the
+    /// default response carries just the four counters above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_local_blocks: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_remote_blocks: Option<u32>,
+}
+
+impl DpBlocks {
+    /// Number of map entries the msgpack encoder must emit for this block.
+    ///
+    /// `cpu_local_blocks` / `cpu_remote_blocks` are always set together, so the
+    /// count is 4 or 6 — the same keys serde writes for JSON.
+    fn wire_field_count(&self) -> u32 {
+        let base = 4;
+        let local = u32::from(self.cpu_local_blocks.is_some());
+        let remote = u32::from(self.cpu_remote_blocks.is_some());
+        base + local + remote
+    }
 }
 
 /// Per-instance match data returned in query response.
@@ -406,8 +424,8 @@ pub fn encode_query_response_msgpack(response: &QueryResponse, out: &mut Vec<u8>
             for (rank, blocks) in &data.dp {
                 write_str(out, rank).expect("write rank");
                 // Field count must match the `Serialize` derive on `DpBlocks`;
-                // the msgpack/JSON shape equality test guards the two together.
-                write_map_len(out, 6).expect("blocks map len");
+                // the msgpack/JSON shape equality tests guard the two together.
+                write_map_len(out, blocks.wire_field_count()).expect("blocks map len");
                 write_str(out, "matched_tokens").expect("write key");
                 write_u32(out, blocks.matched_tokens).expect("write matched_tokens");
                 write_str(out, "npu_blocks").expect("write key");
@@ -416,10 +434,14 @@ pub fn encode_query_response_msgpack(response: &QueryResponse, out: &mut Vec<u8>
                 write_u32(out, blocks.cpu_blocks).expect("write cpu_blocks");
                 write_str(out, "disk_blocks").expect("write key");
                 write_u32(out, blocks.disk_blocks).expect("write disk_blocks");
-                write_str(out, "cpu_local_blocks").expect("write key");
-                write_u32(out, blocks.cpu_local_blocks).expect("write cpu_local_blocks");
-                write_str(out, "cpu_remote_blocks").expect("write key");
-                write_u32(out, blocks.cpu_remote_blocks).expect("write cpu_remote_blocks");
+                if let Some(local) = blocks.cpu_local_blocks {
+                    write_str(out, "cpu_local_blocks").expect("write key");
+                    write_u32(out, local).expect("write cpu_local_blocks");
+                }
+                if let Some(remote) = blocks.cpu_remote_blocks {
+                    write_str(out, "cpu_remote_blocks").expect("write key");
+                    write_u32(out, remote).expect("write cpu_remote_blocks");
+                }
             }
         }
     }
@@ -881,8 +903,8 @@ mod tests {
                 npu_blocks: 0,
                 cpu_blocks: 4,
                 disk_blocks: 0,
-                cpu_local_blocks: 1,
-                cpu_remote_blocks: 3,
+                cpu_local_blocks: Some(1),
+                cpu_remote_blocks: Some(3),
             },
         );
 
@@ -896,8 +918,13 @@ mod tests {
         assert_eq!(parsed["DP"]["0"]["matched_tokens"], 768);
         assert_eq!(parsed["DP"]["0"]["npu_blocks"], 6);
         assert_eq!(parsed["DP"]["0"]["cpu_blocks"], 0);
+        // Split disabled for this DP: the keys are absent, not zero.
+        assert!(parsed["DP"]["0"].get("cpu_local_blocks").is_none());
+        assert!(parsed["DP"]["0"].get("cpu_remote_blocks").is_none());
         assert_eq!(parsed["DP"]["1"]["matched_tokens"], 1024);
         assert_eq!(parsed["DP"]["1"]["cpu_blocks"], 4);
+        assert_eq!(parsed["DP"]["1"]["cpu_local_blocks"], 1);
+        assert_eq!(parsed["DP"]["1"]["cpu_remote_blocks"], 3);
     }
 
     // ── KvEventWirePayload normalization ────────────────────────────────
@@ -1132,8 +1159,8 @@ mod tests {
                 cpu_blocks: 3,
                 disk_blocks: 0,
                 // 2 of the 3 pooled blocks are on this DP's own machine.
-                cpu_local_blocks: 2,
-                cpu_remote_blocks: 1,
+                cpu_local_blocks: Some(2),
+                cpu_remote_blocks: Some(1),
             },
         );
         instances.insert(
@@ -1147,22 +1174,60 @@ mod tests {
         QueryResponse { tenants }
     }
 
-    #[test]
-    fn test_query_response_msgpack_matches_json_shape() {
-        let response = sample_query_response();
+    fn assert_msgpack_matches_json(response: &QueryResponse) -> serde_json::Value {
         let mut buf = Vec::new();
-        encode_query_response_msgpack(&response, &mut buf);
+        encode_query_response_msgpack(response, &mut buf);
 
         // Decode the msgpack payload and compare with the JSON wire shape
         // field-by-field. This guards the hand-written encoder against
         // drifting from the serde_json shape (which the Python client parses).
         let msgpack_value = rmpv::decode::read_value(&mut buf.as_slice()).unwrap();
         let msgpack_json = rmpv_to_json(&msgpack_value);
-        let json_value = serde_json::to_value(&response).unwrap();
+        let json_value = serde_json::to_value(response).unwrap();
         assert_eq!(
             msgpack_json, json_value,
             "msgpack response diverges from JSON wire shape"
         );
+        json_value
+    }
+
+    #[test]
+    fn test_query_response_msgpack_matches_json_shape() {
+        let json = assert_msgpack_matches_json(&sample_query_response());
+        let dps = &json["default"]["prefill-0"]["DP"];
+        assert_eq!(dps["0"].as_object().unwrap().len(), 4);
+        assert!(dps["0"].get("cpu_local_blocks").is_none());
+        assert_eq!(dps["1"].as_object().unwrap().len(), 6);
+        assert_eq!(dps["1"]["cpu_local_blocks"], 2);
+        assert_eq!(dps["1"]["cpu_remote_blocks"], 1);
+    }
+
+    #[test]
+    fn test_query_response_msgpack_without_cpu_split_is_legacy_shape() {
+        // With the split switched off every DP carries exactly the four
+        // pre-split counters, so older clients see an unchanged payload.
+        let mut response = sample_query_response();
+        for instances in response.tenants.values_mut() {
+            for imd in instances.values_mut() {
+                for blocks in imd.dp.values_mut() {
+                    blocks.cpu_local_blocks = None;
+                    blocks.cpu_remote_blocks = None;
+                }
+            }
+        }
+        let json = assert_msgpack_matches_json(&response);
+        for (_, blocks) in json["default"]["prefill-0"]["DP"].as_object().unwrap() {
+            let keys: Vec<&str> = blocks
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(keys.len(), 4, "unexpected keys: {keys:?}");
+            for key in ["matched_tokens", "npu_blocks", "cpu_blocks", "disk_blocks"] {
+                assert!(keys.contains(&key), "missing {key}: {keys:?}");
+            }
+        }
     }
 
     #[test]

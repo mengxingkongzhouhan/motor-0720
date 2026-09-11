@@ -244,13 +244,19 @@ Coordinator                                  KV Conductor
 | `npu_blocks` / `cpu_blocks` / `disk_blocks` | 该 DP 互斥真实命中块数（同前缀副本只归最高优先级介质） |
 | `matched_tokens` | 互斥块数之和 × `block_size`（真实覆盖长度） |
 | `longest_matched` | 该实例所有 DP 的 `matched_tokens` 最大值 |
-| `cpu_local_blocks` / `cpu_remote_blocks` | `cpu_blocks` 按搬运代价拆开：本 Pod DRAM（几乎免费）/ 需要传输 |
+| `cpu_local_blocks` / `cpu_remote_blocks` | `cpu_blocks` 按搬运代价拆开：本 Pod DRAM（几乎免费）/ 需要传输。**默认不下发**，需 `--split-cpu-hits` 开启 |
 
-### 池命中的本地/远端拆分
+### 池命中的本地/远端拆分（默认关闭）
 
 池块任意节点可取，但**搬运代价不同**：本机 DRAM 几乎免费，跨机要走
 `device_rdma` / `device_sdma` / `device_urma`。原先所有池命中都统一记作 `cpu_blocks`，
 调度器看不出这个差异。
+
+这个拆分由 `--split-cpu-hits`（或环境变量 `KV_CONDUCTOR_SPLIT_CPU_HITS=true`）控制，
+**默认关闭**：关闭时 `/query` 响应每个 DP 只有 `matched_tokens` / `npu_blocks` / `cpu_blocks` /
+`disk_blocks` 四个字段（与拆分引入前的 wire 格式完全一致），走查也不做逐块 owner 统计；
+开启后才多出 `cpu_local_blocks` / `cpu_remote_blocks`。开关只影响这两个字段的有无，
+`cpu_blocks` 等覆盖数值不变。
 
 判断依据是**边的 owner**：一条池事件会广播给上报它的那个 Pod 里的所有 DP，所以「owner 里有
 当前 DP」等价于「这块在当前 DP 自己的 Pod 里」，而同 Pod 必然同机 —— 于是这就是一次免搬运
@@ -278,6 +284,7 @@ Coordinator                                  KV Conductor
 |------|--------|------|
 | `--port` / `-p` | `13333` | HTTP 服务端口 |
 | `--host` | `::` | 绑定地址（默认双栈） |
+| `--split-cpu-hits` | 关闭 | `/query` 响应额外下发 `cpu_local_blocks` / `cpu_remote_blocks`；也可用 `KV_CONDUCTOR_SPLIT_CPU_HITS=true` 开启 |
 
 ## API
 

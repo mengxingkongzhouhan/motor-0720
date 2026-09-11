@@ -299,11 +299,17 @@ root 走查不依赖任何上层覆盖，所以「HBM 全被驱逐、池中保�
   时，使用**注册记录中的** model/tenant 回收空 `IndexerEntry`，不信任注销请求里的同名字段。
 - `POST /events` 的 `shutdown=true` 当前只记录日志，完整释放仍需显式调用 `/unregister`。
 
-### 池命中的本地/远端拆分
+### 池命中的本地/远端拆分（默认关闭）
 
 池块任意节点可取，但**搬运代价不同**：本机 DRAM 几乎免费，跨机要走
 `device_rdma` / `device_sdma` / `device_urma`。原先所有池命中都统一记作 `cpu_blocks`，
 调度器看不出这个差异。
+
+拆分由启动参数 `--split-cpu-hits`（环境变量 `KV_CONDUCTOR_SPLIT_CPU_HITS=true` 等价）控制，
+**默认关闭**。关闭时 `DpBlocks.cpu_local_blocks` / `cpu_remote_blocks` 为 `None`，JSON 与
+msgpack 编码都不输出这两个 key（每个 DP 仍是四字段，与拆分引入前的 wire 格式一致），
+走查也跳过 `count_owned`；开启后才写入并下发。开关只决定这两个字段的有无，
+`npu/cpu/disk_blocks` 与 `matched_tokens` 的数值在两种模式下完全相同（有测试守护）。
 
 判断依据是**边的 owner**：一条池事件会广播给上报它的那个 Pod 里的所有 DP，所以「owner 里
 有当前 DP」等价于「这块在当前 DP 自己的 Pod 里」，而同 Pod 必然同机 —— 于是这就是一次
@@ -583,6 +589,7 @@ maintenance 周期。`offload` 没有容量上限，但不会永久驻留，同�
 | `--pending-ttl-secs` | `60` | Pool-first 等待项 TTL |
 | `--content-ttl-secs` | `300` | CPU→Disk promotion 映射保留 TTL |
 | `--offload-ttl-secs` | `600` | 未确认 engine offload TTL；无容量上限 |
+| `--split-cpu-hits` | 关闭 | `/query` 额外下发 `cpu_local_blocks` / `cpu_remote_blocks`（见「池命中的本地/远端拆分」）；`KV_CONDUCTOR_SPLIT_CPU_HITS=true` 等价 |
 
 ### vLLM 事件过滤
 

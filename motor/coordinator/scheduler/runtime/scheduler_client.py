@@ -1006,7 +1006,13 @@ class AsyncSchedulerClient:
         prefill_cost_map: dict[tuple[int, int], float] | None = None,
         cpu_hit_map: dict[tuple[int, int], float] | None = None,
     ) -> Workload:
-        """Same commit formula the former ALLOCATE_ONLY handler used (R4)."""
+        """Same commit formula the former ALLOCATE_ONLY handler used (R4).
+
+        smetric_gated stamps conductor-derived remaining prefill and cpu_blocks.
+        kv_cache_affinity still commits SHM ``active_tokens`` as ``isl - matched``, and
+        additionally stamps overlay ``prefill_cost = max(0, isl)`` (cache hits do not
+        reduce the overlay). RR/LB leave overlay fields at 0.
+        """
         if candidate_policy == CANDIDATE_POLICY_SMETRIC_GATED:
             pair = (instance.id, endpoint.id)
             return Workload(
@@ -1014,15 +1020,17 @@ class AsyncSchedulerClient:
                 prefill_cost=(prefill_cost_map or {}).get(pair, 0.0),
                 cpu_hit_blocks=(cpu_hit_map or {}).get(pair, 0.0),
             )
-        if (
-            candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY
-            and isl > 0
-            and role in (PDRole.ROLE_P, PDRole.ROLE_U)
-        ):
-            return calculate_committed_workload(
-                role,
-                isl,
-                matched_tokens=matched_tokens_map.get((instance.id, endpoint.id), 0.0),
+        if candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY and role in (PDRole.ROLE_P, PDRole.ROLE_U):
+            active_tokens = demand.active_tokens
+            if isl > 0:
+                active_tokens = calculate_committed_workload(
+                    role,
+                    isl,
+                    matched_tokens=matched_tokens_map.get((instance.id, endpoint.id), 0.0),
+                ).active_tokens
+            return Workload(
+                active_tokens=active_tokens,
+                prefill_cost=max(0.0, float(isl)),
             )
         return demand
 

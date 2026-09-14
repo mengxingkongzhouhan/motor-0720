@@ -35,6 +35,7 @@ from motor.coordinator.scheduler.runtime.scheduler_client import (
     SchedulerClientConfig,
     _SchedulerInstanceCache,
     _collect_active_endpoints_from_cache,
+    _format_request_commit_stamp,
 )
 from motor.coordinator.scheduler.runtime.workload_shm.native import (
     STATUS_BLOCKED,
@@ -327,6 +328,14 @@ class TestSchedulerInstanceCache:
         await self.cache.apply_remove([inst])
         assert self.cache._endpoint_running_requests == {}
         assert self.cache.format_endpoint_load_snapshot(PDRole.ROLE_P) == "<none>"
+
+
+def test_format_request_commit_stamp():
+    """This-request stamp is independent of endpoint ledger snapshot."""
+    assert _format_request_commit_stamp(Workload(active_tokens=4.0)) == "4.0/0.0/0.0"
+    assert _format_request_commit_stamp(
+        Workload(active_tokens=12.0, prefill_cost=100.0, cpu_hit_blocks=3.0)
+    ) == "12.0/100.0/3.0"
 
 
 # ========================================================================
@@ -1075,6 +1084,7 @@ class TestSelectAndAllocateCas:
             assert snap_lines
             assert "req_id=req-snap" in snap_lines[0]
             assert "ins=1 ep=10" in snap_lines[0]
+            assert "req[active_tokens/prefill_cost/cpu_hit_blocks]=4.0/0.0/0.0" in snap_lines[0]
             assert "1/10:0/1.0" in snap_lines[0]
             assert "2/20:0/50.0" in snap_lines[0]
             assert client._cache._endpoint_running_requests[(1, 10)] == 1

@@ -145,6 +145,23 @@ def _endpoint_from_dict(data: dict) -> Endpoint | None:
         return None
 
 
+def _format_request_commit_stamp(committed: Workload) -> str:
+    """Render this request's stamp as ``active_tokens/prefill_cost/cpu_hit_blocks``."""
+    try:
+        active = float(getattr(committed, "active_tokens", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        active = 0.0
+    try:
+        prefill = float(getattr(committed, "prefill_cost", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        prefill = 0.0
+    try:
+        cpu_hits = float(getattr(committed, "cpu_hit_blocks", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        cpu_hits = 0.0
+    return "%.1f/%.1f/%.1f" % (active, prefill, cpu_hits)
+
+
 class _SchedulerInstanceCache:
     """
     Instance cache with lock-free reads, incremental role updates, and workload patch from shm.
@@ -1340,17 +1357,6 @@ class AsyncSchedulerClient:
             if pair in excluded:
                 use_authoritative = True
                 continue
-            logger.info(
-                "select_and_allocate selected req_id=%s role=%s ins=%s ep=%s score=%.4f fast_path=%s "
-                "endpoints[ins/ep:running/workload]=%s",
-                req_info.req_id,
-                role_str,
-                out_instance.id,
-                out_endpoint.id,
-                selected_score,
-                not use_authoritative,
-                self._cache.format_endpoint_load_snapshot(role),
-            )
             committed = self._committed_workload_for(
                 role,
                 candidate_policy,
@@ -1361,6 +1367,19 @@ class AsyncSchedulerClient:
                 isl,
                 prefill_cost_map=prefill_cost_map,
                 cpu_hit_map=cpu_hit_map,
+            )
+            logger.info(
+                "select_and_allocate selected req_id=%s role=%s ins=%s ep=%s score=%.4f fast_path=%s "
+                "req[active_tokens/prefill_cost/cpu_hit_blocks]=%s "
+                "endpoints[ins/ep:running/workload]=%s",
+                req_info.req_id,
+                role_str,
+                out_instance.id,
+                out_endpoint.id,
+                selected_score,
+                not use_authoritative,
+                _format_request_commit_stamp(committed),
+                self._cache.format_endpoint_load_snapshot(role),
             )
             meta = self._workload_reader.entry_meta(out_instance.id, out_endpoint.id)
             if meta is None or int(meta.get("flags", 0)) & FLAG_BLOCKED:

@@ -35,7 +35,6 @@ from motor.coordinator.scheduler.policy.smetric_gated import (
     GatedCandidate,
     SMetricGatedPolicy,
     _cpu_hit_blocks,
-    _prefill_cost,
     pick_gated,
     sort_candidates,
 )
@@ -174,11 +173,6 @@ class TestCpuHitLedger:
 
 
 class TestConductorParsing:
-    def test_stamp_prefill_cost_is_full_isl(self):
-        assert _prefill_cost(100) == 100.0
-        assert _prefill_cost(0) == 0.0
-        assert _prefill_cost(-8) == 0.0
-
     def test_cpu_blocks_from_dp_blocks(self):
         assert _cpu_hit_blocks({"npu_blocks": 2, "cpu_blocks": 5, "matched_tokens": 64}) == 5
 
@@ -359,11 +353,11 @@ class TestPolicy:
 
         assert [(c.endpoint.id, c.ledger_prefill_cost, c.prefill_cost, c.cpu_hit_blocks) for c in ranked] == [
             (11, 100.0, 100.0, 0.0),
-            (20, 200.0, 100.0, 0.0),
-            (10, 300.0, 100.0, 4.0),
+            (20, 200.0, 50.0, 0.0),
+            (10, 300.0, 10.0, 4.0),
         ]
-        assert req_info.smetric_gated_debug == {(1, 11): (100.0, 0.0), (2, 20): (100.0, 0.0), (1, 10): (100.0, 4.0)}
-        assert allocated_prefill_cost(req_info, 1, 10) == 100.0
+        assert req_info.smetric_gated_debug == {(1, 11): (100.0, 0.0), (2, 20): (50.0, 0.0), (1, 10): (10.0, 4.0)}
+        assert allocated_prefill_cost(req_info, 1, 10) == 10.0
         assert allocated_cpu_hit_blocks(req_info, 1, 10) == 4.0
         assert allocated_cpu_hit_blocks(req_info, 9, 9) == 0.0
 

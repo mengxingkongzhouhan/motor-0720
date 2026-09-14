@@ -77,9 +77,8 @@ class RequestInfo(BaseModel):
         default=None,
         exclude=True,
         description="Per-endpoint (prefill_cost, cpu_hit_blocks) cached by the smetric_gated policy at "
-        "selection; prefill_cost is max(0, isl) (not discounted by KV hits). The worker re-ranks by "
-        "ledger prefill_cost, gates on ledger averages and stamps both values on the committed endpoint. "
-        "Keyed by (instance_id, endpoint_id).",
+        "selection; the worker re-ranks by ledger prefill_cost, gates on ledger averages and stamps "
+        "both values on the committed endpoint. Keyed by (instance_id, endpoint_id).",
     )
     api: str = Field(..., description="API need to be forwarded")
     entry_api: str = Field(

@@ -30,9 +30,9 @@ def allocated_prefill_cost(
     """
     Prefill cost stamped onto the committed endpoint's workload.
 
-    ``smetric_gated`` caches ``(prefill_cost, cpu_hit_blocks)`` per endpoint, where
-    ``prefill_cost`` is ``max(0, isl)``. KV affinity stores a 4-tuple whose third field is the
-    request prefill cost. Missing/invalid entries yield 0.
+    ``smetric_gated`` caches ``(prefill_cost, cpu_hit_blocks)`` per endpoint. KV affinity
+    stores a 4-tuple whose third field is the request prefill cost. Missing/invalid entries
+    yield 0.
     """
     if req_info is None or instance_id is None or endpoint_id is None:
         return 0.0

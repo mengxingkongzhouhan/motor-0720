@@ -25,7 +25,7 @@ class Workload(BaseModel):
     active_tokens: float = Field(default=0, description="Active compute load in token units")
     prefill_cost: float = Field(
         default=0,
-        description="In-flight prompt length on this endpoint (smetric_gated sum of max(0, isl)); "
+        description="Remaining prefill cost on this endpoint (smetric_gated outstanding prefill); "
         "0 for RR/LB. Worker-local overlay on motor-0911 (not carried in schema-4 SHM).",
     )
     cpu_hit_blocks: float = Field(

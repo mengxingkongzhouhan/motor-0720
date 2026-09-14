@@ -10,8 +10,8 @@
 SMetric-gated scheduling policy: rank endpoints by their ledger, gate on two ledger averages.
 
 1. Sort the endpoints of the request's role by the ledger ``workload.prefill_cost`` ascending,
-   i.e. the remaining prefill currently outstanding on each endpoint (sum over its in-flight
-   requests of ``isl - matched_tokens``).
+   i.e. the outstanding prompt length currently on each endpoint (sum over its in-flight
+   requests of ``max(0, isl)``; cache hits are not subtracted).
 2. Walk that order and commit the first endpoint whose ledger is at or below BOTH scaled
    averages over the ranked endpoints:
    ``active_tokens <= mean(active_tokens) * active_tokens_mean_factor`` and
@@ -21,10 +21,10 @@ SMetric-gated scheduling policy: rank endpoints by their ledger, gate on two led
 
 All three inputs are ledger fields, so the ranking itself needs no per-request affinity math.
 The KV Conductor is queried once per request only to know what to ADD to the committed
-endpoint's ledger: the request's own remaining prefill (SMetric cost model,
-``max(0, isl - matched_tokens)``) and the CPU-tier KV blocks it would pull there
-(``cpu_blocks``). RELEASE subtracts both again, so ``prefill_cost`` / ``cpu_hit_blocks`` track
-the prefill compute and CPU->NPU KV transfer currently in flight per endpoint.
+endpoint's ledger: the request's prompt length (``max(0, isl)``) and the CPU-tier KV
+blocks it would pull there (``cpu_blocks``). RELEASE subtracts both again, so
+``prefill_cost`` / ``cpu_hit_blocks`` track in-flight prompt length and CPU->NPU KV
+transfer per endpoint.
 
 When no endpoint passes both gates the policy degrades in order: first endpoint passing the
 ``active_tokens`` gate alone, then the head of the list (lowest ledger prefill_cost).
@@ -58,11 +58,6 @@ SMETRIC_GATED_ROLES = frozenset({PDRole.ROLE_P, PDRole.ROLE_U})
 
 # Gate threshold = candidate mean * factor; 1.0 is the plain average.
 DEFAULT_MEAN_FACTOR = 1.0
-
-# SMetric discounts a cached prefix 1:1 against prompt length. Not configurable; not shared with
-# kv_cache_affinity's overlap_credit knob.
-_SMETRIC_OVERLAP_CREDIT = 1
-
 
 def _factor(value: float | None) -> float:
     """Normalize a mean factor: None -> default, negatives -> 0."""
@@ -104,20 +99,12 @@ def _prompt_token_ids(req_info: RequestInfo) -> list[int]:
     return encoded_ids
 
 
-def _prefill_cost(isl: int, matched_tokens: int) -> float:
-    """Remaining prefill tokens with overlap_credit fixed at 1: max(0, isl - matched)."""
-    matched = max(0, min(matched_tokens, isl)) if isl > 0 else 0
-    return float(max(0, isl - _SMETRIC_OVERLAP_CREDIT * matched))
-
-
-def _matched_tokens(matched: object) -> int:
-    """Read both legacy integer and DpBlocks conductor match formats."""
-    if isinstance(matched, dict):
-        matched = matched.get("matched_tokens", 0)
+def _prefill_cost(isl: int) -> float:
+    """Request stamp written to the endpoint ledger: full prompt length, not cache remainder."""
     try:
-        return max(0, int(matched or 0))
+        return float(max(0, int(isl)))
     except (TypeError, ValueError):
-        return 0
+        return 0.0
 
 
 @dataclass(frozen=True)
@@ -126,8 +113,10 @@ class GatedCandidate:
     One endpoint of the request's role.
 
     ``prefill_cost`` / ``cpu_hit_blocks`` are what THIS request would add to the endpoint ledger
-    if committed there (conductor-derived); they are stamped on allocation and never used for
-    ordering. Ordering and gating read the endpoint's current ledger via ``endpoint.workload``.
+    if committed there; they are stamped on allocation and never used for ordering.
+    ``prefill_cost`` is ``max(0, isl)`` (cache hits do not reduce it). ``cpu_hit_blocks`` is
+    the conductor ``cpu_blocks`` for this endpoint. Ordering and gating read the endpoint's
+    current ledger via ``endpoint.workload``.
     """
 
     instance: Instance
@@ -245,8 +234,9 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
         """
         Conductor lookup: every endpoint as a ``GatedCandidate``, sorted by its ledger prefill_cost.
 
-        The conductor only supplies the per-endpoint stamp values (request cost, cpu_blocks).
-        ``None`` means it had no data for our instances (caller falls back). Also caches
+        The conductor only supplies per-endpoint ``cpu_blocks``; ``prefill_cost`` is
+        ``max(0, isl)`` for every endpoint. ``None`` means it had no data for our instances
+        (caller falls back). Also caches
         ``{(instance_id, endpoint_id): (prefill_cost, cpu_hit_blocks)}`` on
         ``req_info.smetric_gated_debug`` for the allocate stamp.
         """
@@ -278,7 +268,7 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
                     GatedCandidate(
                         instance=instance,
                         endpoint=ep,
-                        prefill_cost=_prefill_cost(isl, _matched_tokens(matched)),
+                        prefill_cost=_prefill_cost(isl),
                         cpu_hit_blocks=_cpu_hit_blocks(matched),
                     )
                 )

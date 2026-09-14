@@ -145,21 +145,31 @@ def _endpoint_from_dict(data: dict) -> Endpoint | None:
         return None
 
 
-def _format_request_commit_stamp(committed: Workload) -> str:
-    """Render this request's stamp as ``active_tokens/prefill_cost/cpu_hit_blocks``."""
+def _workload_stamp_fields(workload: Workload | None) -> tuple[float, float, float]:
+    """Return ``(active_tokens, prefill_cost, cpu_hit_blocks)``, defaulting each to 0."""
     try:
-        active = float(getattr(committed, "active_tokens", 0.0) or 0.0)
-    except (TypeError, ValueError):
+        active = float(getattr(workload, "active_tokens", 0.0) or 0.0)
+    except (TypeError, ValueError, AttributeError):
         active = 0.0
     try:
-        prefill = float(getattr(committed, "prefill_cost", 0.0) or 0.0)
-    except (TypeError, ValueError):
+        prefill = float(getattr(workload, "prefill_cost", 0.0) or 0.0)
+    except (TypeError, ValueError, AttributeError):
         prefill = 0.0
     try:
-        cpu_hits = float(getattr(committed, "cpu_hit_blocks", 0.0) or 0.0)
-    except (TypeError, ValueError):
+        cpu_hits = float(getattr(workload, "cpu_hit_blocks", 0.0) or 0.0)
+    except (TypeError, ValueError, AttributeError):
         cpu_hits = 0.0
-    return "%.1f/%.1f/%.1f" % (active, prefill, cpu_hits)
+    return active, prefill, cpu_hits
+
+
+def _format_request_commit_stamp(committed: Workload, candidate_policy: str | None = None) -> str:
+    """Render this request's stamp as ``active_tokens/prefill_cost/cpu_hit_blocks``.
+
+    ``candidate_policy`` is accepted for call-site compatibility; the stamp already
+    comes from ``_committed_workload_for``.
+    """
+    del candidate_policy
+    return "%.1f/%.1f/%.1f" % _workload_stamp_fields(committed)
 
 
 class _SchedulerInstanceCache:
@@ -348,18 +358,17 @@ class _SchedulerInstanceCache:
             if key not in self._endpoint_map:
                 self._endpoint_running_requests.pop(key, None)
 
-    def format_endpoint_load_snapshot(self, role: PDRole) -> str:
-        """Render ``ins/ep:running/active_tokens`` for every cached endpoint of ``role``."""
+    def format_endpoint_load_snapshot(self, role: PDRole, candidate_policy: str | None = None) -> str:
+        """Render ``ins/ep:running/active_tokens/prefill_cost/cpu_hit_blocks`` for ``role``."""
+        del candidate_policy
         parts: list[str] = []
         for instance in sorted(self.get_instances(role), key=lambda inst: inst.id):
             for endpoint in sorted(instance.get_all_endpoints(), key=lambda ep: ep.id):
                 running = self._endpoint_running_requests.get((instance.id, endpoint.id), 0)
-                tokens = 0.0
-                try:
-                    tokens = float((endpoint.workload or Workload()).active_tokens)
-                except (TypeError, ValueError, AttributeError):
-                    tokens = 0.0
-                parts.append(f"{instance.id}/{endpoint.id}:{running}/{tokens:.1f}")
+                active, prefill, cpu_hits = _workload_stamp_fields(endpoint.workload)
+                parts.append(
+                    f"{instance.id}/{endpoint.id}:{running}/{active:.1f}/{prefill:.1f}/{cpu_hits:.1f}"
+                )
         return " ".join(parts) if parts else "<none>"
 
     def _stamp_ledger_overlay(
@@ -1368,19 +1377,6 @@ class AsyncSchedulerClient:
                 prefill_cost_map=prefill_cost_map,
                 cpu_hit_map=cpu_hit_map,
             )
-            logger.info(
-                "select_and_allocate selected req_id=%s role=%s ins=%s ep=%s score=%.4f fast_path=%s "
-                "req[active_tokens/prefill_cost/cpu_hit_blocks]=%s "
-                "endpoints[ins/ep:running/workload]=%s",
-                req_info.req_id,
-                role_str,
-                out_instance.id,
-                out_endpoint.id,
-                selected_score,
-                not use_authoritative,
-                _format_request_commit_stamp(committed),
-                self._cache.format_endpoint_load_snapshot(role),
-            )
             meta = self._workload_reader.entry_meta(out_instance.id, out_endpoint.id)
             if meta is None or int(meta.get("flags", 0)) & FLAG_BLOCKED:
                 excluded.add(pair)
@@ -1395,6 +1391,22 @@ class AsyncSchedulerClient:
                 slot=meta.get("slot"),
             )
             if status == STATUS_OK:
+                # One log per successful allocate. Snapshot is still pre-this-request
+                # (running / overlay have not been incremented yet).
+                if role == PDRole.ROLE_P:
+                    logger.info(
+                        "select_and_allocate selected req_id=%s role=%s ins=%s ep=%s score=%.4f fast_path=%s "
+                        "req[active_tokens/prefill_cost/cpu_hit_blocks]=%s "
+                        "endpoints[ins/ep:running/active_tokens/prefill_cost/cpu_hit_blocks]=%s",
+                        req_info.req_id,
+                        role_str,
+                        out_instance.id,
+                        out_endpoint.id,
+                        selected_score,
+                        not use_authoritative,
+                        _format_request_commit_stamp(committed, candidate_policy),
+                        self._cache.format_endpoint_load_snapshot(role, candidate_policy),
+                    )
                 self._cache.patch_workload_from_shm(out_instance.id, out_endpoint.id, role, actual)
                 self._cache.apply_ledger_delta(
                     out_instance.id,

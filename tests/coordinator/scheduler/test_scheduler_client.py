@@ -299,25 +299,26 @@ class TestSchedulerInstanceCache:
 
     @pytest.mark.asyncio
     async def test_running_request_counter_and_load_snapshot(self):
-        """PR #14: running counts + ins/ep:running/active_tokens snapshot at selection time."""
+        """PR #14: running counts + ins/ep:running/active_tokens/prefill_cost/cpu_hit_blocks snapshot."""
         ep_a = _make_endpoint(endpoint_id=10, active_tokens=100.0)
         ep_b = _make_endpoint(endpoint_id=11, active_tokens=0.0)
         inst = _make_instance(instance_id=1, role="prefill", endpoints={"pod1": {10: ep_a, 11: ep_b}})
         await self.cache.replace_all(PDRole.ROLE_P, [inst])
 
-        assert self.cache.format_endpoint_load_snapshot(PDRole.ROLE_P) == "1/10:0/100.0 1/11:0/0.0"
+        assert self.cache.format_endpoint_load_snapshot(PDRole.ROLE_P) == "1/10:0/100.0/0.0/0.0 1/11:0/0.0/0.0/0.0"
         assert self.cache.format_endpoint_load_snapshot(PDRole.ROLE_D) == "<none>"
 
         self.cache.track_running_request(1, 10, WorkloadAction.ALLOCATION)
         self.cache.track_running_request(1, 10, WorkloadAction.ALLOCATION)
-        assert self.cache.format_endpoint_load_snapshot(PDRole.ROLE_P) == "1/10:2/100.0 1/11:0/0.0"
+        self.cache.apply_ledger_delta(1, 10, PDRole.ROLE_P, 12.0, 3.0)
+        assert self.cache.format_endpoint_load_snapshot(PDRole.ROLE_P) == "1/10:2/100.0/12.0/3.0 1/11:0/0.0/0.0/0.0"
 
         self.cache.track_running_request(1, 10, WorkloadAction.RELEASE_TOKENS)
-        assert self.cache.format_endpoint_load_snapshot(PDRole.ROLE_P) == "1/10:1/100.0 1/11:0/0.0"
+        assert self.cache.format_endpoint_load_snapshot(PDRole.ROLE_P) == "1/10:1/100.0/12.0/3.0 1/11:0/0.0/0.0/0.0"
         self.cache.track_running_request(1, 10, WorkloadAction.RELEASE_TOKENS)
         self.cache.track_running_request(1, 10, WorkloadAction.RELEASE_TOKENS)
         assert (1, 10) not in self.cache._endpoint_running_requests
-        assert self.cache.format_endpoint_load_snapshot(PDRole.ROLE_P) == "1/10:0/100.0 1/11:0/0.0"
+        assert self.cache.format_endpoint_load_snapshot(PDRole.ROLE_P) == "1/10:0/100.0/12.0/3.0 1/11:0/0.0/0.0/0.0"
 
     @pytest.mark.asyncio
     async def test_running_request_counter_pruned_when_instance_leaves(self):
@@ -1063,7 +1064,7 @@ class TestSelectAndAllocateCas:
 
     @pytest.mark.asyncio
     async def test_select_and_allocate_logs_running_snapshot_before_commit(self, native_lib, caplog):
-        """Snapshot log is the pre-commit view: running=0, then counter increments after CAS."""
+        """CAS-success log is still the pre-this-request snapshot; running increments after the log."""
         del native_lib
         config = CoordinatorConfig()
         im = InstanceManager(config)
@@ -1080,13 +1081,17 @@ class TestSelectAndAllocateCas:
             with caplog.at_level("INFO"):
                 result = await client.select_and_allocate(PDRole.ROLE_P, req)
             assert result is not None
-            snap_lines = [rec.message for rec in caplog.records if "endpoints[ins/ep:running/workload]=" in rec.message]
+            snap_lines = [
+                rec.message
+                for rec in caplog.records
+                if "endpoints[ins/ep:running/active_tokens/prefill_cost/cpu_hit_blocks]=" in rec.message
+            ]
             assert snap_lines
             assert "req_id=req-snap" in snap_lines[0]
             assert "ins=1 ep=10" in snap_lines[0]
             assert "req[active_tokens/prefill_cost/cpu_hit_blocks]=4.0/0.0/0.0" in snap_lines[0]
-            assert "1/10:0/1.0" in snap_lines[0]
-            assert "2/20:0/50.0" in snap_lines[0]
+            assert "1/10:0/1.0/0.0/0.0" in snap_lines[0]
+            assert "2/20:0/50.0/0.0/0.0" in snap_lines[0]
             scheduled_lines = [rec.message for rec in caplog.records if rec.message.startswith("scheduled role=")]
             assert scheduled_lines
             assert "policy=load_balance" in scheduled_lines[0]

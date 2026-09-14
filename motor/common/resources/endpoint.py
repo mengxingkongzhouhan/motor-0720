@@ -23,12 +23,24 @@ class Workload(BaseModel):
     """Workload information for load balancing (compute-load ledger)."""
 
     active_tokens: float = Field(default=0, description="Active compute load in token units")
+    prefill_cost: float = Field(
+        default=0,
+        description="Remaining prefill cost on this endpoint (smetric_gated outstanding prefill); "
+        "0 for RR/LB. Worker-local overlay on motor-0911 (not carried in schema-4 SHM).",
+    )
+    cpu_hit_blocks: float = Field(
+        default=0,
+        description="CPU-tier KV blocks the in-flight requests on this endpoint matched (smetric_gated); "
+        "worker-local overlay, not carried in the workload SHM",
+    )
 
     def __iadd__(self, other):
         if not isinstance(other, Workload):
             raise TypeError(f"Unsupported operand type(s) for +=: 'Workload' and {type(other).__name__}")
 
         self.active_tokens += other.active_tokens
+        self.prefill_cost += other.prefill_cost
+        self.cpu_hit_blocks += other.cpu_hit_blocks
 
         return self
 

@@ -27,7 +27,14 @@ from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
     CANDIDATE_POLICY_LOAD_BALANCE,
+    CANDIDATE_POLICY_SMETRIC_GATED,
     KNOWN_CANDIDATE_POLICIES,
+)
+from motor.coordinator.scheduler.policy.smetric_gated import (
+    GatedCandidate,
+    format_candidates,
+    pick_gated,
+    sort_candidates,
 )
 
 logger = get_logger(__name__)
@@ -46,6 +53,8 @@ class ArbitrationContext:
     is_instance_circuit_open: Callable[[int], bool]
     endpoint_instance_score_weight: float = 0.05
     is_load_balance_scheduler: bool = False
+    smetric_gated_active_factor: float = 1.0
+    smetric_gated_cpu_factor: float = 1.0
 
 
 def matches_engine_type(instance: Instance, required_engine_type: str | None) -> bool:
@@ -290,6 +299,82 @@ def should_scan_global_load_balance(ctx: ArbitrationContext, candidate_policy: s
     return ctx.is_load_balance_scheduler
 
 
+def select_smetric_gated(
+    ctx: ArbitrationContext,
+    worker_candidate: tuple[int, int],
+    gated_candidates: list[tuple[int, int, float, float]] | None,
+    role: PDRole,
+    required_engine_type: str | None = None,
+    excluded: set[tuple[int, int]] | None = None,
+    required_dispatch_capability: str | None = None,
+    req_id: str | None = None,
+) -> tuple[Instance, Endpoint, float] | None:
+    """
+    smetric_gated arbitration on the worker's fresh cache (SHM active_tokens + overlay).
+
+    Resolve every scored endpoint that is still schedulable, sort by the endpoint's ledger
+    ``prefill_cost`` and take the first one at or below both scaled ledger averages. The
+    worker-supplied per-endpoint cost / cpu_blocks are only the values stamped on commit.
+    The returned score is the committed endpoint's ledger prefill_cost.
+    """
+    if not gated_candidates:
+        logger.warning(
+            "smetric_gated: no endpoint costs; validating worker candidate %s req_id=%s",
+            worker_candidate,
+            req_id,
+        )
+        return select_valid_candidate(
+            ctx, worker_candidate, role, required_engine_type, required_dispatch_capability
+        )
+    candidates: list[GatedCandidate] = []
+    for instance_id, endpoint_id, prefill_cost, cpu_hits in gated_candidates:
+        if excluded is not None and (instance_id, endpoint_id) in excluded:
+            continue
+        if ctx.is_instance_circuit_open(instance_id):
+            continue
+        found = find_available_instance_endpoint(ctx, instance_id, endpoint_id)
+        if found is None:
+            continue
+        instance, endpoint = found
+        if not matches_engine_type(instance, required_engine_type):
+            continue
+        if not matches_dispatch_capability(instance, required_dispatch_capability):
+            continue
+        try:
+            instance_role = PDRole(instance.role)
+        except ValueError:
+            instance_role = PDRole.ROLE_U
+        if instance_role != role:
+            continue
+        candidates.append(
+            GatedCandidate(
+                instance=instance,
+                endpoint=endpoint,
+                prefill_cost=prefill_cost,
+                cpu_hit_blocks=cpu_hits,
+            )
+        )
+    ranked = sort_candidates(candidates)
+    picked = pick_gated(ranked, ctx.smetric_gated_active_factor, ctx.smetric_gated_cpu_factor)
+    if picked is None:
+        return None
+    chosen, reason, active_threshold, cpu_threshold = picked
+    logger.info(
+        "smetric_gated: req_id=%s pick=%s-%s reason=%s active_threshold=%.1f cpu_threshold=%.1f "
+        "factors=%.2f/%.2f ranked[ins-ep:ledger_prefill/active/cpu(+req_cost/+req_cpu)]=%s",
+        req_id,
+        chosen.instance.id,
+        chosen.endpoint.id,
+        reason,
+        active_threshold,
+        cpu_threshold,
+        ctx.smetric_gated_active_factor,
+        ctx.smetric_gated_cpu_factor,
+        format_candidates(ranked),
+    )
+    return (chosen.instance, chosen.endpoint, chosen.ledger_prefill_cost)
+
+
 def select_authoritative_allocate_candidate(
     ctx: ArbitrationContext,
     candidate: tuple[int, int],
@@ -302,15 +387,18 @@ def select_authoritative_allocate_candidate(
     required_engine_type: str | None = None,
     excluded: set[tuple[int, int]] | None = None,
     required_dispatch_capability: str | None = None,
+    gated_candidates: list[tuple[int, int, float, float]] | None = None,
+    req_id: str | None = None,
 ) -> tuple[Instance, Endpoint, float] | None:
     """
     Select the allocation target from a fresh workload view (the slow / re-rank path).
 
     Load-balance scans all endpoints. KV-cache affinity in unified mode re-ranks EVERY reported
     endpoint by ``prefill_load_scale*prefill_cost + load_weight*fresh_load``; older affinity callers
-    without per-endpoint prefill_cost fall back to "least-loaded among the ranked alternates". Other
-    policies keep the proposed endpoint. ``excluded`` (pairs this CAS round already rejected) is
-    forwarded to every branch that scans beyond ``candidates`` (which the caller already filters).
+    without per-endpoint prefill_cost fall back to "least-loaded among the ranked alternates".
+    smetric_gated re-sorts by ledger prefill_cost and applies the two mean gates.
+    Other policies keep the proposed endpoint. ``excluded`` (pairs this CAS round already
+    rejected) is forwarded to every branch that scans beyond ``candidates``.
     """
     if should_scan_global_load_balance(ctx, candidate_policy):
         selected = select_global_load_balance_candidate(
@@ -342,4 +430,17 @@ def select_authoritative_allocate_candidate(
             )
             if selected is not None:
                 return selected
+    if candidate_policy == CANDIDATE_POLICY_SMETRIC_GATED:
+        selected = select_smetric_gated(
+            ctx,
+            candidate,
+            gated_candidates,
+            role,
+            required_engine_type,
+            excluded=excluded,
+            required_dispatch_capability=required_dispatch_capability,
+            req_id=req_id,
+        )
+        if selected is not None:
+            return selected
     return select_valid_candidate(ctx, candidate, role, required_engine_type, required_dispatch_capability)

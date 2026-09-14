@@ -165,6 +165,9 @@ class _SchedulerInstanceCache:
         }
         self._endpoint_map: dict[tuple[int, int], Endpoint] = {}
         self._ledger_overlay: dict[tuple[int, int], tuple[float, float]] = {}
+        # Worker-local in-flight request counts (PR #14). Not in schema-4 SHM, so not shared
+        # across Infer Workers; same overlay limitation as prefill_cost / cpu_hit_blocks.
+        self._endpoint_running_requests: dict[tuple[int, int], int] = {}
         self._lock = asyncio.Lock()
 
     def get_instances(self, role: PDRole) -> list[Instance]:
@@ -215,6 +218,7 @@ class _SchedulerInstanceCache:
                     for ep in (pod_eps or {}).values():
                         self._endpoint_map[(inst.id, ep.id)] = ep
         self._reapply_ledger_overlay()
+        self._prune_running_requests_to_cached_endpoints()
 
     @staticmethod
     def _role_of(inst: Instance) -> PDRole | None:
@@ -266,6 +270,7 @@ class _SchedulerInstanceCache:
                         for ep in (pod_eps or {}).values():
                             self._endpoint_map[(inst.id, ep.id)] = ep
             self._reapply_ledger_overlay()
+            self._prune_running_requests_to_cached_endpoints()
         return True
 
     async def apply_remove(self, instances: list[Instance]) -> None:
@@ -284,6 +289,8 @@ class _SchedulerInstanceCache:
                     del self._endpoint_map[key]
                 for key in [k for k in self._ledger_overlay if k[0] == iid]:
                     del self._ledger_overlay[key]
+                for key in [k for k in self._endpoint_running_requests if k[0] == iid]:
+                    del self._endpoint_running_requests[key]
 
     def apply_ledger_delta(
         self,
@@ -303,6 +310,40 @@ class _SchedulerInstanceCache:
         else:
             self._ledger_overlay[key] = (new_prefill, new_cpu)
         self._stamp_ledger_overlay(instance_id, endpoint_id, role, new_prefill, new_cpu)
+
+    def track_running_request(self, instance_id: int, endpoint_id: int, action: WorkloadAction) -> None:
+        """Count one committed ALLOCATION (+1) / RELEASE_TOKENS (-1, floored at 0) on an endpoint."""
+        key = (instance_id, endpoint_id)
+        if action == WorkloadAction.ALLOCATION:
+            self._endpoint_running_requests[key] = self._endpoint_running_requests.get(key, 0) + 1
+            return
+        if action != WorkloadAction.RELEASE_TOKENS:
+            return
+        remaining = self._endpoint_running_requests.get(key, 0) - 1
+        if remaining > 0:
+            self._endpoint_running_requests[key] = remaining
+        else:
+            self._endpoint_running_requests.pop(key, None)
+
+    def _prune_running_requests_to_cached_endpoints(self) -> None:
+        """Drop running-request counters for endpoints no longer in the instance cache."""
+        for key in list(self._endpoint_running_requests):
+            if key not in self._endpoint_map:
+                self._endpoint_running_requests.pop(key, None)
+
+    def format_endpoint_load_snapshot(self, role: PDRole) -> str:
+        """Render ``ins/ep:running/active_tokens`` for every cached endpoint of ``role``."""
+        parts: list[str] = []
+        for instance in sorted(self.get_instances(role), key=lambda inst: inst.id):
+            for endpoint in sorted(instance.get_all_endpoints(), key=lambda ep: ep.id):
+                running = self._endpoint_running_requests.get((instance.id, endpoint.id), 0)
+                tokens = 0.0
+                try:
+                    tokens = float((endpoint.workload or Workload()).active_tokens)
+                except (TypeError, ValueError, AttributeError):
+                    tokens = 0.0
+                parts.append(f"{instance.id}/{endpoint.id}:{running}/{tokens:.1f}")
+        return " ".join(parts) if parts else "<none>"
 
     def _stamp_ledger_overlay(
         self,
@@ -1299,6 +1340,17 @@ class AsyncSchedulerClient:
             if pair in excluded:
                 use_authoritative = True
                 continue
+            logger.info(
+                "select_and_allocate selected req_id=%s role=%s ins=%s ep=%s score=%.4f fast_path=%s "
+                "endpoints[ins/ep:running/workload]=%s",
+                req_info.req_id,
+                role_str,
+                out_instance.id,
+                out_endpoint.id,
+                selected_score,
+                not use_authoritative,
+                self._cache.format_endpoint_load_snapshot(role),
+            )
             committed = self._committed_workload_for(
                 role,
                 candidate_policy,
@@ -1332,6 +1384,7 @@ class AsyncSchedulerClient:
                     committed.prefill_cost,
                     committed.cpu_hit_blocks,
                 )
+                self._cache.track_running_request(out_instance.id, out_endpoint.id, WorkloadAction.ALLOCATION)
                 meta["active_tokens"] = actual
                 self._dp_stats.record(
                     instance_id=out_instance.id,
@@ -1592,6 +1645,7 @@ class AsyncSchedulerClient:
         except ValueError:
             role = PDRole.ROLE_U
         meta["active_tokens"] = actual
+        self._cache.track_running_request(params.instance_id, params.endpoint_id, WorkloadAction.RELEASE_TOKENS)
         # CAS already committed above; a cache-patch failure must not turn this into a retry
         # (a second cas_sub_floor0 would subtract the same delta twice).
         try:

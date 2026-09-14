@@ -1418,8 +1418,8 @@ class AsyncSchedulerClient:
                 tier_hit = matched_load[3] if matched_load and len(matched_load) > 3 else None
                 logger.info(
                     "scheduled role=%s req_id=%s instance=%s endpoint=%s policy=%s matched=%s "
-                    "hbm=%s cpu=%s disk=%s load=%s committed=%s score=%s fast_path=%s repicked=%s "
-                    "proposed=%s-%s",
+                    "hbm=%s cpu=%s disk=%s load=%s committed=%s prefill_cost=%s cpu_hit_blocks=%s "
+                    "score=%s fast_path=%s repicked=%s proposed=%s-%s",
                     role_str,
                     req_info.req_id,
                     out_instance.id,
@@ -1431,6 +1431,8 @@ class AsyncSchedulerClient:
                     tier_hit[2] if tier_hit else None,
                     matched_load[1] if matched_load else None,
                     committed.active_tokens,
+                    committed.prefill_cost,
+                    committed.cpu_hit_blocks,
                     selected_score,
                     not use_authoritative,
                     pair != proposed,

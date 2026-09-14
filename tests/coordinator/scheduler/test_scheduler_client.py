@@ -1087,6 +1087,12 @@ class TestSelectAndAllocateCas:
             assert "req[active_tokens/prefill_cost/cpu_hit_blocks]=4.0/0.0/0.0" in snap_lines[0]
             assert "1/10:0/1.0" in snap_lines[0]
             assert "2/20:0/50.0" in snap_lines[0]
+            scheduled_lines = [rec.message for rec in caplog.records if rec.message.startswith("scheduled role=")]
+            assert scheduled_lines
+            assert "policy=load_balance" in scheduled_lines[0]
+            assert "committed=4.0" in scheduled_lines[0]
+            assert "prefill_cost=0.0" in scheduled_lines[0]
+            assert "cpu_hit_blocks=0.0" in scheduled_lines[0]
             assert client._cache._endpoint_running_requests[(1, 10)] == 1
             ok = await client.update_workload(
                 UpdateWorkloadParams(

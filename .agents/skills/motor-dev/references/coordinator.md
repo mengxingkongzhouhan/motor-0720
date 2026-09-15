@@ -9,7 +9,7 @@ CoordinatorDaemon (parent process, async main loop)
 │
 ├── MgmtServer (1 process)               — Management HTTP + control plane
 │     owns: InstanceManager master (TYPE_MGMT, KV register), CircuitBreakerManager,
-│           precision tables, schema-4 WorkloadSharedMemoryOwner, ZMQ ROUTER + PUB
+│           precision tables, schema-5 WorkloadSharedMemoryOwner, ZMQ ROUTER + PUB
 │     start order: 1st | stop order: last
 │
 ├── ObsServer (1 process)                — Observability API
@@ -71,7 +71,7 @@ NPU resources.
 
 **Serialization:** `msgspec.msgpack` (not pickle) with zero-copy optimization — payloads >1024 bytes go in separate ZMQ frames to avoid msgpack decoding overhead on the receiver side.
 
-**Request types** (defined in `zmq_protocol.py: SchedulerRequestType`). Data-plane allocate/release is **not** an RPC — Workers CAS on schema-4 SHM.
+**Request types** (defined in `zmq_protocol.py: SchedulerRequestType`). Data-plane allocate/release is **not** an RPC — Workers CAS on schema-5 SHM.
 
 | Request | Direction | Purpose |
 |---------|-----------|---------|
@@ -95,18 +95,18 @@ There is no `ALLOCATE_ONLY`, `UPDATE_WORKLOAD`, or `REFRESH_INSTANCES` RPC.
 
 ### Workload Shared Memory
 
-**Purpose:** Workers need per-endpoint `active_tokens` on every scheduling decision. Allocate/release is per-slot CAS in the Rust `.so`; there is no ZMQ round-trip per request.
+**Purpose:** Workers need per-endpoint `active_tokens` / `prefill_cost` / `cpu_hit_blocks` on every scheduling decision. Allocate/release is per-slot CAS in the Rust `.so`; there is no ZMQ round-trip per request.
 
-**Design:** Mgmt is the only membership writer (seqlock snapshot + heartbeat + `BLOCKED` flags). Infer Workers attach via Rust `shm_open` (not CPython `SharedMemory`) and CAS tokens.
+**Design:** Mgmt is the only membership writer (seqlock snapshot + heartbeat + `BLOCKED` flags). Infer Workers attach via Rust `shm_open` (not CPython `SharedMemory`) and CAS the three ledger fields.
 
-**Layout** (`workload_shm/layout.py`, **SCHEMA_VERSION=4**):
+**Layout** (`workload_shm/layout.py`, **SCHEMA_VERSION=5**):
 
 ``` text
 Offset  Size   Field
 0       4B     magic              = 0x574B4C44 ("WKLD")
-4       2B     schema_version     — SCHEMA_VERSION=4
+4       2B     schema_version     — SCHEMA_VERSION=5
 6       2B     (padding)
-8       8B     sequence           — membership seqlock only (token CAS does not bump)
+8       8B     sequence           — membership seqlock only (ledger CAS does not bump)
 16      4B     entry_count        — number of valid entries
 20      4B     max_entries        — slot capacity (default 10240)
 24      8B     instance_version   — bumped on membership snapshot (ADD/DEL/SET)
@@ -114,10 +114,10 @@ Offset  Size   Field
 40      8B     prefill_sequence   — P membership change counter
 48      8B     decode_sequence    — D membership change counter
 56      8B     hybrid_sequence    — U membership change counter
-64      N×24B  entries            — per-endpoint slots (max 10240)
+64      N×40B  entries            — per-endpoint slots (max 10240)
 ```
 
-Header is 64B, each entry 24B:
+Header is 64B, each entry 40B:
 
 ``` text
 0   4B  instance_id
@@ -126,16 +126,18 @@ Header is 64B, each entry 24B:
 9   1B  flags (bit0=BLOCKED, bit1=VALID)
 10  2B  generation (ABA on slot reuse)
 12  4B  reserved
-16  8B  active_tokens (f64 bits as AtomicU64; 8-aligned for aarch64)
+16  8B  active_tokens (f64 bits as AtomicU64; 8-aligned)
+24  8B  prefill_cost (f64 bits as AtomicU64)
+32  8B  cpu_hit_blocks (f64 bits as AtomicU64)
 ```
 
-`active_tokens` is at **offset 16**, not 12: a 24B stride from a 64B header would leave offset 12 only 4-byte aligned, which faults an 8-byte atomic on aarch64. Scoring must atomic-load tokens every pass (seqlock no longer covers token updates). Schema 3 readers are hard-rejected.
+All three ledgers sit at offsets 16/24/32 so a 40B stride from a 64B header stays 8-aligned on aarch64. Scoring must atomic-load them every pass (seqlock no longer covers ledger updates). Schema 4 readers are hard-rejected.
 
 **SHM name:** `mindie_workload_<mgmt_pid>` — includes PID for uniqueness and orphan detection. Created via Rust `create_v4`. `shm_open(O_CREAT|O_EXCL)` failure unlinks and retries **only on `EEXIST`** (orphan); other errno values return SYSCALL without touching a live segment.
 
-**Membership snapshot:** Mgmt keeps **stable slots** for still-live `(iid, eid)` pairs (new pairs take the lowest free slot; removed pairs become INVALID holes). `write_entry_v4` never `store`s caller tokens over a live pair: same slot leaves Worker CAS bits in place; a moved pair atomic-loads the old slot. `_generation` is not pruned when a pair leaves (ABA). `_add_instances` resets `endpoint.workload` to empty, so a new pair's IM seed is 0; non-zero tokens come only from Worker `cas_add`.
+**Membership snapshot:** Mgmt keeps **stable slots** for still-live `(iid, eid)` pairs (new pairs take the lowest free slot; removed pairs become INVALID holes). `write_entry_v4` never `store`s caller tokens/overlay over a live pair: same slot leaves Worker CAS bits in place; a moved pair atomic-loads the old slot. `_generation` is not pruned when a pair leaves (ABA). `_add_instances` resets `endpoint.workload` to empty, so a new pair's IM seed is 0; non-zero ledgers come only from Worker `cas_add`.
 
-**Recovery:** Workers detect stale SHM (heartbeat >5s old) → trigger full `GET_AVAILABLE_INSTANCES` refresh. Attach failure is loud (`NativeWorkloadShmUnavailable`); there is no Python writer fallback. Native **ABI_VERSION=2** (`mindie_wl_abi_version`; Python `MIN_ABI_VERSION=2` refuses older `.so`). Scoring refresh uses one FFI `load_entries` (atomic-load flags/tokens in Rust); `cas_add` / `cas_sub_floor0` take a slot hint from that snapshot (`SLOT_HINT_NONE` scans; a stale hint is `SLOT_INVALID`, no rescan). Both reject non-finite or negative `delta` with `BAD_ARG`. `update_workload` is release-only (`RELEASE_TOKENS`).
+**Recovery:** Workers detect stale SHM (heartbeat >5s old) → trigger full `GET_AVAILABLE_INSTANCES` refresh. Attach failure is loud (`NativeWorkloadShmUnavailable`); there is no Python writer fallback. Native **ABI_VERSION=3** (`mindie_wl_abi_version`; Python `MIN_ABI_VERSION=3` refuses older `.so`). Scoring refresh uses one FFI `load_entries` (atomic-load flags/tokens/overlay in Rust); `cas_add` / `cas_sub_floor0` take a slot hint from that snapshot (`SLOT_HINT_NONE` scans; a stale hint is `SLOT_INVALID`, no rescan). Token CAS uses `expected`; overlay fields are fetch-added only after that CAS succeeds. Both reject non-finite or negative deltas with `BAD_ARG`. `update_workload` is release-only (`RELEASE_TOKENS`) and subtracts all three fields, flooring at 0.
 
 ### Role Shared Memory (HA)
 
@@ -181,7 +183,7 @@ Tunables live under `CoordinatorConfig.scheduler_config.kv_affinity`: `mode`, `l
 
 Worker-local successful SHM CAS allocations feed `DpStatsLogger` for every scheduling policy.
 `scheduler_config.dp_stats_window` is the emit interval (default 60 seconds; 0 disables).
-Inference **worker 0** is the only printer: every tick it snapshots schema-4 SHM and logs one line per DP
+Inference **worker 0** is the only printer: every tick it snapshots schema-5 SHM and logs one line per DP
 with this worker's request count and the current `active_tokens`
 (`dp_stats instance=%s dp_rank=%s requests=%d active_tokens=%s`).
 Idle DPs with both `requests == 0` and `active_tokens == 0` are omitted.
@@ -236,7 +238,7 @@ SGLang stays on native bootstrap (`CoordinationMode.BOOTSTRAP`); that path is un
 
 **Request lifecycle:**
 
-1. `prepare_resource(plan)` — scheduling policy scores locally → Worker `cas_add` on schema-4 SHM (stale expected → reload + same Python scorer, not blind retry)
+1. `prepare_resource(plan)` — scheduling policy scores locally → Worker `cas_add` on schema-5 SHM (stale expected → reload + same Python scorer, not blind retry)
 2. `forward_request(plan)` — HTTP POST to engine's infer endpoint (streaming or non-streaming)
 3. `release_all(plan)` — Worker `cas_sub_floor0` on the same SHM slot (no UPDATE ZMQ)
 4. Teardown — drain pending releases, reclaim residual SHM tokens, then `del_req_info`
@@ -283,7 +285,7 @@ Hot-reload is driven by a process-local `ConfigWatcher` in the **Inference Worke
 | `motor/coordinator/scheduler/runtime/dp_stats.py` | | Worker-0 timer: per-DP request counts + SHM `active_tokens` in one `dp_stats` line; skip idle (requests=0 and active_tokens=0) |
 | `motor/coordinator/scheduler/runtime/zmq_protocol.py` | | Request/response types, msgpack framing, topic constants |
 | `motor/coordinator/scheduler/allocate_arbitration.py` | | Shared LB/KVA/RR reselect (R4; no ZMQ) |
-| `motor/coordinator/scheduler/runtime/workload_shm/` | | schema-4 layout + Reader/Owner + `native.py` ctypes |
+| `motor/coordinator/scheduler/runtime/workload_shm/` | | schema-5 layout + Reader/Owner + `native.py` ctypes |
 | `motor/coordinator/workload_shm_rs/` | | Rust cdylib: POSIX SHM create/attach, seqlock snapshot, per-slot CAS |
 | `motor/coordinator/domain/instance_manager.py` | | Central instance pool (available/unavailable/paused); `snapshot_instances()` for mgmt list |
 | `motor/coordinator/domain/request_manager.py` | | Request ID generation, per-request workload records + residual reclaim owners |
@@ -312,8 +314,8 @@ Hot-reload is driven by a process-local `ConfigWatcher` in the **Inference Worke
 Controller detects instance change
   → POST /instances/refresh (InsEventMsg: ADD/DEL/SET + instance list)
     → Mgmt refresh lock: duplicate IDs / identity conflicts fail closed (400 / 409)
-      → apply_refresh: InstanceManager + schema-4 SHM membership snapshot
-        (stable slots; do not store over in-flight tokens)
+      → apply_refresh: InstanceManager + schema-5 SHM membership snapshot
+        (stable slots; do not store over in-flight tokens / overlay)
       → PUB socket: INSTANCE_CHANGE_TOPIC (+ delta frame for ADD/DEL)
         → Workers: patch/invalidate caches; CAS uses the new generation/slots
 

@@ -30,8 +30,8 @@ When no endpoint passes both gates the policy degrades in order: first endpoint 
 ``active_tokens`` gate alone, then the head of the list (lowest ledger prefill_cost).
 
 On motor-0911 the authoritative re-pick lives in worker-local ``allocate_arbitration``
-(schema-4 SHM CAS). ``active_tokens`` is the cross-worker SHM ledger; ``prefill_cost`` and
-``cpu_hit_blocks`` are a worker-local overlay (schema-4 does not carry them).
+(schema-5 SHM CAS). ``active_tokens``, ``prefill_cost`` and ``cpu_hit_blocks`` are all
+cross-worker SHM ledger fields.
 """
 
 from __future__ import annotations
@@ -222,7 +222,7 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
     Rank by ledger prefill_cost, commit the first endpoint under both ledger load averages.
 
     Workers run the conductor query (for the stamp values) and re-rank / re-gate against the
-    local cache (SHM ``active_tokens`` + worker-local overlay) before CAS-committing.
+    local cache (SHM ledger) before CAS-committing.
     """
 
     def __init__(self, instance_provider: InstanceProvider):

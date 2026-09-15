@@ -1,6 +1,8 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
 # MindIE is licensed under Mulan PSL v2.
 # You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#         http://license.coscl.org.cn/MulanPSL2
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
 # EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
@@ -8,9 +10,10 @@
 
 """
 Shared memory layout for workload data.
-Header 64B + Entry 24B × N. Little-endian. SCHEMA_VERSION=4.
-Control-plane membership uses header seqlock; per-slot active_tokens is AtomicU64 CAS
-at offset 16 (8-aligned). Sequence odd means writer in progress (membership snapshot).
+Header 64B + Entry 40B × N. Little-endian. SCHEMA_VERSION=5.
+Control-plane membership uses header seqlock; per-slot active_tokens / prefill_cost /
+cpu_hit_blocks are AtomicU64 CAS at offsets 16/24/32 (8-aligned). Sequence odd means writer
+in progress (membership snapshot).
 """
 
 import struct
@@ -21,8 +24,8 @@ from dataclasses import dataclass
 # Readers check this to ensure the buffer is our workload shm layout, not other data or corruption.
 MAGIC = 0x574B4C44
 
-# Schema version for layout compatibility (schema 4: per-slot CAS, tokens 8-aligned at offset 16)
-SCHEMA_VERSION = 4
+# Schema version for layout compatibility (schema 5: per-slot CAS of tokens + overlay fields)
+SCHEMA_VERSION = 5
 
 # Role mapping: prefill=0, decode=1, hybrid=2, encode=3
 ROLE_PREFILL = 0
@@ -40,11 +43,12 @@ HEADER_FMT = "<I H H q I I Q Q Q Q Q"  # little-endian
 HEARTBEAT_OFFSET = 32  # bytes 32-40: heartbeat_sequence (Q)
 HEARTBEAT_STALE_SEC = 5.0  # If heartbeat unchanged for this long, Infer treats shm as stale
 
-# Entry: 24 bytes (schema 4)
+# Entry: 40 bytes (schema 5)
 # instance_id 4B, endpoint_id 4B, role 1B, flags 1B, generation 2B, reserved 4B,
-# active_tokens 8B at offset 16 (8-byte aligned for AtomicU64 CAS on aarch64).
-ENTRY_SIZE = 24
-ENTRY_FMT = "<i i B B H I d"
+# active_tokens 8B at offset 16, prefill_cost 8B at 24, cpu_hit_blocks 8B at 32
+# (all three 8-byte aligned for AtomicU64 CAS on aarch64).
+ENTRY_SIZE = 40
+ENTRY_FMT = "<i i B B H I d d d"
 
 # Entry flag bits (must match workload_shm_rs/src/layout.rs).
 FLAG_BLOCKED = 0b0000_0001
@@ -56,7 +60,7 @@ DEFAULT_WORKLOAD_SHM_MAX_ENTRIES = 10240
 
 @dataclass(frozen=True)
 class WorkloadShmEntry:
-    """Single workload entry (24 bytes). Used by pack_entry/unpack_entry and writer."""
+    """Single workload entry (40 bytes). Used by pack_entry/unpack_entry and writer."""
 
     instance_id: int
     endpoint_id: int
@@ -64,6 +68,8 @@ class WorkloadShmEntry:
     active_tokens: float
     flags: int = 0
     generation: int = 0
+    prefill_cost: float = 0.0
+    cpu_hit_blocks: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -135,7 +141,7 @@ def unpack_header(buf: memoryview) -> WorkloadShmHeader:
 
 
 def pack_entry(entry: WorkloadShmEntry) -> bytes:
-    """Pack single entry into 24 bytes."""
+    """Pack single entry into 40 bytes."""
     return struct.pack(
         ENTRY_FMT,
         entry.instance_id,
@@ -145,6 +151,8 @@ def pack_entry(entry: WorkloadShmEntry) -> bytes:
         entry.generation,
         0,  # reserved
         entry.active_tokens,
+        entry.prefill_cost,
+        entry.cpu_hit_blocks,
     )
 
 
@@ -161,6 +169,8 @@ def unpack_entry(buf: memoryview, slot: int) -> WorkloadShmEntry:
         flags=t[3],
         generation=t[4],
         active_tokens=t[6],
+        prefill_cost=t[7],
+        cpu_hit_blocks=t[8],
     )
 
 

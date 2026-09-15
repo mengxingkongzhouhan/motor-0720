@@ -310,7 +310,7 @@ def select_smetric_gated(
     req_id: str | None = None,
 ) -> tuple[Instance, Endpoint, float] | None:
     """
-    smetric_gated arbitration on the worker's fresh cache (SHM active_tokens + overlay).
+    smetric_gated arbitration on the worker's fresh cache (SHM tokens + overlay fields).
 
     Resolve every scored endpoint that is still schedulable, sort by the endpoint's ledger
     ``prefill_cost`` and take the first one at or below both scaled ledger averages. The

@@ -1019,7 +1019,7 @@ class TestDpStatsSnapshot:
 
 
 class TestSelectAndAllocateCas:
-    """Local scoring + schema-4 CAS. Does not mock send_request."""
+    """Local scoring + schema-5 CAS. Does not mock send_request."""
 
     def test_dp_stats_window_follows_config(self):
         client = AsyncSchedulerClient(

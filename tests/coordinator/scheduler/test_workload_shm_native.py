@@ -9,7 +9,7 @@
 # See the Mulan PSL v2 for more details.
 
 """
-Native shared-memory writer contract (schema 4) and per-slot CAS.
+Native shared-memory writer contract (schema 5) and per-slot CAS.
 
 Drives ``libmindie_workload_shm`` via ctypes and reads back with the production Python reader.
 """
@@ -23,7 +23,14 @@ import pytest
 
 from motor.common.resources.instance import PDRole
 from motor.coordinator.scheduler.runtime.workload_shm import native
-from motor.coordinator.scheduler.runtime.workload_shm.layout import FLAG_VALID, ROLE_PREFILL, SCHEMA_VERSION
+from motor.coordinator.scheduler.runtime.workload_shm.layout import (
+    ENTRY_SIZE,
+    FLAG_VALID,
+    ROLE_PREFILL,
+    SCHEMA_VERSION,
+    WorkloadShmEntry,
+    pack_entry,
+)
 from motor.coordinator.scheduler.runtime.workload_shm.native import (
     MIN_ABI_VERSION,
     STATUS_BAD_ARG,
@@ -42,10 +49,12 @@ from motor.coordinator.scheduler.runtime.workload_shm.reader import WorkloadShar
 
 class _FakeCache:
     def __init__(self) -> None:
-        self.patched: dict[tuple[int, int], tuple[PDRole, float]] = {}
+        self.patched: dict[tuple[int, int], tuple[PDRole, float, float, float]] = {}
 
-    def patch_workload_from_shm(self, instance_id, endpoint_id, role, active_tokens) -> None:
-        self.patched[(instance_id, endpoint_id)] = (role, active_tokens)
+    def patch_workload_from_shm(
+        self, instance_id, endpoint_id, role, active_tokens, prefill_cost=0.0, cpu_hit_blocks=0.0
+    ) -> None:
+        self.patched[(instance_id, endpoint_id)] = (role, active_tokens, prefill_cost, cpu_hit_blocks)
 
 
 @pytest.fixture
@@ -73,20 +82,32 @@ def _read_with_python(name: str, role: PDRole | None = None) -> tuple[tuple[int 
 
 
 def test_native_reports_abi(lib):
-    """ABI version is stable; production segments are schema 4."""
+    """ABI version is stable; production segments are schema 5."""
     assert lib.mindie_wl_abi_version() >= MIN_ABI_VERSION
-    assert MIN_ABI_VERSION == 2
-    assert lib.mindie_wl_schema_version() == 4
+    assert MIN_ABI_VERSION == 3
+    assert lib.mindie_wl_schema_version() == 5
+    assert ENTRY_SIZE == 40
+    packed = pack_entry(
+        WorkloadShmEntry(
+            instance_id=1,
+            endpoint_id=10,
+            role=ROLE_PREFILL,
+            active_tokens=1.0,
+            prefill_cost=2.0,
+            cpu_hit_blocks=3.0,
+        )
+    )
+    assert len(packed) == ENTRY_SIZE
     name = _unique("ab")
     shm = WorkloadShm.create_v4(name, 4, lib=lib)
     try:
-        assert shm.read_header()["schema_version"] == SCHEMA_VERSION == 4
+        assert shm.read_header()["schema_version"] == SCHEMA_VERSION == 5
     finally:
         shm.close(unlink=True)
 
 
 def test_native_writer_roundtrips_to_python_reader(lib):
-    """Rust schema-4 snapshot -> production Python reader."""
+    """Rust schema-5 snapshot -> production Python reader."""
     name = _unique("rt")
     shm = WorkloadShm.create_v4(name, 16, lib=lib)
     try:
@@ -101,7 +122,7 @@ def test_native_writer_roundtrips_to_python_reader(lib):
         shm.heartbeat()
 
         header = shm.read_header()
-        assert header["schema_version"] == 4
+        assert header["schema_version"] == 5
         assert header["sequence"] % 2 == 0
         assert header["entry_count"] == 3
         assert header["instance_version"] == 1
@@ -111,9 +132,9 @@ def test_native_writer_roundtrips_to_python_reader(lib):
         assert instance_version == 1
         assert stale is False
         assert cache.patched == {
-            (1, 10): (PDRole.ROLE_P, 7.0),
-            (1, 11): (PDRole.ROLE_P, 8.0),
-            (2, 20): (PDRole.ROLE_P, 9.0),
+            (1, 10): (PDRole.ROLE_P, 7.0, 0.0, 0.0),
+            (1, 11): (PDRole.ROLE_P, 8.0, 0.0, 0.0),
+            (2, 20): (PDRole.ROLE_P, 9.0, 0.0, 0.0),
         }
     finally:
         shm.close(unlink=True)
@@ -140,7 +161,7 @@ def test_native_odd_sequence_is_rejected_then_accepted(lib):
 
         (instance_version2, _), cache2 = _read_with_python(name)
         assert instance_version2 == 1
-        assert cache2.patched == {(1, 10): (PDRole.ROLE_P, 5.0)}
+        assert cache2.patched == {(1, 10): (PDRole.ROLE_P, 5.0, 0.0, 0.0)}
     finally:
         shm.close(unlink=True)
 
@@ -187,7 +208,7 @@ def test_native_create_v4_recovers_from_orphan(lib):
     try:
         second.write_snapshot_v4([(2, 20, pdrole_to_shm_role(PDRole.ROLE_P), 0, FLAG_VALID, 2.0)])
         (_, _), cache = _read_with_python(name)
-        assert cache.patched == {(2, 20): (PDRole.ROLE_P, 2.0)}
+        assert cache.patched == {(2, 20): (PDRole.ROLE_P, 2.0, 0.0, 0.0)}
     finally:
         second.close(unlink=True)
 
@@ -220,7 +241,7 @@ def _poke_schema_version(name: str, schema: int) -> None:
 
 
 def test_schema_mismatch_is_refused(lib):
-    """A non-schema-4 header is refused by the Reader."""
+    """A non-schema-5 header is refused by the Reader."""
     name = _unique("sm")
     shm = WorkloadShm.create_v4(name, 8, lib=lib)
     reader = WorkloadSharedMemoryReader(name)
@@ -261,9 +282,12 @@ def test_snapshot_v4_does_not_clobber_cas_tokens(lib):
     """Membership rewrite must not store stale caller tokens over a live pair."""
     shm = _single_entry_segment(lib, "clob")
     try:
-        assert shm.cas_add(1, 10, 0, 0.0, 11.0)[0] == STATUS_OK
+        assert shm.cas_add(1, 10, 0, 0.0, 11.0, prefill_cost=12.0, cpu_hit_blocks=3.0)[0] == STATUS_OK
         shm.write_snapshot_v4([(1, 10, ROLE_PREFILL, 0, FLAG_VALID, 0.0)])
-        assert shm.load_entry(0)["active_tokens"] == 11.0
+        entry = shm.load_entry(0)
+        assert entry["active_tokens"] == 11.0
+        assert entry["prefill_cost"] == 12.0
+        assert entry["cpu_hit_blocks"] == 3.0
         status, _ = shm.cas_add(1, 10, 0, 11.0, float("nan"))
         assert status == STATUS_BAD_ARG
         status, _ = shm.cas_add(1, 10, 0, 11.0, -1.0)
@@ -286,12 +310,14 @@ def test_snapshot_v4_copies_tokens_when_pair_moves_slot(lib):
                 (2, 20, ROLE_PREFILL, 0, FLAG_VALID, 0.0),
             ]
         )
-        assert shm.cas_add(2, 20, 0, 0.0, 7.0)[0] == STATUS_OK
+        assert shm.cas_add(2, 20, 0, 0.0, 7.0, prefill_cost=5.0, cpu_hit_blocks=2.0)[0] == STATUS_OK
         shm.write_snapshot_v4([(2, 20, ROLE_PREFILL, 0, FLAG_VALID, 0.0)])
         entry = shm.load_entry(0)
         assert entry["instance_id"] == 2
         assert entry["endpoint_id"] == 20
         assert entry["active_tokens"] == 7.0
+        assert entry["prefill_cost"] == 5.0
+        assert entry["cpu_hit_blocks"] == 2.0
     finally:
         shm.close(unlink=True)
 
@@ -306,6 +332,59 @@ def test_cas_add_ok_then_changed(lib):
         status, actual = shm.cas_add(1, 10, 0, expected=0.0, delta=100.0)
         assert status == STATUS_CHANGED
         assert actual == 3.0
+        entry = shm.load_entry(0)
+        assert entry["prefill_cost"] == pytest.approx(0.0)
+        assert entry["cpu_hit_blocks"] == pytest.approx(0.0)
+    finally:
+        shm.close(unlink=True)
+
+
+def test_cas_add_writes_overlay_fields(lib):
+    """prefill_cost / cpu_hit_blocks are stored in SHM like active_tokens and floored on release."""
+    shm = _single_entry_segment(lib, "ovl")
+    try:
+        status, actual = shm.cas_add(
+            1, 10, 0, expected=0.0, delta=4.0, prefill_cost=12.0, cpu_hit_blocks=3.0
+        )
+        assert status == STATUS_OK
+        assert actual == 4.0
+        entry = shm.load_entry(0)
+        assert entry["active_tokens"] == pytest.approx(4.0)
+        assert entry["prefill_cost"] == pytest.approx(12.0)
+        assert entry["cpu_hit_blocks"] == pytest.approx(3.0)
+        status, actual = shm.cas_add(
+            1, 10, 0, expected=0.0, delta=1.0, prefill_cost=100.0, cpu_hit_blocks=1.0
+        )
+        assert status == STATUS_CHANGED
+        entry = shm.load_entry(0)
+        assert entry["prefill_cost"] == pytest.approx(12.0)
+        assert entry["cpu_hit_blocks"] == pytest.approx(3.0)
+        status, _ = shm.cas_add(1, 10, 0, expected=4.0, delta=1.0, prefill_cost=float("nan"))
+        assert status == STATUS_BAD_ARG
+        status, _ = shm.cas_add(1, 10, 0, expected=4.0, delta=1.0, cpu_hit_blocks=-1.0)
+        assert status == STATUS_BAD_ARG
+        entry = shm.load_entry(0)
+        assert entry["prefill_cost"] == pytest.approx(12.0)
+        assert entry["cpu_hit_blocks"] == pytest.approx(3.0)
+        status, actual = shm.cas_sub_floor0(1, 10, 0, 4.0, prefill_cost=20.0, cpu_hit_blocks=3.0)
+        assert status == STATUS_OK
+        entry = shm.load_entry(0)
+        assert entry["active_tokens"] == pytest.approx(0.0)
+        assert entry["prefill_cost"] == pytest.approx(0.0)
+        assert entry["cpu_hit_blocks"] == pytest.approx(0.0)
+    finally:
+        shm.close(unlink=True)
+
+
+def test_python_reader_patches_overlay_from_shm(lib):
+    """Scoring refresh copies prefill_cost / cpu_hit_blocks out of SHM like active_tokens."""
+    name = _unique("rdov")
+    shm = WorkloadShm.create_v4(name, 8, lib=lib)
+    try:
+        shm.write_snapshot_v4([(1, 10, ROLE_PREFILL, 0, FLAG_VALID, 0.0)])
+        assert shm.cas_add(1, 10, 0, 0.0, 4.0, prefill_cost=12.0, cpu_hit_blocks=3.0)[0] == STATUS_OK
+        (_, _), cache = _read_with_python(name)
+        assert cache.patched == {(1, 10): (PDRole.ROLE_P, 4.0, 12.0, 3.0)}
     finally:
         shm.close(unlink=True)
 

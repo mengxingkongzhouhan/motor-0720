@@ -8,7 +8,7 @@ Coordinator 进程入口为 `motor/coordinator/main.py`：异步 `main()` 中构
 
 | 进程字典键（常量名 / 值） | 管理类 | 说明 |
 |--------|--------|------|
-| `PROCESS_KEY_MGMT`（`"MgmtProcess"`） | `MgmtProcessManager` | 管理 HTTP + 控制面（实例成员表、熔断、精度全局门闩、schema-4 负载 SHM、ZMQ ROUTER/PUB） |
+| `PROCESS_KEY_MGMT`（`"MgmtProcess"`） | `MgmtProcessManager` | 管理 HTTP + 控制面（实例成员表、熔断、精度全局门闩、schema-5 负载 SHM、ZMQ ROUTER/PUB） |
 | `PROCESS_KEY_OBS`（`"ObsProcess"`） | `ObsProcessManager` | 可观测性 API 进程 |
 | `PROCESS_KEY_INFERENCE`（`"InferenceWorkers"`） | `InferenceProcessManager` | 推理 Worker：OpenAI/Anthropic HTTP；调度热路径在本地打分后对 Rust POSIX SHM 做 CAS 记账 |
 

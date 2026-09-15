@@ -50,6 +50,11 @@ _STATUS = {
 }
 _STATUS_OK = 0
 
+
+def cas_status_name(status: int) -> str:
+    """Stable token for CAS status logs (not a log line by itself)."""
+    return _STATUS.get(int(status), "Unknown")
+
 # Named status codes for CAS control flow (callers branch on these; they are not errors).
 STATUS_OK = 0
 STATUS_CHANGED = 1

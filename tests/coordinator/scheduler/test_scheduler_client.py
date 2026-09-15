@@ -41,6 +41,7 @@ from motor.coordinator.scheduler.runtime.scheduler_client import (
 )
 from motor.coordinator.scheduler.runtime.workload_shm.native import (
     STATUS_BLOCKED,
+    STATUS_CHANGED,
     STATUS_OK,
     NativeWorkloadShmUnavailable,
     load_native_library,
@@ -1314,6 +1315,90 @@ class TestSelectAndAllocateCas:
             assert (instance.id, endpoint.id) == (2, 20)
             # Must switch on the second attempt, not exhaust retries re-selecting the excluded pair.
             assert calls["n"] == 2
+        finally:
+            native.cas_add = orig
+            client._workload_reader.detach()
+            writer.release()
+
+    @pytest.mark.asyncio
+    async def test_select_and_allocate_exhaust_logs_none_meta(self, native_lib, caplog):
+        """Missing SHM slot is silent per attempt; the exhaust warning must name none_meta."""
+        del native_lib
+        config = CoordinatorConfig()
+        im = InstanceManager(config)
+        await im.refresh_instances(EventType.ADD, [_make_cas_instance(1, 10)])
+        name = _cas_shm_name("nm")
+        client, writer = await _client_with_shm(im, name)
+        native = client._workload_reader.native
+        orig_cas = native.cas_add
+        native.cas_add = Mock(side_effect=AssertionError("cas_add must not run when meta is missing"))
+        orig_meta = client._workload_reader.entry_meta
+        client._workload_reader.entry_meta = Mock(return_value=None)
+        try:
+            req = RequestInfo(req_id="req-none-meta", req_data={}, req_len=4, api="completions", token_ids=[1, 2, 3, 4])
+            with (
+                patch(
+                    "motor.coordinator.scheduler.runtime.scheduler_client._MAX_CAS_ALLOCATE_ATTEMPTS",
+                    3,
+                ),
+                caplog.at_level("WARNING"),
+            ):
+                result = await client.select_and_allocate(PDRole.ROLE_P, req)
+            assert result is None
+            native.cas_add.assert_not_called()
+            exhaust = [rec.message for rec in caplog.records if "exhausted CAS retries" in rec.message]
+            assert exhaust
+            assert "req_id=req-none-meta" in exhaust[0]
+            assert "none_meta=1" in exhaust[0]
+            assert "already_excluded=2" in exhaust[0]
+            assert "last_reason=none_meta" in exhaust[0] or "last_reason=already_excluded" in exhaust[0]
+            assert "changed=0" in exhaust[0]
+            assert "blocked=0" in exhaust[0]
+            assert "slot_invalid=0" in exhaust[0]
+        finally:
+            client._workload_reader.entry_meta = orig_meta
+            native.cas_add = orig_cas
+            client._workload_reader.detach()
+            writer.release()
+
+    @pytest.mark.asyncio
+    async def test_select_and_allocate_exhaust_logs_changed(self, native_lib, caplog):
+        """Perpetual CHANGED never logs cas_add/SLOT_INVALID; exhaust must count changed."""
+        del native_lib
+        config = CoordinatorConfig()
+        im = InstanceManager(config)
+        await im.refresh_instances(EventType.ADD, [_make_cas_instance(1, 10)])
+        name = _cas_shm_name("exh")
+        client, writer = await _client_with_shm(im, name)
+        _seed_shm_tokens(writer, 1, 10, 1.0)
+        native = client._workload_reader.native
+        orig = native.cas_add
+
+        def always_changed(iid, eid, gen, expected, delta, slot=None, **kwargs):
+            del iid, eid, gen, delta, slot, kwargs
+            return (STATUS_CHANGED, expected + 1.0)
+
+        native.cas_add = always_changed
+        try:
+            req = RequestInfo(req_id="req-exh-ch", req_data={}, req_len=4, api="completions", token_ids=[1, 2, 3, 4])
+            with (
+                patch(
+                    "motor.coordinator.scheduler.runtime.scheduler_client._MAX_CAS_ALLOCATE_ATTEMPTS",
+                    3,
+                ),
+                caplog.at_level("WARNING"),
+            ):
+                result = await client.select_and_allocate(PDRole.ROLE_P, req)
+            assert result is None
+            exhaust = [rec.message for rec in caplog.records if "exhausted CAS retries" in rec.message]
+            assert exhaust
+            assert "req_id=req-exh-ch" in exhaust[0]
+            assert "changed=3" in exhaust[0]
+            assert "none_meta=0" in exhaust[0]
+            assert "already_excluded=0" in exhaust[0]
+            assert "last_reason=Changed" in exhaust[0]
+            assert "last_pair=1-10" in exhaust[0]
+            assert "pair_in_meta=True" in exhaust[0]
         finally:
             native.cas_add = orig
             client._workload_reader.detach()

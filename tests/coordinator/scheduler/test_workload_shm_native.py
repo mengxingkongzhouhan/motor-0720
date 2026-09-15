@@ -41,6 +41,7 @@ from motor.coordinator.scheduler.runtime.workload_shm.native import (
     NativeWorkloadShmError,
     NativeWorkloadShmUnavailable,
     WorkloadShm,
+    cas_status_name,
     load_native_library,
     pdrole_to_shm_role,
 )
@@ -320,6 +321,16 @@ def test_snapshot_v4_copies_tokens_when_pair_moves_slot(lib):
         assert entry["cpu_hit_blocks"] == 2.0
     finally:
         shm.close(unlink=True)
+
+
+def test_cas_status_name_matches_abi_tokens():
+    """Allocate exhaust logs must print these names, not raw C enums."""
+    assert cas_status_name(STATUS_OK) == "Ok"
+    assert cas_status_name(STATUS_CHANGED) == "Changed"
+    assert cas_status_name(STATUS_BLOCKED) == "Blocked"
+    assert cas_status_name(STATUS_SLOT_INVALID) == "SlotInvalid"
+    assert cas_status_name(STATUS_BAD_ARG) == "BadArg"
+    assert cas_status_name(99) == "Unknown"
 
 
 def test_cas_add_ok_then_changed(lib):

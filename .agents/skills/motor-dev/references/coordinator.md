@@ -139,6 +139,8 @@ All three ledgers sit at offsets 16/24/32 so a 40B stride from a 64B header stay
 
 **Recovery:** Workers detect stale SHM (heartbeat >5s old) → trigger full `GET_AVAILABLE_INSTANCES` refresh. Attach failure is loud (`NativeWorkloadShmUnavailable`); there is no Python writer fallback. Native **ABI_VERSION=3** (`mindie_wl_abi_version`; Python `MIN_ABI_VERSION=3` refuses older `.so`). Scoring refresh uses one FFI `load_entries` (atomic-load flags/tokens/overlay in Rust); `cas_add` / `cas_sub_floor0` take a slot hint from that snapshot (`SLOT_HINT_NONE` scans; a stale hint is `SLOT_INVALID`, no rescan). Token CAS uses `expected`; overlay fields are fetch-added only after that CAS succeeds. Both reject non-finite or negative deltas with `BAD_ARG`. `update_workload` is release-only (`RELEASE_TOKENS`) and subtracts all three fields, flooring at 0.
 
+`select_and_allocate` retries CAS up to 64 times. `STATUS_CHANGED` reloads SHM and re-scores; `BLOCKED` / `SLOT_INVALID` / missing-or-`FLAG_BLOCKED` slot exclude the pair. Those reasons are silent per attempt. The exhaust warning counts them (`none_meta`, `blocked_flag`, `changed`, `blocked`, `slot_invalid`, `already_excluded`, `other`) plus last pair/reason/expected/actual/slot and `shm_valid_pairs`. `cas_add` / `SLOT_INVALID` / `BLOCKED` are status tokens, not log substrings. `select_and_allocate selected` is only emitted on Prefill `STATUS_OK`.
+
 ### Role Shared Memory (HA)
 
 ``` yaml

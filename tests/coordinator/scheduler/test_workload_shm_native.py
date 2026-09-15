@@ -44,6 +44,8 @@ from motor.coordinator.scheduler.runtime.workload_shm.native import (
     cas_status_name,
     load_native_library,
     pdrole_to_shm_role,
+    probe_so_abi,
+    so_abi_is_current,
 )
 from motor.coordinator.scheduler.runtime.workload_shm.reader import WorkloadSharedMemoryReader
 
@@ -219,6 +221,44 @@ def test_missing_library_raises_clear_error():
     with pytest.raises(NativeWorkloadShmUnavailable) as exc:
         load_native_library(path="/nonexistent/does-not-exist/libmindie_workload_shm.so")
     assert native._LIB_BASENAME in str(exc.value)
+
+
+def test_probe_so_abi_rejects_missing_and_garbage(tmp_path):
+    """Checkout leftovers are probed without binding the full ctypes ABI."""
+    assert probe_so_abi("/nonexistent/libmindie_workload_shm.so") is None
+    assert so_abi_is_current("/nonexistent/libmindie_workload_shm.so") is False
+    garbage = tmp_path / "libmindie_workload_shm.so"
+    garbage.write_bytes(b"not-a-shared-object")
+    assert probe_so_abi(str(garbage)) is None
+    assert so_abi_is_current(str(garbage)) is False
+
+
+def test_stale_abi_library_is_refused(tmp_path, monkeypatch):
+    """ABI 2 leftover from a previous branch must not start this checkout."""
+    so = tmp_path / "libmindie_workload_shm.so"
+    so.write_bytes(b"fake")
+
+    class _FakeLib:
+        def mindie_wl_abi_version(self):
+            return 2
+
+    monkeypatch.setattr(native, "_bind", lambda _lib: _FakeLib())
+    monkeypatch.setattr(native.ctypes, "CDLL", lambda _path: object())
+    with pytest.raises(NativeWorkloadShmUnavailable) as exc:
+        load_native_library(path=str(so))
+    message = str(exc.value)
+    assert "ABI 2 < 3" in message
+    assert "SKIP_WORKLOAD_SHM_BUILD=0" in message
+    assert "leftover .so" in message
+
+
+def test_so_abi_is_current_accepts_built_library():
+    """The first existing search-path .so must satisfy MIN_ABI_VERSION."""
+    paths = [item for item in native._candidate_paths() if os.path.isfile(item)]
+    if not paths:
+        pytest.skip("native workload-shm library not built")
+    assert so_abi_is_current(paths[0]) is True
+    assert probe_so_abi(paths[0]) >= MIN_ABI_VERSION
 
 
 def _poke_schema_version(name: str, schema: int) -> None:

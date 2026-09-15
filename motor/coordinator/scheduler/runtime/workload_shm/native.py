@@ -55,6 +55,25 @@ def cas_status_name(status: int) -> str:
     """Stable token for CAS status logs (not a log line by itself)."""
     return _STATUS.get(int(status), "Unknown")
 
+
+def probe_so_abi(path: str) -> int | None:
+    """Return ``mindie_wl_abi_version()``, or None if ``path`` cannot be probed."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        lib = ctypes.CDLL(path)
+        lib.mindie_wl_abi_version.restype = ctypes.c_uint32
+        lib.mindie_wl_abi_version.argtypes = []
+        return int(lib.mindie_wl_abi_version())
+    except (OSError, AttributeError, ValueError, TypeError, OverflowError):
+        return None
+
+
+def so_abi_is_current(path: str) -> bool:
+    """True when ``path`` exists and reports ABI >= ``MIN_ABI_VERSION``."""
+    abi = probe_so_abi(path)
+    return abi is not None and abi >= MIN_ABI_VERSION
+
 # Named status codes for CAS control flow (callers branch on these; they are not errors).
 STATUS_OK = 0
 STATUS_CHANGED = 1
@@ -247,14 +266,22 @@ def load_native_library(path: str | None = None) -> ctypes.CDLL:
         if path is None:
             _lib_cache = lib
         return lib
-    raise NativeWorkloadShmUnavailable(
-        "Could not load "
-        + _LIB_BASENAME
-        + " (build it via build.sh / `cargo build --release` in "
-        + "motor/coordinator/workload_shm_rs, or set "
+    hint = (
+        " (build it via build.sh / `cargo build --release` in "
+        "motor/coordinator/workload_shm_rs, or set "
         + _ENV_OVERRIDE
-        + "). Tried: "
-        + "; ".join(errors)
+        + ")"
+    )
+    if any("ABI " in item for item in errors):
+        hint = (
+            " (leftover .so from a previous checkout; this branch needs ABI >= "
+            + str(MIN_ABI_VERSION)
+            + ". Rebuild with SKIP_WORKLOAD_SHM_BUILD=0 bash build.sh, or "
+            "`cargo build --release` in motor/coordinator/workload_shm_rs and copy "
+            "into lib/; then restart Coordinator)"
+        )
+    raise NativeWorkloadShmUnavailable(
+        "Could not load " + _LIB_BASENAME + hint + ". Tried: " + "; ".join(errors)
     )
 
 

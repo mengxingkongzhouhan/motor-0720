@@ -24,6 +24,8 @@ from motor.coordinator.domain import InstanceReadiness
 from motor.coordinator.domain.instance_manager import InstanceManager
 from motor.coordinator.domain.scheduling import UpdateWorkloadParams
 from motor.coordinator.models.request import RequestInfo
+from motor.coordinator.scheduler.allocate_arbitration import select_authoritative_allocate_candidate
+from motor.coordinator.scheduler.policy.smetric_gated import SMetricGatedPolicy
 from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_LOAD_BALANCE,
     SchedulerRequestType,
@@ -914,11 +916,13 @@ def native_lib():
         return None
 
 
-async def _client_with_shm(im: InstanceManager, name: str) -> tuple[AsyncSchedulerClient, WorkloadSharedMemoryOwner]:
+async def _client_with_shm(
+    im: InstanceManager, name: str, scheduler_type: str = "load_balance"
+) -> tuple[AsyncSchedulerClient, WorkloadSharedMemoryOwner]:
     writer = WorkloadSharedMemoryOwner(im, max_entries=8, shm_name=name)
     writer.write_snapshot()
     client = AsyncSchedulerClient(
-        SchedulerClientConfig(scheduler_type="load_balance", endpoint_instance_score_weight=0.0)
+        SchedulerClientConfig(scheduler_type=scheduler_type, endpoint_instance_score_weight=0.0)
     )
     cache = _SchedulerInstanceCache()
     instances = list(im.get_available_instances(PDRole.ROLE_P).values())
@@ -1139,6 +1143,101 @@ class TestSelectAndAllocateCas:
             assert result is not None
             assert calls["n"] == 1
         finally:
+            client._workload_reader.detach()
+            writer.release()
+
+    @pytest.mark.asyncio
+    async def test_smetric_gated_first_cas_uses_fast_path(self, native_lib, caplog):
+        """smetric_gated CAS-commits the policy winner first; it does not re-gate before the first CAS."""
+        del native_lib
+        config = CoordinatorConfig()
+        im = InstanceManager(config)
+        await im.refresh_instances(
+            EventType.ADD,
+            [_make_cas_instance(1, 10), _make_cas_instance(2, 20)],
+        )
+        name = _cas_shm_name("gfp")
+        client, writer = await _client_with_shm(im, name, scheduler_type="smetric_gated")
+        _seed_shm_tokens(writer, 1, 10, 1.0)
+        _seed_shm_tokens(writer, 2, 20, 50.0)
+        inst = next(item for item in client._cache.get_instances(PDRole.ROLE_P) if item.id == 1)
+        ep = next(item for item in inst.get_all_endpoints() if item.id == 10)
+
+        def fake_select(instances, req_info, **kwargs):
+            req_info.smetric_gated_debug = {(1, 10): (4.0, 0.0), (2, 20): (4.0, 0.0)}
+            return [(inst, ep, 0.0)]
+
+        try:
+            with (
+                patch.object(SMetricGatedPolicy, "select_endpoint_candidates_from_list", side_effect=fake_select),
+                patch(
+                    "motor.coordinator.scheduler.runtime.scheduler_client.select_authoritative_allocate_candidate"
+                ) as mock_auth,
+                caplog.at_level("INFO"),
+            ):
+                req = RequestInfo(
+                    req_id="req-gfp", req_data={}, req_len=4, api="completions", token_ids=[1, 2, 3, 4]
+                )
+                result = await client.select_and_allocate(PDRole.ROLE_P, req)
+            assert result is not None
+            assert (result[0].id, result[1].id) == (1, 10)
+            mock_auth.assert_not_called()
+            scheduled = [rec.message for rec in caplog.records if rec.message.startswith("scheduled role=")]
+            assert scheduled
+            assert "policy=smetric_gated" in scheduled[0]
+            assert "fast_path=True" in scheduled[0]
+        finally:
+            client._workload_reader.detach()
+            writer.release()
+
+    @pytest.mark.asyncio
+    async def test_smetric_gated_changed_then_regates(self, native_lib):
+        """Stale tokens on the gated winner refresh SHM and re-run select_smetric_gated once."""
+        del native_lib
+        config = CoordinatorConfig()
+        im = InstanceManager(config)
+        await im.refresh_instances(
+            EventType.ADD,
+            [_make_cas_instance(1, 10), _make_cas_instance(2, 20)],
+        )
+        name = _cas_shm_name("gch")
+        client, writer = await _client_with_shm(im, name, scheduler_type="smetric_gated")
+        _seed_shm_tokens(writer, 1, 10, 1.0)
+        _seed_shm_tokens(writer, 2, 20, 8.0)
+        inst = next(item for item in client._cache.get_instances(PDRole.ROLE_P) if item.id == 1)
+        ep = next(item for item in inst.get_all_endpoints() if item.id == 10)
+        native = client._workload_reader.native
+        orig_cas = native.cas_add
+        cas_calls = {"n": 0}
+
+        def fake_select(instances, req_info, **kwargs):
+            req_info.smetric_gated_debug = {(1, 10): (4.0, 0.0), (2, 20): (4.0, 0.0)}
+            return [(inst, ep, 0.0)]
+
+        def wrapped_cas(iid, eid, gen, expected, delta, slot=None, **kwargs):
+            cas_calls["n"] += 1
+            if cas_calls["n"] == 1:
+                orig_cas(iid, eid, gen, expected, 80.0, slot=slot, **kwargs)
+            return orig_cas(iid, eid, gen, expected, delta, slot=slot, **kwargs)
+
+        native.cas_add = wrapped_cas
+        try:
+            with (
+                patch.object(SMetricGatedPolicy, "select_endpoint_candidates_from_list", side_effect=fake_select),
+                patch(
+                    "motor.coordinator.scheduler.runtime.scheduler_client.select_authoritative_allocate_candidate",
+                    wraps=select_authoritative_allocate_candidate,
+                ) as mock_auth,
+            ):
+                req = RequestInfo(
+                    req_id="req-gch", req_data={}, req_len=4, api="completions", token_ids=[1, 2, 3, 4]
+                )
+                result = await client.select_and_allocate(PDRole.ROLE_P, req)
+            assert result is not None
+            assert cas_calls["n"] >= 2
+            assert mock_auth.call_count == 1
+        finally:
+            native.cas_add = orig_cas
             client._workload_reader.detach()
             writer.release()
 

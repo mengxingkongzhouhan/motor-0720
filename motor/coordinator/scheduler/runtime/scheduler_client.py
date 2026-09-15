@@ -1320,7 +1320,9 @@ class AsyncSchedulerClient:
         ]
         proposed = (proposed_instance.id, proposed_endpoint.id)
         excluded: set[tuple[int, int]] = set()
-        use_authoritative = candidate_policy == CANDIDATE_POLICY_SMETRIC_GATED
+        # Same as LB/RR/affinity: first CAS validates the policy winner. CHANGED/BLOCKED
+        # refresh SHM and re-run allocate_arbitration (smetric_gated re-gates on that path).
+        use_authoritative = False
         native = self._workload_reader.native
         if native is None:
             return None

@@ -29,9 +29,9 @@ the prefill compute and CPU->NPU KV transfer currently in flight per endpoint.
 When no endpoint passes both gates the policy degrades in order: first endpoint passing the
 ``active_tokens`` gate alone, then the head of the list (lowest ledger prefill_cost).
 
-On motor-0911 the authoritative re-pick lives in worker-local ``allocate_arbitration``
-(schema-5 SHM CAS). ``active_tokens``, ``prefill_cost`` and ``cpu_hit_blocks`` are all
-cross-worker SHM ledger fields.
+On motor-0911 the CHANGED/BLOCKED retry re-picks in worker-local ``allocate_arbitration``
+(schema-5 SHM CAS), same as other policies. First CAS uses the policy winner. ``active_tokens``,
+``prefill_cost`` and ``cpu_hit_blocks`` are all cross-worker SHM ledger fields.
 """
 
 from __future__ import annotations
@@ -221,8 +221,8 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
     """
     Rank by ledger prefill_cost, commit the first endpoint under both ledger load averages.
 
-    Workers run the conductor query (for the stamp values) and re-rank / re-gate against the
-    local cache (SHM ledger) before CAS-committing.
+    Workers run the conductor query for stamp values and CAS the gated winner. A stale
+    token CAS (CHANGED) refreshes the SHM ledger and re-ranks / re-gates before retrying.
     """
 
     def __init__(self, instance_provider: InstanceProvider):
@@ -310,7 +310,8 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
         """
         Worker-side proposal: the gated pick first, then the rest in ledger prefill_cost order.
 
-        ``allocate_arbitration`` re-ranks and re-gates on the cache after a SHM refresh.
+        First CAS uses this winner. On CHANGED/BLOCKED, ``allocate_arbitration`` re-ranks
+        and re-gates against a fresh SHM cache.
         """
         ranked = SMetricGatedPolicy.score_endpoints(instances, req_info)
         if not ranked:

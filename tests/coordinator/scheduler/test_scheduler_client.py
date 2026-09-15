@@ -1096,8 +1096,8 @@ class TestSelectAndAllocateCas:
             assert scheduled_lines
             assert "policy=load_balance" in scheduled_lines[0]
             assert "committed=4.0" in scheduled_lines[0]
-            assert "prefill_cost=0.0" in scheduled_lines[0]
-            assert "cpu_hit_blocks=0.0" in scheduled_lines[0]
+            assert "prefill_cost=0" in scheduled_lines[0]
+            assert "cpu_hit_blocks=0" in scheduled_lines[0]
             assert client._cache._endpoint_running_requests[(1, 10)] == 1
             ok = await client.update_workload(
                 UpdateWorkloadParams(
@@ -1160,11 +1160,11 @@ class TestSelectAndAllocateCas:
         orig = native.cas_add
         calls = {"n": 0}
 
-        def wrapped(iid, eid, gen, expected, delta, slot=None):
+        def wrapped(iid, eid, gen, expected, delta, slot=None, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
-                orig(iid, eid, gen, expected, 80.0, slot=slot)
-            return orig(iid, eid, gen, expected, delta, slot=slot)
+                orig(iid, eid, gen, expected, 80.0, slot=slot, **kwargs)
+            return orig(iid, eid, gen, expected, delta, slot=slot, **kwargs)
 
         native.cas_add = wrapped
         try:
@@ -1200,11 +1200,11 @@ class TestSelectAndAllocateCas:
         orig = native.cas_add
         calls = {"n": 0}
 
-        def wrapped(iid, eid, gen, expected, delta, slot=None):
+        def wrapped(iid, eid, gen, expected, delta, slot=None, **kwargs):
             calls["n"] += 1
             if (iid, eid) == (1, 10):
                 return (STATUS_BLOCKED, expected)
-            return orig(iid, eid, gen, expected, delta, slot=slot)
+            return orig(iid, eid, gen, expected, delta, slot=slot, **kwargs)
 
         native.cas_add = wrapped
         try:

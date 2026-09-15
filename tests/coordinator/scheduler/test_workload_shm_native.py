@@ -487,7 +487,7 @@ def test_multiprocess_cas_conserves_total(lib):
 
 def test_load_entries_matches_per_slot_and_cas_uses_slot(lib):
     """One FFI refresh must equal N load_entry calls; cas_add with a stale slot is SLOT_INVALID."""
-    assert ctypes.sizeof(native._LoadedEntry) == 24
+    assert ctypes.sizeof(native._LoadedEntry) == 40
     shm = WorkloadShm.create_v4(_unique("batch"), 16, lib=lib)
     try:
         shm.write_snapshot_v4(
@@ -501,6 +501,8 @@ def test_load_entries_matches_per_slot_and_cas_uses_slot(lib):
         assert batched[0]["instance_id"] == 1
         assert batched[1]["instance_id"] == 2
         assert batched[0]["active_tokens"] == shm.load_entry(0)["active_tokens"]
+        assert batched[0]["prefill_cost"] == shm.load_entry(0)["prefill_cost"]
+        assert batched[0]["cpu_hit_blocks"] == shm.load_entry(0)["cpu_hit_blocks"]
         status, actual = shm.cas_add(1, 10, 0, 0.0, 3.0, slot=0)
         assert status == STATUS_OK
         assert actual == 3.0

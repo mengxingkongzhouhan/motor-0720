@@ -35,6 +35,8 @@ from motor.coordinator.scheduler.policy.smetric_gated import (
     GatedCandidate,
     SMetricGatedPolicy,
     _cpu_hit_blocks,
+    _npu_hit_blocks,
+    _npu_hit_ratio,
     pick_gated,
     sort_candidates,
 )
@@ -183,6 +185,22 @@ class TestConductorParsing:
         assert _cpu_hit_blocks({"matched_tokens": 8}) == 0
         assert _cpu_hit_blocks({"cpu_blocks": "x"}) == 0
         assert _cpu_hit_blocks({"cpu_blocks": -3}) == 0
+
+    def test_npu_blocks_from_dp_blocks(self):
+        assert _npu_hit_blocks({"npu_blocks": 3, "cpu_blocks": 5, "matched_tokens": 64}) == 3
+        assert _npu_hit_blocks(40) == 0
+        assert _npu_hit_blocks({"npu_blocks": "x"}) == 0
+        assert _npu_hit_blocks({"npu_blocks": -2}) == 0
+
+    def test_npu_hit_ratio_divides_by_isl_and_guards_zero(self):
+        matched = {"npu_blocks": 4, "cpu_blocks": 1}
+        assert _npu_hit_ratio(matched, 100) == pytest.approx(0.04)
+        assert _npu_hit_ratio(matched, 0) == 0.0
+
+    def test_gated_candidate_npu_hit_defaults_to_zero(self):
+        """allocate_arbitration rebuilds GatedCandidate without npu_hit; that must not TypeError."""
+        cand = _cand(1, ledger_prefill=10)
+        assert cand.npu_hit == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -351,10 +369,10 @@ class TestPolicy:
 
         ranked = SMetricGatedPolicy.score_endpoints([inst_a, inst_b], req_info)
 
-        assert [(c.endpoint.id, c.ledger_prefill_cost, c.prefill_cost, c.cpu_hit_blocks) for c in ranked] == [
-            (11, 100.0, 100.0, 0.0),
-            (20, 200.0, 50.0, 0.0),
-            (10, 300.0, 10.0, 4.0),
+        assert [(c.endpoint.id, c.ledger_prefill_cost, c.prefill_cost, c.cpu_hit_blocks, c.npu_hit) for c in ranked] == [
+            (11, 100.0, 100.0, 0.0, 0.0),
+            (20, 200.0, 50.0, 0.0, 0.0),
+            (10, 300.0, 10.0, 4.0, 0.01),
         ]
         assert req_info.smetric_gated_debug == {(1, 11): (100.0, 0.0), (2, 20): (50.0, 0.0), (1, 10): (10.0, 4.0)}
         assert allocated_prefill_cost(req_info, 1, 10) == 10.0

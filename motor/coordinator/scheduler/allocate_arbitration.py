@@ -347,6 +347,7 @@ def select_smetric_gated(
             instance_role = PDRole.ROLE_U
         if instance_role != role:
             continue
+        # npu_hit is not in the stamp tuple; GatedCandidate defaults it to 0.
         candidates.append(
             GatedCandidate(
                 instance=instance,

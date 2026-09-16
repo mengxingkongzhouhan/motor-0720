@@ -127,13 +127,19 @@ class GatedCandidate:
 
     ``prefill_cost`` / ``cpu_hit_blocks`` are what THIS request would add to the endpoint ledger
     if committed there (conductor-derived); they are stamped on allocation and never used for
-    ordering. Ordering and gating read the endpoint's current ledger via ``endpoint.workload``.
+    ordering. ``npu_hit`` is this request's NPU-tier hit ratio (``npu_blocks / isl``), also not
+    used for ordering. Ordering and gating read the endpoint's current ledger via
+    ``endpoint.workload``.
+
+    ``npu_hit`` defaults to 0 so CAS-retry reconstruction in ``allocate_arbitration`` (which only
+    carries stamp tuples) and tests that build 4-field candidates stay valid.
     """
 
     instance: Instance
     endpoint: Endpoint
     prefill_cost: float
     cpu_hit_blocks: float
+    npu_hit: float = 0.0
 
     @property
     def key(self) -> tuple[int, int]:
@@ -160,6 +166,23 @@ def _cpu_hit_blocks(matched: object) -> float:
         return max(0.0, float(matched.get("cpu_blocks", 0) or 0))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _npu_hit_blocks(matched: object) -> float:
+    """NPU-tier matched blocks from a DpBlocks conductor entry; 0 for legacy integer matches."""
+    if not isinstance(matched, dict):
+        return 0.0
+    try:
+        return max(0.0, float(matched.get("npu_blocks", 0) or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _npu_hit_ratio(matched: object, isl: int) -> float:
+    """``npu_blocks / isl``; 0 when the prompt is empty (no ZeroDivisionError)."""
+    if isl <= 0:
+        return 0.0
+    return _npu_hit_blocks(matched) / float(isl)
 
 
 def _ledger_value(endpoint: Endpoint, field: str) -> float:
@@ -280,6 +303,7 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
                         endpoint=ep,
                         prefill_cost=_prefill_cost(isl, _matched_tokens(matched)),
                         cpu_hit_blocks=_cpu_hit_blocks(matched),
+                        npu_hit=_npu_hit_ratio(matched, isl),
                     )
                 )
         if not any_instance:

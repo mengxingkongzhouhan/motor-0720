@@ -58,3 +58,4 @@
 | 2026-09-09 | kv_conductor | map 格式 BlockStored 无法解析 | `kv_conductor/map-block-stored.md` | BlockStored, msgspec, map, deserialize_any |
 | 2026-09-09 | kv_conductor | CPU/Disk 订阅器误按 vLLM 事件解析 | `kv_conductor/event-source-routing.md` | ZmqSubscriber, EventSource, PoolEvent, CPU, Disk |
 | 2026-09-15 | coordinator | 切到 schema-5 分支后 Mgmt 因 ABI 2 .so 无法启动 | [stale-abi-so-refused.md](coordinator/stale-abi-so-refused.md) | ABI 2 < 3, libmindie_workload_shm.so, SKIP_WORKLOAD_SHM_BUILD, NativeWorkloadShmUnavailable, schema-5 |
+| 2026-09-16 | coordinator | 给 GatedCandidate 加必填字段后 CAS 重选 TypeError | [gated-candidate-npu-hit-ctor.md](coordinator/gated-candidate-npu-hit-ctor.md) | GatedCandidate npu_hit, missing positional argument, allocate_arbitration, select_smetric_gated |

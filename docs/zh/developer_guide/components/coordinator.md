@@ -8,7 +8,7 @@ Coordinator 进程入口为 `motor/coordinator/main.py`：异步 `main()` 中构
 
 | 进程字典键（常量名 / 值） | 管理类 | 说明 |
 |--------|--------|------|
-| `PROCESS_KEY_MGMT`（`"MgmtProcess"`） | `MgmtProcessManager` | 管理 HTTP + 控制面（实例成员表、熔断、精度全局门闩、schema-4 负载 SHM、ZMQ ROUTER/PUB） |
+| `PROCESS_KEY_MGMT`（`"MgmtProcess"`） | `MgmtProcessManager` | 管理 HTTP + 控制面（实例成员表、熔断、精度全局门闩、schema-5 负载 SHM、ZMQ ROUTER/PUB） |
 | `PROCESS_KEY_OBS`（`"ObsProcess"`） | `ObsProcessManager` | 可观测性 API 进程 |
 | `PROCESS_KEY_INFERENCE`（`"InferenceWorkers"`） | `InferenceProcessManager` | 推理 Worker：OpenAI/Anthropic HTTP；调度热路径在本地打分后对 Rust POSIX SHM 做 CAS 记账 |
 
@@ -43,7 +43,7 @@ Render 产生的非流式 Chat Completions 和 Completions 请求支持完整 To
 
 - 配置来源：`CoordinatorConfig.from_json()`，通常来自挂载的 `user_config.json` 中 **`motor_coordinator_config`** 等合并结果，字段定义见 `motor/config/coordinator.py`。独立部署时入口只读环境变量 `USER_CONFIG_PATH`。
 - 部署与端口约定见 [配置参考：motor_coordinator_config](../../user_guide/configuration/config_reference.md) 与 [接口说明](../../user_guide/api/README.md)。
-- 负载 SHM 需要 `libmindie_workload_shm.so`。`bash build.sh` 默认已有 `lib/*.so` 则跳过 cargo，缺了才编并**打进 wheel**（缺库禁止出包）。改 `.rs` 后设 `SKIP_WORKLOAD_SHM_BUILD=0`。有 cargo + libzmq 且缺 `bin/kv-conductor` 时同时打包 kv-conductor；缺 libzmq 时自动跳过（也可 `SKIP_KV_CONDUCTOR_BUILD=1 bash build.sh`）。缺失 `.so` 时启动响亮失败，不会回退到 Python 账本。
+- 负载 SHM 需要 `libmindie_workload_shm.so`。`bash build.sh` 默认已有 **ABI 达标**的 `lib/*.so` 则跳过 cargo；文件缺失或 ABI 低于当前 Python `MIN_ABI_VERSION` 时会重编并**打进 wheel**（缺库或 ABI 过旧禁止出包）。改 `.rs` 后也可设 `SKIP_WORKLOAD_SHM_BUILD=0`。有 cargo + libzmq 且缺 `bin/kv-conductor` 时同时打包 kv-conductor；缺 libzmq 时自动跳过（也可 `SKIP_KV_CONDUCTOR_BUILD=1 bash build.sh`）。缺失或 ABI 过旧的 `.so` 时启动响亮失败，不会回退到 Python 账本。`lib/*.so` 不进 git：只切分支不会换掉上一版 ABI 2 的残留库。
 - 不依赖 Controller / Node Manager 的拉起步骤见 [Coordinator 独立部署](../../user_guide/deployment/standalone.md)。
 
 ## 配置说明

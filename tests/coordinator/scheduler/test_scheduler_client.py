@@ -24,6 +24,8 @@ from motor.coordinator.domain import InstanceReadiness
 from motor.coordinator.domain.instance_manager import InstanceManager
 from motor.coordinator.domain.scheduling import UpdateWorkloadParams
 from motor.coordinator.models.request import RequestInfo
+from motor.coordinator.scheduler.allocate_arbitration import select_authoritative_allocate_candidate
+from motor.coordinator.scheduler.policy.smetric_gated import SMetricGatedPolicy
 from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_LOAD_BALANCE,
     SchedulerRequestType,
@@ -39,6 +41,7 @@ from motor.coordinator.scheduler.runtime.scheduler_client import (
 )
 from motor.coordinator.scheduler.runtime.workload_shm.native import (
     STATUS_BLOCKED,
+    STATUS_CHANGED,
     STATUS_OK,
     NativeWorkloadShmUnavailable,
     load_native_library,
@@ -914,11 +917,13 @@ def native_lib():
         return None
 
 
-async def _client_with_shm(im: InstanceManager, name: str) -> tuple[AsyncSchedulerClient, WorkloadSharedMemoryOwner]:
+async def _client_with_shm(
+    im: InstanceManager, name: str, scheduler_type: str = "load_balance"
+) -> tuple[AsyncSchedulerClient, WorkloadSharedMemoryOwner]:
     writer = WorkloadSharedMemoryOwner(im, max_entries=8, shm_name=name)
     writer.write_snapshot()
     client = AsyncSchedulerClient(
-        SchedulerClientConfig(scheduler_type="load_balance", endpoint_instance_score_weight=0.0)
+        SchedulerClientConfig(scheduler_type=scheduler_type, endpoint_instance_score_weight=0.0)
     )
     cache = _SchedulerInstanceCache()
     instances = list(im.get_available_instances(PDRole.ROLE_P).values())
@@ -1019,7 +1024,7 @@ class TestDpStatsSnapshot:
 
 
 class TestSelectAndAllocateCas:
-    """Local scoring + schema-4 CAS. Does not mock send_request."""
+    """Local scoring + schema-5 CAS. Does not mock send_request."""
 
     def test_dp_stats_window_follows_config(self):
         client = AsyncSchedulerClient(
@@ -1096,8 +1101,8 @@ class TestSelectAndAllocateCas:
             assert scheduled_lines
             assert "policy=load_balance" in scheduled_lines[0]
             assert "committed=4.0" in scheduled_lines[0]
-            assert "prefill_cost=0.0" in scheduled_lines[0]
-            assert "cpu_hit_blocks=0.0" in scheduled_lines[0]
+            assert "prefill_cost=0" in scheduled_lines[0]
+            assert "cpu_hit_blocks=0" in scheduled_lines[0]
             assert client._cache._endpoint_running_requests[(1, 10)] == 1
             ok = await client.update_workload(
                 UpdateWorkloadParams(
@@ -1143,6 +1148,101 @@ class TestSelectAndAllocateCas:
             writer.release()
 
     @pytest.mark.asyncio
+    async def test_smetric_gated_first_cas_uses_fast_path(self, native_lib, caplog):
+        """smetric_gated CAS-commits the policy winner first; it does not re-gate before the first CAS."""
+        del native_lib
+        config = CoordinatorConfig()
+        im = InstanceManager(config)
+        await im.refresh_instances(
+            EventType.ADD,
+            [_make_cas_instance(1, 10), _make_cas_instance(2, 20)],
+        )
+        name = _cas_shm_name("gfp")
+        client, writer = await _client_with_shm(im, name, scheduler_type="smetric_gated")
+        _seed_shm_tokens(writer, 1, 10, 1.0)
+        _seed_shm_tokens(writer, 2, 20, 50.0)
+        inst = next(item for item in client._cache.get_instances(PDRole.ROLE_P) if item.id == 1)
+        ep = next(item for item in inst.get_all_endpoints() if item.id == 10)
+
+        def fake_select(instances, req_info, **kwargs):
+            req_info.smetric_gated_debug = {(1, 10): (4.0, 0.0), (2, 20): (4.0, 0.0)}
+            return [(inst, ep, 0.0)]
+
+        try:
+            with (
+                patch.object(SMetricGatedPolicy, "select_endpoint_candidates_from_list", side_effect=fake_select),
+                patch(
+                    "motor.coordinator.scheduler.runtime.scheduler_client.select_authoritative_allocate_candidate"
+                ) as mock_auth,
+                caplog.at_level("INFO"),
+            ):
+                req = RequestInfo(
+                    req_id="req-gfp", req_data={}, req_len=4, api="completions", token_ids=[1, 2, 3, 4]
+                )
+                result = await client.select_and_allocate(PDRole.ROLE_P, req)
+            assert result is not None
+            assert (result[0].id, result[1].id) == (1, 10)
+            mock_auth.assert_not_called()
+            scheduled = [rec.message for rec in caplog.records if rec.message.startswith("scheduled role=")]
+            assert scheduled
+            assert "policy=smetric_gated" in scheduled[0]
+            assert "fast_path=True" in scheduled[0]
+        finally:
+            client._workload_reader.detach()
+            writer.release()
+
+    @pytest.mark.asyncio
+    async def test_smetric_gated_changed_then_regates(self, native_lib):
+        """Stale tokens on the gated winner refresh SHM and re-run select_smetric_gated once."""
+        del native_lib
+        config = CoordinatorConfig()
+        im = InstanceManager(config)
+        await im.refresh_instances(
+            EventType.ADD,
+            [_make_cas_instance(1, 10), _make_cas_instance(2, 20)],
+        )
+        name = _cas_shm_name("gch")
+        client, writer = await _client_with_shm(im, name, scheduler_type="smetric_gated")
+        _seed_shm_tokens(writer, 1, 10, 1.0)
+        _seed_shm_tokens(writer, 2, 20, 8.0)
+        inst = next(item for item in client._cache.get_instances(PDRole.ROLE_P) if item.id == 1)
+        ep = next(item for item in inst.get_all_endpoints() if item.id == 10)
+        native = client._workload_reader.native
+        orig_cas = native.cas_add
+        cas_calls = {"n": 0}
+
+        def fake_select(instances, req_info, **kwargs):
+            req_info.smetric_gated_debug = {(1, 10): (4.0, 0.0), (2, 20): (4.0, 0.0)}
+            return [(inst, ep, 0.0)]
+
+        def wrapped_cas(iid, eid, gen, expected, delta, slot=None, **kwargs):
+            cas_calls["n"] += 1
+            if cas_calls["n"] == 1:
+                orig_cas(iid, eid, gen, expected, 80.0, slot=slot, **kwargs)
+            return orig_cas(iid, eid, gen, expected, delta, slot=slot, **kwargs)
+
+        native.cas_add = wrapped_cas
+        try:
+            with (
+                patch.object(SMetricGatedPolicy, "select_endpoint_candidates_from_list", side_effect=fake_select),
+                patch(
+                    "motor.coordinator.scheduler.runtime.scheduler_client.select_authoritative_allocate_candidate",
+                    wraps=select_authoritative_allocate_candidate,
+                ) as mock_auth,
+            ):
+                req = RequestInfo(
+                    req_id="req-gch", req_data={}, req_len=4, api="completions", token_ids=[1, 2, 3, 4]
+                )
+                result = await client.select_and_allocate(PDRole.ROLE_P, req)
+            assert result is not None
+            assert cas_calls["n"] >= 2
+            assert mock_auth.call_count == 1
+        finally:
+            native.cas_add = orig_cas
+            client._workload_reader.detach()
+            writer.release()
+
+    @pytest.mark.asyncio
     async def test_select_and_allocate_changed_reloads_and_rescores(self, native_lib):
         """Stale expected (CHANGED) must re-score on the fresh vector, not blindly add on the old winner."""
         del native_lib
@@ -1160,11 +1260,11 @@ class TestSelectAndAllocateCas:
         orig = native.cas_add
         calls = {"n": 0}
 
-        def wrapped(iid, eid, gen, expected, delta, slot=None):
+        def wrapped(iid, eid, gen, expected, delta, slot=None, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
-                orig(iid, eid, gen, expected, 80.0, slot=slot)
-            return orig(iid, eid, gen, expected, delta, slot=slot)
+                orig(iid, eid, gen, expected, 80.0, slot=slot, **kwargs)
+            return orig(iid, eid, gen, expected, delta, slot=slot, **kwargs)
 
         native.cas_add = wrapped
         try:
@@ -1200,11 +1300,11 @@ class TestSelectAndAllocateCas:
         orig = native.cas_add
         calls = {"n": 0}
 
-        def wrapped(iid, eid, gen, expected, delta, slot=None):
+        def wrapped(iid, eid, gen, expected, delta, slot=None, **kwargs):
             calls["n"] += 1
             if (iid, eid) == (1, 10):
                 return (STATUS_BLOCKED, expected)
-            return orig(iid, eid, gen, expected, delta, slot=slot)
+            return orig(iid, eid, gen, expected, delta, slot=slot, **kwargs)
 
         native.cas_add = wrapped
         try:
@@ -1215,6 +1315,90 @@ class TestSelectAndAllocateCas:
             assert (instance.id, endpoint.id) == (2, 20)
             # Must switch on the second attempt, not exhaust retries re-selecting the excluded pair.
             assert calls["n"] == 2
+        finally:
+            native.cas_add = orig
+            client._workload_reader.detach()
+            writer.release()
+
+    @pytest.mark.asyncio
+    async def test_select_and_allocate_exhaust_logs_none_meta(self, native_lib, caplog):
+        """Missing SHM slot is silent per attempt; the exhaust warning must name none_meta."""
+        del native_lib
+        config = CoordinatorConfig()
+        im = InstanceManager(config)
+        await im.refresh_instances(EventType.ADD, [_make_cas_instance(1, 10)])
+        name = _cas_shm_name("nm")
+        client, writer = await _client_with_shm(im, name)
+        native = client._workload_reader.native
+        orig_cas = native.cas_add
+        native.cas_add = Mock(side_effect=AssertionError("cas_add must not run when meta is missing"))
+        orig_meta = client._workload_reader.entry_meta
+        client._workload_reader.entry_meta = Mock(return_value=None)
+        try:
+            req = RequestInfo(req_id="req-none-meta", req_data={}, req_len=4, api="completions", token_ids=[1, 2, 3, 4])
+            with (
+                patch(
+                    "motor.coordinator.scheduler.runtime.scheduler_client._MAX_CAS_ALLOCATE_ATTEMPTS",
+                    3,
+                ),
+                caplog.at_level("WARNING"),
+            ):
+                result = await client.select_and_allocate(PDRole.ROLE_P, req)
+            assert result is None
+            native.cas_add.assert_not_called()
+            exhaust = [rec.message for rec in caplog.records if "exhausted CAS retries" in rec.message]
+            assert exhaust
+            assert "req_id=req-none-meta" in exhaust[0]
+            assert "none_meta=1" in exhaust[0]
+            assert "already_excluded=2" in exhaust[0]
+            assert "last_reason=none_meta" in exhaust[0] or "last_reason=already_excluded" in exhaust[0]
+            assert "changed=0" in exhaust[0]
+            assert "blocked=0" in exhaust[0]
+            assert "slot_invalid=0" in exhaust[0]
+        finally:
+            client._workload_reader.entry_meta = orig_meta
+            native.cas_add = orig_cas
+            client._workload_reader.detach()
+            writer.release()
+
+    @pytest.mark.asyncio
+    async def test_select_and_allocate_exhaust_logs_changed(self, native_lib, caplog):
+        """Perpetual CHANGED never logs cas_add/SLOT_INVALID; exhaust must count changed."""
+        del native_lib
+        config = CoordinatorConfig()
+        im = InstanceManager(config)
+        await im.refresh_instances(EventType.ADD, [_make_cas_instance(1, 10)])
+        name = _cas_shm_name("exh")
+        client, writer = await _client_with_shm(im, name)
+        _seed_shm_tokens(writer, 1, 10, 1.0)
+        native = client._workload_reader.native
+        orig = native.cas_add
+
+        def always_changed(iid, eid, gen, expected, delta, slot=None, **kwargs):
+            del iid, eid, gen, delta, slot, kwargs
+            return (STATUS_CHANGED, expected + 1.0)
+
+        native.cas_add = always_changed
+        try:
+            req = RequestInfo(req_id="req-exh-ch", req_data={}, req_len=4, api="completions", token_ids=[1, 2, 3, 4])
+            with (
+                patch(
+                    "motor.coordinator.scheduler.runtime.scheduler_client._MAX_CAS_ALLOCATE_ATTEMPTS",
+                    3,
+                ),
+                caplog.at_level("WARNING"),
+            ):
+                result = await client.select_and_allocate(PDRole.ROLE_P, req)
+            assert result is None
+            exhaust = [rec.message for rec in caplog.records if "exhausted CAS retries" in rec.message]
+            assert exhaust
+            assert "req_id=req-exh-ch" in exhaust[0]
+            assert "changed=3" in exhaust[0]
+            assert "none_meta=0" in exhaust[0]
+            assert "already_excluded=0" in exhaust[0]
+            assert "last_reason=Changed" in exhaust[0]
+            assert "last_pair=1-10" in exhaust[0]
+            assert "pair_in_meta=True" in exhaust[0]
         finally:
             native.cas_add = orig
             client._workload_reader.detach()

@@ -310,12 +310,13 @@ def select_smetric_gated(
     req_id: str | None = None,
 ) -> tuple[Instance, Endpoint, float] | None:
     """
-    smetric_gated arbitration on the worker's fresh cache (SHM active_tokens + overlay).
+    smetric_gated arbitration on the worker's fresh cache (SHM tokens + overlay fields).
 
-    Resolve every scored endpoint that is still schedulable, sort by the endpoint's ledger
-    ``prefill_cost`` and take the first one at or below both scaled ledger averages. The
-    worker-supplied per-endpoint cost / cpu_blocks are only the values stamped on commit.
-    The returned score is the committed endpoint's ledger prefill_cost.
+    Used after a stale/blocked CAS, not on the first attempt. Resolve every scored endpoint
+    that is still schedulable, sort by the endpoint's ledger ``prefill_cost`` and take the
+    first one at or below both scaled ledger averages. The worker-supplied per-endpoint
+    cost / cpu_blocks are only the values stamped on commit. The returned score is the
+    committed endpoint's ledger prefill_cost.
     """
     if not gated_candidates:
         logger.warning(
@@ -346,6 +347,7 @@ def select_smetric_gated(
             instance_role = PDRole.ROLE_U
         if instance_role != role:
             continue
+        # npu_hit is not in the stamp tuple; GatedCandidate defaults it to 0.
         candidates.append(
             GatedCandidate(
                 instance=instance,
@@ -396,7 +398,8 @@ def select_authoritative_allocate_candidate(
     Load-balance scans all endpoints. KV-cache affinity in unified mode re-ranks EVERY reported
     endpoint by ``prefill_load_scale*prefill_cost + load_weight*fresh_load``; older affinity callers
     without per-endpoint prefill_cost fall back to "least-loaded among the ranked alternates".
-    smetric_gated re-sorts by ledger prefill_cost and applies the two mean gates.
+    smetric_gated re-sorts by ledger prefill_cost and applies the two mean gates (CHANGED /
+    BLOCKED retry path; first CAS uses the policy winner like other policies).
     Other policies keep the proposed endpoint. ``excluded`` (pairs this CAS round already
     rejected) is forwarded to every branch that scans beyond ``candidates``.
     """

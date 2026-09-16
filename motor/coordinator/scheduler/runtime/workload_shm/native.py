@@ -9,12 +9,12 @@
 # See the Mulan PSL v2 for more details.
 
 """
-ctypes binding for the Rust ``libmindie_workload_shm`` shared-memory ledger (schema 4).
+ctypes binding for the Rust ``libmindie_workload_shm`` shared-memory ledger (schema 5).
 
 Mgmt owns the segment (create_v4 / membership snapshot / heartbeat / set_blocked). Infer Workers
-attach and CAS tokens (cas_add / cas_sub_floor0) against per-slot AtomicU64 plus generation and
-flags. If the ``.so`` is missing the loader raises ``NativeWorkloadShmUnavailable`` with a clear
-message -- callers must fail loudly rather than silently fall back to a wrong ledger.
+attach and CAS tokens plus overlay fields (cas_add / cas_sub_floor0) against per-slot AtomicU64
+plus generation and flags. If the ``.so`` is missing the loader raises ``NativeWorkloadShmUnavailable``
+with a clear message -- callers must fail loudly rather than silently fall back to a wrong ledger.
 """
 
 import ctypes
@@ -50,6 +50,30 @@ _STATUS = {
 }
 _STATUS_OK = 0
 
+
+def cas_status_name(status: int) -> str:
+    """Stable token for CAS status logs (not a log line by itself)."""
+    return _STATUS.get(int(status), "Unknown")
+
+
+def probe_so_abi(path: str) -> int | None:
+    """Return ``mindie_wl_abi_version()``, or None if ``path`` cannot be probed."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        lib = ctypes.CDLL(path)
+        lib.mindie_wl_abi_version.restype = ctypes.c_uint32
+        lib.mindie_wl_abi_version.argtypes = []
+        return int(lib.mindie_wl_abi_version())
+    except (OSError, AttributeError, ValueError, TypeError, OverflowError):
+        return None
+
+
+def so_abi_is_current(path: str) -> bool:
+    """True when ``path`` exists and reports ABI >= ``MIN_ABI_VERSION``."""
+    abi = probe_so_abi(path)
+    return abi is not None and abi >= MIN_ABI_VERSION
+
 # Named status codes for CAS control flow (callers branch on these; they are not errors).
 STATUS_OK = 0
 STATUS_CHANGED = 1
@@ -60,11 +84,11 @@ STATUS_BAD_ARG = 8
 # Must match Rust SLOT_HINT_NONE: cas_add/cas_sub_floor0 linear-scan when the caller has no slot.
 SLOT_HINT_NONE = 0xFFFFFFFF
 # ctypes arg layout for cas_add/cas_sub/load_entries; older .so must not be bound.
-MIN_ABI_VERSION = 2
+MIN_ABI_VERSION = 3
 
 
 class _LoadedEntry(ctypes.Structure):
-    """24-byte schema-4 entry view returned by mindie_wl_load_entries."""
+    """40-byte schema-5 entry view returned by mindie_wl_load_entries."""
 
     _pack_ = 1
     _fields_ = [
@@ -75,10 +99,12 @@ class _LoadedEntry(ctypes.Structure):
         ("generation", ctypes.c_uint16),
         ("reserved", ctypes.c_uint32),
         ("active_tokens", ctypes.c_double),
+        ("prefill_cost", ctypes.c_double),
+        ("cpu_hit_blocks", ctypes.c_double),
     ]
 
 
-# Entry flag bits (must match layout.rs / schema 4).
+# Entry flag bits (must match layout.rs / schema 5).
 FLAG_BLOCKED = 0b0000_0001
 FLAG_VALID = 0b0000_0010
 
@@ -140,7 +166,7 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(ctypes.c_uint64),
     ]
-    # Schema 4 (per-slot CAS) surface.
+    # Schema 5 (per-slot CAS) surface. create_v4 / write_entry_v4 names are historical.
     lib.mindie_wl_create_v4.restype = ctypes.c_int32
     lib.mindie_wl_create_v4.argtypes = [ctypes.c_char_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64)]
     lib.mindie_wl_snapshot_write_entry_v4.restype = ctypes.c_int32
@@ -163,6 +189,8 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         ctypes.c_uint16,
         ctypes.c_double,
         ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_double,
         ctypes.POINTER(ctypes.c_double),
     ]
     lib.mindie_wl_cas_sub_floor0.restype = ctypes.c_int32
@@ -172,6 +200,8 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         ctypes.c_int32,
         ctypes.c_int32,
         ctypes.c_uint16,
+        ctypes.c_double,
+        ctypes.c_double,
         ctypes.c_double,
         ctypes.POINTER(ctypes.c_double),
     ]
@@ -191,6 +221,8 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_uint8),
         ctypes.POINTER(ctypes.c_uint8),
         ctypes.POINTER(ctypes.c_uint16),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
         ctypes.POINTER(ctypes.c_double),
     ]
     lib.mindie_wl_load_entries.restype = ctypes.c_int32
@@ -234,14 +266,22 @@ def load_native_library(path: str | None = None) -> ctypes.CDLL:
         if path is None:
             _lib_cache = lib
         return lib
-    raise NativeWorkloadShmUnavailable(
-        "Could not load "
-        + _LIB_BASENAME
-        + " (build it via build.sh / `cargo build --release` in "
-        + "motor/coordinator/workload_shm_rs, or set "
+    hint = (
+        " (build it via build.sh / `cargo build --release` in "
+        "motor/coordinator/workload_shm_rs, or set "
         + _ENV_OVERRIDE
-        + "). Tried: "
-        + "; ".join(errors)
+        + ")"
+    )
+    if any("ABI " in item for item in errors):
+        hint = (
+            " (leftover .so from a previous checkout; this branch needs ABI >= "
+            + str(MIN_ABI_VERSION)
+            + ". Rebuild with SKIP_WORKLOAD_SHM_BUILD=0 bash build.sh, or "
+            "`cargo build --release` in motor/coordinator/workload_shm_rs and copy "
+            "into lib/; then restart Coordinator)"
+        )
+    raise NativeWorkloadShmUnavailable(
+        "Could not load " + _LIB_BASENAME + hint + ". Tried: " + "; ".join(errors)
     )
 
 
@@ -272,7 +312,7 @@ class WorkloadShm:
         *,
         lib: ctypes.CDLL | None = None,
     ) -> "WorkloadShm":
-        """Create and own a new schema-4 (per-slot CAS) segment."""
+        """Create and own a new schema-5 (per-slot CAS) segment."""
         lib = lib or load_native_library()
         handle = ctypes.c_uint64(0)
         _check(
@@ -305,7 +345,7 @@ class WorkloadShm:
         _check(self._lib.mindie_wl_heartbeat(self._handle), "heartbeat")
 
     # ------------------------------------------------------------------
-    # Schema 4: per-slot CAS data plane
+    # Schema 5: per-slot CAS data plane
     # ------------------------------------------------------------------
 
     def write_snapshot_v4(
@@ -314,10 +354,10 @@ class WorkloadShm:
         *,
         bump_instance_version: bool = True,
     ) -> None:
-        """Write a schema-4 snapshot: (instance_id, endpoint_id, role, generation, flags, tokens)/slot.
+        """Write a schema-5 snapshot: (instance_id, endpoint_id, role, generation, flags, tokens)/slot.
 
-        ``tokens`` seeds a new pair only. A live pair's in-flight CAS value is preserved by the
-        native writer (stale caller tokens are ignored). ``(0, 0, *, *, 0, *)`` punches a hole.
+        ``tokens`` seeds a new pair only. A live pair's in-flight CAS value (tokens + overlay)
+        is preserved by the native writer (stale caller tokens are ignored). ``(0, 0, *, *, 0, *)`` punches a hole.
         """
         self.snapshot_begin()
         for slot, (iid, eid, role, gen, flags, tokens) in enumerate(entries):
@@ -337,10 +377,13 @@ class WorkloadShm:
         expected: float,
         delta: float,
         slot: int | None = None,
+        prefill_cost: float = 0.0,
+        cpu_hit_blocks: float = 0.0,
     ) -> tuple[int, float]:
-        """Atomic CAS-add. Returns (status, actual): OK (added), CHANGED/BLOCKED/SLOT_INVALID/BAD_ARG (not).
+        """Atomic CAS-add. Returns (status, actual tokens): OK (added), CHANGED/BLOCKED/SLOT_INVALID/BAD_ARG (not).
 
         ``slot`` is the known SHM index from the last batch load; omit to linear-scan.
+        Overlay deltas are fetch-added only after the token CAS succeeds.
         """
         actual = ctypes.c_double(0.0)
         status = self._lib.mindie_wl_cas_add(
@@ -351,6 +394,8 @@ class WorkloadShm:
             int(generation),
             float(expected),
             float(delta),
+            float(prefill_cost),
+            float(cpu_hit_blocks),
             ctypes.byref(actual),
         )
         return status, actual.value
@@ -362,8 +407,10 @@ class WorkloadShm:
         generation: int,
         delta: float,
         slot: int | None = None,
+        prefill_cost: float = 0.0,
+        cpu_hit_blocks: float = 0.0,
     ) -> tuple[int, float]:
-        """Atomic CAS-subtract flooring at 0 (release path). Returns (status, actual); BAD_ARG on invalid delta."""
+        """Atomic CAS-subtract flooring each ledger at 0 (release path). Returns (status, actual tokens)."""
         actual = ctypes.c_double(0.0)
         status = self._lib.mindie_wl_cas_sub_floor0(
             self._handle,
@@ -372,6 +419,8 @@ class WorkloadShm:
             int(endpoint_id),
             int(generation),
             float(delta),
+            float(prefill_cost),
+            float(cpu_hit_blocks),
             ctypes.byref(actual),
         )
         return status, actual.value
@@ -386,13 +435,15 @@ class WorkloadShm:
         return touched.value
 
     def load_entry(self, slot: int) -> dict:
-        """Read one schema-4 entry: instance_id, endpoint_id, role, flags, generation, active_tokens."""
+        """Read one schema-5 entry including overlay ledger fields."""
         iid = ctypes.c_int32(0)
         eid = ctypes.c_int32(0)
         role = ctypes.c_uint8(0)
         flags = ctypes.c_uint8(0)
         generation = ctypes.c_uint16(0)
         tokens = ctypes.c_double(0.0)
+        prefill = ctypes.c_double(0.0)
+        cpu = ctypes.c_double(0.0)
         _check(
             self._lib.mindie_wl_load_entry(
                 self._handle,
@@ -403,6 +454,8 @@ class WorkloadShm:
                 ctypes.byref(flags),
                 ctypes.byref(generation),
                 ctypes.byref(tokens),
+                ctypes.byref(prefill),
+                ctypes.byref(cpu),
             ),
             "load_entry",
         )
@@ -413,10 +466,12 @@ class WorkloadShm:
             "flags": flags.value,
             "generation": generation.value,
             "active_tokens": tokens.value,
+            "prefill_cost": prefill.value,
+            "cpu_hit_blocks": cpu.value,
         }
 
     def load_entries(self, entry_count: int) -> list[dict[str, Any]]:
-        """Read ``entry_count`` schema-4 slots in one FFI call. Each dict includes ``slot``."""
+        """Read ``entry_count`` schema-5 slots in one FFI call. Each dict includes ``slot``."""
         cap = max(int(entry_count), 0)
         if cap == 0:
             return []
@@ -438,6 +493,8 @@ class WorkloadShm:
                     "flags": row.flags,
                     "generation": row.generation,
                     "active_tokens": row.active_tokens,
+                    "prefill_cost": row.prefill_cost,
+                    "cpu_hit_blocks": row.cpu_hit_blocks,
                 }
             )
         return entries

@@ -27,12 +27,12 @@ class Workload(BaseModel):
         default=0,
         description="smetric_gated: outstanding remaining prefill (isl - matched); "
         "kv_cache_affinity: in-flight prompt length max(0, isl); 0 for RR/LB. "
-        "Worker-local overlay on motor-0911 (not carried in schema-4 SHM).",
+        "Carried in schema-5 SHM alongside active_tokens (cross-worker).",
     )
     cpu_hit_blocks: float = Field(
         default=0,
         description="CPU-tier KV blocks the in-flight requests on this endpoint matched (smetric_gated); "
-        "worker-local overlay, not carried in the workload SHM",
+        "carried in schema-5 SHM alongside active_tokens",
     )
 
     def __iadd__(self, other):

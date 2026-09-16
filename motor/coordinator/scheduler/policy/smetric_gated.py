@@ -29,9 +29,9 @@ the prefill compute and CPU->NPU KV transfer currently in flight per endpoint.
 When no endpoint passes both gates the policy degrades in order: first endpoint passing the
 ``active_tokens`` gate alone, then the head of the list (lowest ledger prefill_cost).
 
-On motor-0911 the authoritative re-pick lives in worker-local ``allocate_arbitration``
-(schema-4 SHM CAS). ``active_tokens`` is the cross-worker SHM ledger; ``prefill_cost`` and
-``cpu_hit_blocks`` are a worker-local overlay (schema-4 does not carry them).
+On motor-0911 the CHANGED/BLOCKED retry re-picks in worker-local ``allocate_arbitration``
+(schema-5 SHM CAS), same as other policies. First CAS uses the policy winner. ``active_tokens``,
+``prefill_cost`` and ``cpu_hit_blocks`` are all cross-worker SHM ledger fields.
 """
 
 from __future__ import annotations
@@ -127,13 +127,19 @@ class GatedCandidate:
 
     ``prefill_cost`` / ``cpu_hit_blocks`` are what THIS request would add to the endpoint ledger
     if committed there (conductor-derived); they are stamped on allocation and never used for
-    ordering. Ordering and gating read the endpoint's current ledger via ``endpoint.workload``.
+    ordering. ``npu_hit`` is this request's NPU-tier hit ratio (``npu_blocks / isl``), also not
+    used for ordering. Ordering and gating read the endpoint's current ledger via
+    ``endpoint.workload``.
+
+    ``npu_hit`` defaults to 0 so CAS-retry reconstruction in ``allocate_arbitration`` (which only
+    carries stamp tuples) and tests that build 4-field candidates stay valid.
     """
 
     instance: Instance
     endpoint: Endpoint
     prefill_cost: float
     cpu_hit_blocks: float
+    npu_hit: float = 0.0
 
     @property
     def key(self) -> tuple[int, int]:
@@ -160,6 +166,23 @@ def _cpu_hit_blocks(matched: object) -> float:
         return max(0.0, float(matched.get("cpu_blocks", 0) or 0))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _npu_hit_blocks(matched: object) -> float:
+    """NPU-tier matched blocks from a DpBlocks conductor entry; 0 for legacy integer matches."""
+    if not isinstance(matched, dict):
+        return 0.0
+    try:
+        return max(0.0, float(matched.get("npu_blocks", 0) or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _npu_hit_ratio(matched: object, isl: int) -> float:
+    """``npu_blocks / isl``; 0 when the prompt is empty (no ZeroDivisionError)."""
+    if isl <= 0:
+        return 0.0
+    return _npu_hit_blocks(matched) / float(isl)
 
 
 def _ledger_value(endpoint: Endpoint, field: str) -> float:
@@ -221,8 +244,8 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
     """
     Rank by ledger prefill_cost, commit the first endpoint under both ledger load averages.
 
-    Workers run the conductor query (for the stamp values) and re-rank / re-gate against the
-    local cache (SHM ``active_tokens`` + worker-local overlay) before CAS-committing.
+    Workers run the conductor query for stamp values and CAS the gated winner. A stale
+    token CAS (CHANGED) refreshes the SHM ledger and re-ranks / re-gates before retrying.
     """
 
     def __init__(self, instance_provider: InstanceProvider):
@@ -280,6 +303,7 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
                         endpoint=ep,
                         prefill_cost=_prefill_cost(isl, _matched_tokens(matched)),
                         cpu_hit_blocks=_cpu_hit_blocks(matched),
+                        npu_hit=_npu_hit_ratio(matched, isl),
                     )
                 )
         if not any_instance:
@@ -310,7 +334,8 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
         """
         Worker-side proposal: the gated pick first, then the rest in ledger prefill_cost order.
 
-        ``allocate_arbitration`` re-ranks and re-gates on the cache after a SHM refresh.
+        First CAS uses this winner. On CHANGED/BLOCKED, ``allocate_arbitration`` re-ranks
+        and re-gates against a fresh SHM cache.
         """
         ranked = SMetricGatedPolicy.score_endpoints(instances, req_info)
         if not ranked:

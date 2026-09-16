@@ -2,7 +2,7 @@
 # MindIE is licensed under Mulan PSL v2.
 [package]
 name = "mindie-workload-shm"
-description = "POSIX shared-memory workload ledger for MindIE-PyMotor coordinator (schema 4, multi-writer CAS)"
+description = "POSIX shared-memory workload ledger for MindIE-PyMotor coordinator (schema 5, multi-writer CAS)"
 version = "0.1.0"
 edition = "2021"
 authors = ["MindIE Team"]

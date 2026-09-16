@@ -27,6 +27,7 @@ from motor.coordinator.workload_shm_rs.wheel_gate import (
     list_missing_required_native_libs,
     resolve_motor_wheel_platform_tag,
     retag_motor_wheel_filename,
+    workload_shm_so_needs_rebuild,
 )
 
 _WHEEL_MEMBER = "motor-3.1.0.dist-info/WHEEL"
@@ -158,3 +159,15 @@ def test_retag_motor_wheel_filename_is_noop_when_already_tagged(tmp_path: Path):
     assert dest == src
     assert src.is_file()
     assert _wheel_tags(dest) == ["py3-none-linux_aarch64"]
+
+
+def test_workload_shm_so_needs_rebuild_missing_or_garbage(tmp_path: Path):
+    """An ABI-old leftover must not be treated as a reusable build artifact."""
+    assert workload_shm_so_needs_rebuild("/nonexistent/libmindie_workload_shm.so") is True
+    garbage = tmp_path / "libmindie_workload_shm.so"
+    garbage.write_bytes(b"not-a-shared-object")
+    assert workload_shm_so_needs_rebuild(str(garbage)) is True
+    paths = [item for item in native._candidate_paths() if item and Path(item).is_file()]
+    if not paths:
+        pytest.skip("native workload-shm library not built")
+    assert workload_shm_so_needs_rebuild(paths[0]) is False

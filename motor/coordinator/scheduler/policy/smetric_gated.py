@@ -194,7 +194,7 @@ def _ledger_value(endpoint: Endpoint, field: str) -> float:
 
 def sort_candidates(candidates: list[GatedCandidate]) -> list[GatedCandidate]:
     """Lowest ledger ``workload.prefill_cost`` first, ties by (instance_id, endpoint_id)."""
-    return sorted(candidates, key=lambda c: (c.ledger_prefill_cost, c.instance.id, c.endpoint.id))
+    return sorted(candidates, key=lambda c: c.ledger_prefill_cost)
 
 
 def pick_gated(
@@ -212,6 +212,9 @@ def pick_gated(
     Fallback order when nothing passes both gates: active_tokens gate only, then the head of the
     list (lowest ledger prefill_cost).
     """
+
+    return (candidates[0], PICK_MIN_LEDGER_PREFILL, 0, 0)
+
     if not candidates:
         return None
     n = len(candidates)

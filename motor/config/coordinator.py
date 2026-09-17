@@ -196,6 +196,7 @@ class SchedulerType(Enum):
     LOAD_BALANCE = "load_balance"
     ROUND_ROBIN = "round_robin"
     KV_CACHE_AFFINITY = "kv_cache_affinity"
+    COMPUTE_LENGTH = "compute_length"
 
     @classmethod
     def from_string(cls, value: str) -> Optional["SchedulerType"]:

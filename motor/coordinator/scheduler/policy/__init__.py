@@ -7,16 +7,18 @@
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
 
-"""Scheduling policies: LoadBalance, RoundRobin, and factory."""
+"""Scheduling policies: LoadBalance, RoundRobin, ComputeLength, and factory."""
 
 __all__ = [
     "BaseSchedulingPolicy",
+    "ComputeLengthPolicy",
     "LoadBalancePolicy",
     "RoundRobinPolicy",
     "SchedulingPolicyFactory",
 ]
 
 from motor.coordinator.scheduler.policy.base import BaseSchedulingPolicy
+from motor.coordinator.scheduler.policy.compute_length import ComputeLengthPolicy
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.factory import SchedulingPolicyFactory

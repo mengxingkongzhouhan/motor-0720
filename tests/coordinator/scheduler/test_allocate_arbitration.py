@@ -26,6 +26,7 @@ from motor.coordinator.domain.instance_manager import InstanceManager
 from motor.coordinator.scheduler import allocate_arbitration
 from motor.coordinator.scheduler.allocate_arbitration import ArbitrationContext
 from motor.coordinator.scheduler.runtime.zmq_protocol import (
+    CANDIDATE_POLICY_COMPUTE_LENGTH,
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
     CANDIDATE_POLICY_LOAD_BALANCE,
 )
@@ -304,6 +305,36 @@ async def test_authoritative_load_balance_skips_excluded_pair():
     assert selected is not None
     instance, endpoint, _ = selected
     assert (instance.id, endpoint.id) == (1, 10)
+
+
+@pytest.mark.asyncio
+async def test_compute_length_picks_min_instance_then_min_dp():
+    """Hierarchical: lightest instance first, then lightest DP -- not the global min endpoint."""
+    # Inst1: 5+100=105, Inst2: 10+10=20. Global min endpoint is ep10=5; hierarchical picks inst2.
+    im = await _two_prefill_pool({(1, 10): 5, (1, 11): 100, (2, 20): 10, (2, 21): 10})
+    ctx = _context(im, is_load_balance=False)
+
+    selected = allocate_arbitration.select_authoritative_allocate_candidate(
+        ctx, (1, 10), [(1, 10)], PDRole.ROLE_P, candidate_policy=CANDIDATE_POLICY_COMPUTE_LENGTH
+    )
+
+    assert selected is not None
+    instance, endpoint, score = selected
+    assert (instance.id, endpoint.id) == (2, 20)
+    assert score == 20
+
+
+@pytest.mark.asyncio
+async def test_compute_length_skips_excluded_pair_on_same_instance():
+    """After CAS rejects the lightest DP, stay on the lightest instance and take the next DP."""
+    im = await _two_prefill_pool({(1, 10): 5, (1, 11): 100, (2, 20): 10, (2, 21): 40})
+    ctx = _context(im, is_load_balance=False)
+
+    selected = allocate_arbitration.select_compute_length_candidate(ctx, PDRole.ROLE_P, excluded={(2, 20)})
+
+    assert selected is not None
+    instance, endpoint, _ = selected
+    assert (instance.id, endpoint.id) == (2, 21)
 
 
 @pytest.mark.asyncio

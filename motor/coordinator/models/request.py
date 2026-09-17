@@ -73,6 +73,13 @@ class RequestInfo(BaseModel):
         "for the committed endpoint. Keyed by (instance_id, endpoint_id) tuples, so excluded "
         "from serialization.",
     )
+    max_matched_tokens: int | float | None = Field(
+        default=None,
+        exclude=True,
+        description="Global max KV prefix match (tokens) used by compute_length. The request "
+        "commits ISL - this value to the selected DP/instance active_tokens ledger; per-DP "
+        "hits are not used for routing.",
+    )
     api: str = Field(..., description="API need to be forwarded")
     entry_api: str = Field(
         default="",

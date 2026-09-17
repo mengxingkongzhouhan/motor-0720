@@ -27,7 +27,8 @@ def calculate_demand_workload(role: PDRole, req_info: RequestInfo) -> Workload:
     Compute demand workload for non-affinity allocation paths.
 
     KV-affinity ALLOCATE commits via :func:`calculate_committed_workload` on the scheduler
-    after final selection (ISL - matched_tokens).
+    after final selection (ISL - per-endpoint matched_tokens). Compute-length uses the same
+    commit helper with the global max match (ISL - max_matched).
     """
     if role == PDRole.ROLE_E:
         return Workload(active_tokens=_calculate_encode_scores(req_info))

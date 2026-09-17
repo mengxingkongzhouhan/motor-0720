@@ -23,8 +23,10 @@ from dataclasses import dataclass
 from motor.common.logger import get_logger
 from motor.common.resources.endpoint import Endpoint
 from motor.common.resources.instance import Instance, PDRole
+from motor.coordinator.scheduler.policy.compute_length import ComputeLengthPolicy
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.runtime.zmq_protocol import (
+    CANDIDATE_POLICY_COMPUTE_LENGTH,
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
     CANDIDATE_POLICY_LOAD_BALANCE,
     KNOWN_CANDIDATE_POLICIES,
@@ -224,6 +226,33 @@ def select_affinity_global(
     return (best[0], best[1], best[2])
 
 
+def select_compute_length_candidate(
+    ctx: ArbitrationContext,
+    role: PDRole,
+    required_engine_type: str | None = None,
+    excluded: set[tuple[int, int]] | None = None,
+    required_dispatch_capability: str | None = None,
+) -> tuple[Instance, Endpoint, float] | None:
+    """Hierarchical compute-length re-pick: lightest instance, then lightest DP.
+
+    Uses the same ``active_tokens`` ledgers as KV affinity (per-DP endpoint
+    workload, instance ``gathered_workload`` as the sum). Circuit-open instances
+    and ``excluded`` pairs from this CAS round are skipped.
+    """
+    instances = [
+        instance
+        for instance in ctx.get_available_instances(role).values()
+        if matches_engine_type(instance, required_engine_type)
+        and matches_dispatch_capability(instance, required_dispatch_capability)
+    ]
+    return ComputeLengthPolicy.select_instance_then_endpoint(
+        instances,
+        role,
+        is_blocked=ctx.is_instance_circuit_open,
+        excluded_pairs=excluded,
+    )
+
+
 def select_lowest_load_among_candidates(
     ctx: ArbitrationContext,
     candidates: list[tuple[int, int]],
@@ -308,7 +337,8 @@ def select_authoritative_allocate_candidate(
 
     Load-balance scans all endpoints. KV-cache affinity in unified mode re-ranks EVERY reported
     endpoint by ``prefill_load_scale*prefill_cost + load_weight*fresh_load``; older affinity callers
-    without per-endpoint prefill_cost fall back to "least-loaded among the ranked alternates". Other
+    without per-endpoint prefill_cost fall back to "least-loaded among the ranked alternates".
+    Compute-length re-picks the lightest instance then the lightest DP on the fresh ledger. Other
     policies keep the proposed endpoint. ``excluded`` (pairs this CAS round already rejected) is
     forwarded to every branch that scans beyond ``candidates`` (which the caller already filters).
     """
@@ -342,4 +372,14 @@ def select_authoritative_allocate_candidate(
             )
             if selected is not None:
                 return selected
+    if candidate_policy == CANDIDATE_POLICY_COMPUTE_LENGTH:
+        selected = select_compute_length_candidate(
+            ctx,
+            role,
+            required_engine_type,
+            excluded=excluded,
+            required_dispatch_capability=required_dispatch_capability,
+        )
+        if selected is not None:
+            return selected
     return select_valid_candidate(ctx, candidate, role, required_engine_type, required_dispatch_capability)

@@ -37,6 +37,7 @@ from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_LOAD_BALANCE,
     CANDIDATE_POLICY_ROUND_ROBIN,
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+    CANDIDATE_POLICY_COMPUTE_LENGTH,
     pack_send_frames,
     unpack_recv_payload,
     ZMQMessageSerializer,
@@ -51,6 +52,7 @@ from motor.config.coordinator import (
 from motor.coordinator.fault_tolerance.precision.streak_result import (
     PrecisionStreakResult,
 )
+from motor.coordinator.scheduler.policy.compute_length import ComputeLengthPolicy
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.kv_cache_affinity import KvCacheAffinityPolicy
@@ -930,14 +932,18 @@ class AsyncSchedulerClient:
     ) -> Workload:
         """Same commit formula the former ALLOCATE_ONLY handler used (R4)."""
         if (
-            candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY
+            candidate_policy in (CANDIDATE_POLICY_KV_CACHE_AFFINITY, CANDIDATE_POLICY_COMPUTE_LENGTH)
             and isl > 0
             and role in (PDRole.ROLE_P, PDRole.ROLE_U)
         ):
+            if candidate_policy == CANDIDATE_POLICY_COMPUTE_LENGTH:
+                matched = max(matched_tokens_map.values(), default=0.0)
+            else:
+                matched = matched_tokens_map.get((instance.id, endpoint.id), 0.0)
             return calculate_committed_workload(
                 role,
                 isl,
-                matched_tokens=matched_tokens_map.get((instance.id, endpoint.id), 0.0),
+                matched_tokens=matched,
             )
         return demand
 
@@ -1079,6 +1085,16 @@ class AsyncSchedulerClient:
                     if rec is not None:
                         item["matched_tokens"] = rec[0]
                     candidate_endpoints.append(item)
+            elif candidate_policy == CANDIDATE_POLICY_COMPUTE_LENGTH:
+                max_matched = getattr(req_info, "max_matched_tokens", None)
+                candidate_endpoints = [
+                    {
+                        "instance_id": cand_instance.id,
+                        "endpoint_id": cand_endpoint.id,
+                        **({"matched_tokens": float(max_matched)} if max_matched is not None else {}),
+                    }
+                    for cand_instance, cand_endpoint, _score in candidates
+                ]
             else:
                 candidate_endpoints = [
                     {"instance_id": cand_instance.id, "endpoint_id": cand_endpoint.id}
@@ -1197,6 +1213,10 @@ class AsyncSchedulerClient:
                     if (candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY and isinstance(affinity_debug, dict))
                     else None
                 )
+                if matched_load is None and candidate_policy == CANDIDATE_POLICY_COMPUTE_LENGTH:
+                    max_matched = getattr(req_info, "max_matched_tokens", None)
+                    if max_matched is not None:
+                        matched_load = (max_matched, None, None, None)
                 tier_hit = matched_load[3] if matched_load and len(matched_load) > 3 else None
                 logger.info(
                     "scheduled role=%s req_id=%s instance=%s endpoint=%s policy=%s matched=%s "
@@ -1768,6 +1788,27 @@ class AsyncSchedulerClient:
             if candidates:
                 return candidates, CANDIDATE_POLICY_LOAD_BALANCE
             logger.warning("load_balance failed, falling back to round-robin")
+        elif st == "compute_length":
+            if role in _KVA_SELECT_ROLES:
+                ComputeLengthPolicy.resolve_max_matched_tokens(
+                    instances,
+                    req_info,
+                    w_npu=self._kv_affinity_w_npu,
+                    w_cpu=self._kv_affinity_w_cpu,
+                    w_disk=self._kv_affinity_w_disk,
+                )
+            selected = ComputeLengthPolicy.select_instance_then_endpoint(
+                instances,
+                role,
+                is_blocked=self.is_instance_blocked,
+            )
+            if selected:
+                return [selected], CANDIDATE_POLICY_COMPUTE_LENGTH
+            logger.warning("compute_length unavailable, falling back to load_balance")
+            candidates = self._select_endpoint_candidates_by_load_balance(instances, role, top_k)
+            if candidates:
+                return candidates, CANDIDATE_POLICY_LOAD_BALANCE
+            logger.warning("load_balance unavailable, falling back to round-robin")
         elif st == "kv_cache_affinity":
             # Affinity ranking applies to KVA-eligible roles only; others fall through to
             # the load_balance -> round_robin chain below.
@@ -1819,7 +1860,7 @@ class AsyncSchedulerClient:
         if not all_endpoints:
             return None
         st = self._scheduler_type or "round_robin"
-        if st in ("load_balance", "kv_cache_affinity"):
+        if st in ("load_balance", "kv_cache_affinity", "compute_length"):
             ep = LoadBalancePolicy.select_endpoint_from_instance(instance)
             if ep:
                 return (instance, ep)

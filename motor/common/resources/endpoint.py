@@ -22,10 +22,14 @@ logger = get_logger(__name__)
 class Workload(BaseModel):
     """Workload information for load balancing (compute-load ledger)."""
 
-    active_tokens: float = Field(default=0, description="Active compute load in token units")
+    active_tokens: float = Field(
+        default=0,
+        description="CAS-field compute load. smetric_gated / kv_cache_affinity stamp remaining "
+        "prefill (isl - matched); RR/LB use demand tokens.",
+    )
     prefill_cost: float = Field(
         default=0,
-        description="smetric_gated: outstanding remaining prefill (isl - matched); "
+        description="smetric_gated: same remaining prefill as active_tokens (overlay / telemetry); "
         "kv_cache_affinity: in-flight prompt length max(0, isl); 0 for RR/LB. "
         "Carried in schema-5 SHM alongside active_tokens (cross-worker).",
     )

@@ -223,10 +223,10 @@ def select_affinity_global(
                 e,
             )
             continue
-        combined = lweight * load
+        combined = pscale * prefill_cost + lweight * load
         if best is None:
             best = (instance, endpoint, combined, prefill_cost)
-        elif combined < best[2]:
+        elif combined < best[2] or (combined == best[2] and prefill_cost < best[3]):
             best = (instance, endpoint, combined, prefill_cost)
     if best is None:
         return None
@@ -313,10 +313,10 @@ def select_smetric_gated(
     smetric_gated arbitration on the worker's fresh cache (SHM tokens + overlay fields).
 
     Used after a stale/blocked CAS, not on the first attempt. Resolve every scored endpoint
-    that is still schedulable, sort by the endpoint's ledger ``prefill_cost`` and take the
-    first one at or below both scaled ledger averages. The worker-supplied per-endpoint
-    cost / cpu_blocks are only the values stamped on commit. The returned score is the
-    committed endpoint's ledger prefill_cost.
+    that is still schedulable, sort by ``ledger.active_tokens + this_request_prefill`` and
+    take the first one at or below both scaled ledger averages. The worker-supplied
+    per-endpoint cost / cpu_blocks are the values stamped on commit. The returned score is
+    the unified sort key.
     """
     if not gated_candidates:
         logger.warning(
@@ -374,7 +374,7 @@ def select_smetric_gated(
         ctx.smetric_gated_cpu_factor,
         format_candidates(ranked),
     )
-    return (chosen.instance, chosen.endpoint, chosen.ledger_prefill_cost)
+    return (chosen.instance, chosen.endpoint, chosen.unified_score)
 
 
 def select_authoritative_allocate_candidate(
@@ -398,8 +398,9 @@ def select_authoritative_allocate_candidate(
     Load-balance scans all endpoints. KV-cache affinity in unified mode re-ranks EVERY reported
     endpoint by ``prefill_load_scale*prefill_cost + load_weight*fresh_load``; older affinity callers
     without per-endpoint prefill_cost fall back to "least-loaded among the ranked alternates".
-    smetric_gated re-sorts by ledger prefill_cost and applies the two mean gates (CHANGED /
-    BLOCKED retry path; first CAS uses the policy winner like other policies).
+    smetric_gated re-sorts by ``active_tokens + this_request_prefill`` and applies the two
+    mean gates (CHANGED / BLOCKED retry path; first CAS uses the policy winner like other
+    policies).
     Other policies keep the proposed endpoint. ``excluded`` (pairs this CAS round already
     rejected) is forwarded to every branch that scans beyond ``candidates``.
     """

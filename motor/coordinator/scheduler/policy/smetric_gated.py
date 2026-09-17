@@ -7,11 +7,14 @@
 # See the Mulan PSL v2 for more details.
 
 """
-SMetric-gated scheduling policy: rank endpoints by their ledger, gate on two ledger averages.
+SMetric-gated scheduling policy: rank endpoints by SHM ``active_tokens`` plus this request's
+remaining prefill, then (when gates are enabled) walk that order under two ledger averages.
 
-1. Sort the endpoints of the request's role by the ledger ``workload.prefill_cost`` ascending,
-   i.e. the remaining prefill currently outstanding on each endpoint (sum over its in-flight
-   requests of ``isl - matched_tokens``).
+1. Sort the endpoints of the request's role by
+   ``ledger.active_tokens + this_request_prefill`` ascending.
+   ``active_tokens`` is the schema-5 CAS field (cross-worker remaining prefill already in
+   flight). ``this_request_prefill`` is ``max(0, isl - matched_tokens)`` from the conductor
+   for *this* request on that endpoint -- the same term KV unified uses as ``prefill_cost``.
 2. Walk that order and commit the first endpoint whose ledger is at or below BOTH scaled
    averages over the ranked endpoints:
    ``active_tokens <= mean(active_tokens) * active_tokens_mean_factor`` and
@@ -19,19 +22,16 @@ SMetric-gated scheduling policy: rank endpoints by their ledger, gate on two led
    (factors from ``SchedulerConfig.smetric_gated``, default 1.0). ``<=`` so that an idle
    cluster (every ledger 0, mean 0) still passes the gates instead of relying on the fallback.
 
-All three inputs are ledger fields, so the ranking itself needs no per-request affinity math.
-The KV Conductor is queried once per request only to know what to ADD to the committed
-endpoint's ledger: the request's own remaining prefill (SMetric cost model,
-``max(0, isl - matched_tokens)``) and the CPU-tier KV blocks it would pull there
-(``cpu_blocks``). RELEASE subtracts both again, so ``prefill_cost`` / ``cpu_hit_blocks`` track
-the prefill compute and CPU->NPU KV transfer currently in flight per endpoint.
+ALLOCATE stamps SHM ``active_tokens`` with this request's remaining prefill (``isl - matched``)
+so CAS conflicts and later ranking share one quantity. Overlay ``prefill_cost`` is stamped
+with the same remaining value (telemetry / optional gates); ``cpu_hit_blocks`` is the
+CPU-tier hit count. RELEASE subtracts the same stamp.
 
 When no endpoint passes both gates the policy degrades in order: first endpoint passing the
-``active_tokens`` gate alone, then the head of the list (lowest ledger prefill_cost).
+``active_tokens`` gate alone, then the head of the list (lowest unified score).
 
 On motor-0911 the CHANGED/BLOCKED retry re-picks in worker-local ``allocate_arbitration``
-(schema-5 SHM CAS), same as other policies. First CAS uses the policy winner. ``active_tokens``,
-``prefill_cost`` and ``cpu_hit_blocks`` are all cross-worker SHM ledger fields.
+(schema-5 SHM CAS), same as other policies. First CAS uses the policy winner.
 """
 
 from __future__ import annotations
@@ -157,6 +157,11 @@ class GatedCandidate:
     def ledger_cpu_hit_blocks(self) -> float:
         return _ledger_value(self.endpoint, "cpu_hit_blocks")
 
+    @property
+    def unified_score(self) -> float:
+        """CAS-field in-flight load plus this request's remaining prefill (KV unified shape)."""
+        return self.ledger_active_tokens + self.prefill_cost
+
 
 def _cpu_hit_blocks(matched: object) -> float:
     """CPU-tier matched blocks from a DpBlocks conductor entry; 0 for legacy integer matches."""
@@ -193,8 +198,8 @@ def _ledger_value(endpoint: Endpoint, field: str) -> float:
 
 
 def sort_candidates(candidates: list[GatedCandidate]) -> list[GatedCandidate]:
-    """Lowest ledger ``workload.prefill_cost`` first, ties by (instance_id, endpoint_id)."""
-    return sorted(candidates, key=lambda c:(c.ledger_prefill_cost + c.prefill_cost))
+    """Lowest ``active_tokens + this_request_prefill`` first, ties by (instance_id, endpoint_id)."""
+    return sorted(candidates, key=lambda c: (c.unified_score, c.instance.id, c.endpoint.id))
 
 
 def pick_gated(
@@ -357,7 +362,7 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
             cpu_threshold,
         )
         ordered = [chosen] + [c for c in ranked if c is not chosen]
-        return [(c.instance, c.endpoint, c.ledger_prefill_cost) for c in ordered[: max(1, top_k)]]
+        return [(c.instance, c.endpoint, c.unified_score) for c in ordered[: max(1, top_k)]]
 
     @staticmethod
     def select_endpoint_from_list(

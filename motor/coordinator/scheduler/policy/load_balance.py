@@ -67,7 +67,7 @@ class LoadBalancePolicy(BaseSchedulingPolicy):
             return endpoint_score
         endpoint_count = max(1, len(instance.get_all_endpoints()))
         instance_score = instance.gathered_workload.calculate_workload_score(role=score_role)
-        return endpoint_score + instance_score_weight * (instance_score / endpoint_count)
+        return endpoint_score
 
     @staticmethod
     def select_endpoint_candidates_from_list(

@@ -654,7 +654,7 @@ class TokenizerManager(ThreadSafeSingleton):
         render_enabled = bool(getattr(getattr(config, "render_config", None), "enabled", False))
         eager_load = bool(
             (kv_config and getattr(kv_config, "conductor_service", ""))
-            or scheduler_value == "kv_cache_affinity"
+            or scheduler_value in ("kv_cache_affinity", "compute_length")
             or (config.context_budget_mode == CONTEXT_BUDGET_ON and not render_enabled)
         )
         needs_tokenizer = eager_load or render_enabled

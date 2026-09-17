@@ -223,10 +223,10 @@ def select_affinity_global(
                 e,
             )
             continue
-        combined = pscale * prefill_cost + lweight * load
+        combined = lweight * load
         if best is None:
             best = (instance, endpoint, combined, prefill_cost)
-        elif combined < best[2] or (combined == best[2] and prefill_cost < best[3]):
+        elif combined < best[2]:
             best = (instance, endpoint, combined, prefill_cost)
     if best is None:
         return None

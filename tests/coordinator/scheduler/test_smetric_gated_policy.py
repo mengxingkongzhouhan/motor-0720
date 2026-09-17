@@ -209,15 +209,21 @@ class TestConductorParsing:
 
 
 class TestPickGated:
-    def test_sorted_by_ledger_prefill_then_ids(self):
+    def test_sorted_by_active_plus_request_cost_then_ids(self):
         ranked = sort_candidates(
-            [_cand(3, ledger_prefill=50), _cand(1, ledger_prefill=10), _cand(2, ledger_prefill=10)]
+            [
+                _cand(3, ledger_prefill=0, active=50, req_cost=0),
+                _cand(1, ledger_prefill=0, active=10, req_cost=0),
+                _cand(2, ledger_prefill=0, active=10, req_cost=0),
+            ]
         )
         assert [c.endpoint.id for c in ranked] == [1, 2, 3]
 
-    def test_request_cost_does_not_affect_order(self):
-        ranked = sort_candidates([_cand(1, ledger_prefill=40, req_cost=90), _cand(2, ledger_prefill=80, req_cost=1)])
-        assert [c.endpoint.id for c in ranked] == [1, 2]
+    def test_request_cost_is_added_to_active_tokens(self):
+        ranked = sort_candidates(
+            [_cand(1, ledger_prefill=0, active=40, req_cost=90), _cand(2, ledger_prefill=0, active=80, req_cost=1)]
+        )
+        assert [c.endpoint.id for c in ranked] == [2, 1]
 
     def test_first_under_both_averages_wins(self):
         ranked = sort_candidates(
@@ -370,9 +376,9 @@ class TestPolicy:
         ranked = SMetricGatedPolicy.score_endpoints([inst_a, inst_b], req_info)
 
         assert [(c.endpoint.id, c.ledger_prefill_cost, c.prefill_cost, c.cpu_hit_blocks, c.npu_hit) for c in ranked] == [
-            (11, 100.0, 100.0, 0.0, 0.0),
-            (20, 200.0, 50.0, 0.0, 0.0),
             (10, 300.0, 10.0, 4.0, 0.01),
+            (20, 200.0, 50.0, 0.0, 0.0),
+            (11, 100.0, 100.0, 0.0, 0.0),
         ]
         assert req_info.smetric_gated_debug == {(1, 11): (100.0, 0.0), (2, 20): (50.0, 0.0), (1, 10): (10.0, 4.0)}
         assert allocated_prefill_cost(req_info, 1, 10) == 10.0
@@ -388,7 +394,7 @@ class TestPolicy:
 
         ranked = SMetricGatedPolicy.select_endpoint_candidates_from_list([inst_a, inst_b], req_info, top_k=2)
 
-        assert [(ep.id, score) for _i, ep, score in ranked] == [(20, 80.0), (10, 10.0)]
+        assert [(ep.id, score) for _i, ep, score in ranked] == [(20, 90.0), (10, 510.0)]
 
     @patch("motor.coordinator.scheduler.policy.smetric_gated.ConductorApiClient.query_conductor")
     def test_no_tenant_returns_none(self, mock_query):
@@ -564,7 +570,22 @@ class TestClientDispatch:
             prefill_cost_map={(1, 10): 60.0},
             cpu_hit_map={(1, 10): 3.0},
         )
-        assert (committed.active_tokens, committed.prefill_cost, committed.cpu_hit_blocks) == (100.0, 60.0, 3.0)
+        assert (committed.active_tokens, committed.prefill_cost, committed.cpu_hit_blocks) == (60.0, 60.0, 3.0)
+
+    def test_committed_workload_falls_back_to_demand_when_cost_missing(self):
+        client = _client()
+        inst = _instance(1, [_endpoint(10)])
+        ep = inst.get_all_endpoints()[0]
+        committed = client._committed_workload_for(
+            PDRole.ROLE_P,
+            CANDIDATE_POLICY_SMETRIC_GATED,
+            inst,
+            ep,
+            Workload(active_tokens=100.0),
+            {},
+            100.0,
+        )
+        assert (committed.active_tokens, committed.prefill_cost, committed.cpu_hit_blocks) == (100.0, 100.0, 0.0)
 
     @pytest.mark.asyncio
     async def test_overlay_survives_shm_token_patch(self):
@@ -633,15 +654,15 @@ class TestArbitration:
 
         assert selected is not None
         instance, endpoint, score = selected
-        assert (instance.id, endpoint.id) == (2, 20)
-        assert score == 90.0
+        assert (instance.id, endpoint.id) == (1, 11)
+        assert score == 20.0
 
     @pytest.mark.asyncio
-    async def test_order_follows_ledger_not_request_cost(self):
+    async def test_order_follows_active_plus_request_cost(self):
         inst = _instance(1, [_endpoint(10), _endpoint(11)])
         im = await _pool([inst])
-        await im.update_instance_workload(1, 10, Workload(prefill_cost=50))
-        await im.update_instance_workload(1, 11, Workload(prefill_cost=5))
+        await im.update_instance_workload(1, 10, Workload(active_tokens=50))
+        await im.update_instance_workload(1, 11, Workload(active_tokens=5))
         ctx = _arbitration_context(im)
 
         selected = allocate_arbitration.select_authoritative_allocate_candidate(
@@ -654,8 +675,8 @@ class TestArbitration:
         )
 
         assert selected is not None
-        assert selected[1].id == 11
-        assert selected[2] == 5.0
+        assert selected[1].id == 10
+        assert selected[2] == 51.0
 
     @pytest.mark.asyncio
     async def test_equal_active_lets_cpu_gate_decide(self):

@@ -1090,16 +1090,21 @@ class AsyncSchedulerClient:
     ) -> Workload:
         """Same commit formula the former ALLOCATE_ONLY handler used (R4).
 
-        smetric_gated stamps conductor-derived remaining prefill and cpu_blocks.
-        kv_cache_affinity still commits SHM ``active_tokens`` as ``isl - matched``, and
-        additionally stamps overlay ``prefill_cost = max(0, isl)`` (cache hits do not
-        reduce the overlay). RR/LB leave overlay fields at 0.
+        smetric_gated stamps SHM ``active_tokens`` and overlay ``prefill_cost`` with the
+        conductor remaining prefill (``isl - matched``) so CAS and later ranking share one
+        quantity; ``cpu_hit_blocks`` is the CPU-tier hit count. kv_cache_affinity still
+        commits SHM ``active_tokens`` as ``isl - matched``, and stamps overlay
+        ``prefill_cost = max(0, isl)`` (cache hits do not reduce the overlay). RR/LB leave
+        overlay fields at 0.
         """
         if candidate_policy == CANDIDATE_POLICY_SMETRIC_GATED:
             pair = (instance.id, endpoint.id)
+            remaining = (prefill_cost_map or {}).get(pair)
+            if remaining is None:
+                remaining = demand.active_tokens
             return Workload(
-                active_tokens=demand.active_tokens,
-                prefill_cost=(prefill_cost_map or {}).get(pair, 0.0),
+                active_tokens=remaining,
+                prefill_cost=remaining,
                 cpu_hit_blocks=(cpu_hit_map or {}).get(pair, 0.0),
             )
         if candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY and role in (PDRole.ROLE_P, PDRole.ROLE_U):

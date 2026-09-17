@@ -164,7 +164,8 @@ Located in `scheduler/policy/`, each policy implements `BaseSchedulingPolicy`:
 |--------|-----------|-------------|
 | `RoundRobinPolicy` | Simple atomic counter, mod endpoint count | Uniform workload, no KV cache locality |
 | `LoadBalancePolicy` | Reads workload SHM, picks endpoint with minimum active tokens | Heterogeneous workloads, varying request lengths |
-| `KvCacheAffinityPolicy` | Queries KV Conductor (via `ConductorApiClient`) for prefix match; prefers endpoints with cached blocks | High prefix reuse, PD disaggregation |
+| `KvCacheAffinityPolicy` | Queries KV Conductor (via `ConductorApiClient`) for prefix match; `unified` score is `prefill_load_scale * (isl - matched) + load_weight * active_tokens` | High prefix reuse, PD disaggregation |
+| `SMetricGatedPolicy` | Same remaining-prefill term plus SHM `active_tokens`; ALLOCATE stamps CAS `active_tokens` with `isl - matched` so ranking and CAS share one quantity | Same as KV unified when gates are off / `prefill_load_scale=1` |
 
 **Conductor `/query` wire encoding** (`ConductorApiClient.query_conductor`):
 `kv_conductor_config.query_encoding` (default `"msgpack"`) selects the wire

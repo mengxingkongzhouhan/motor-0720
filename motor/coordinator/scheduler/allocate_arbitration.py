@@ -356,7 +356,7 @@ def select_smetric_gated(
                 cpu_hit_blocks=cpu_hits,
             )
         )
-    ranked = sort_candidates(candidates)
+    ranked = sort_candidates(candidates, True)
     picked = pick_gated(ranked, ctx.smetric_gated_active_factor, ctx.smetric_gated_cpu_factor)
     if picked is None:
         return None

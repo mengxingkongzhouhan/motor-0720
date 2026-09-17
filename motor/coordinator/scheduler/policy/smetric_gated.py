@@ -192,9 +192,11 @@ def _ledger_value(endpoint: Endpoint, field: str) -> float:
         return 0.0
 
 
-def sort_candidates(candidates: list[GatedCandidate]) -> list[GatedCandidate]:
-    """Lowest ledger ``workload.prefill_cost`` first, ties by (instance_id, endpoint_id)."""
-    return sorted(candidates, key=lambda c:(c.ledger_prefill_cost + c.prefill_cost))
+def sort_candidates(candidates: list[GatedCandidate], is_cas = False) -> list[GatedCandidate]:
+    """Lowest ledger ``workload.prefill_cost`` """
+    if is_cas:
+        sorted(candidates, key=lambda c: c.ledger_prefill_cost)
+    return sorted(candidates, key=lambda c: (c.ledger_prefill_cost + c.prefill_cost))
 
 
 def pick_gated(

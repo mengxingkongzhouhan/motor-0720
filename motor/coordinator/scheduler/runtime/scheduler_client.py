@@ -342,7 +342,7 @@ class _SchedulerInstanceCache:
         prefill_cost_delta: float,
         cpu_hit_blocks_delta: float,
     ) -> None:
-        """Accumulate this worker's overlay after SHM CAS; scoring refresh SETs the same fields from SHM."""
+        """Local overlay helper. Allocate/release no longer call this; they SET from SHM like tokens."""
         key = (instance_id, endpoint_id)
         old_prefill, old_cpu = self._ledger_overlay.get(key, (0.0, 0.0))
         new_prefill = max(0.0, old_prefill + float(prefill_cost_delta))
@@ -1116,6 +1116,40 @@ class AsyncSchedulerClient:
             )
         return demand
 
+    def _stamp_ledgers_from_shm(
+        self,
+        instance_id: int,
+        endpoint_id: int,
+        role: PDRole,
+        tokens_fallback: float,
+        slot: int | None,
+    ) -> None:
+        """SET cache tokens/prefill/cpu from SHM after a successful CAS (same path as tokens).
+
+        ``cas_add`` / ``cas_sub_floor0`` only return the new token value. Overlay fields are
+        read back with ``load_entry``. If that fails, tokens still SET from ``tokens_fallback``
+        and overlay args stay None so the existing overlay cache is kept.
+        """
+        tokens = float(tokens_fallback)
+        prefill: float | None = None
+        cpu: float | None = None
+        native = getattr(self._workload_reader, "native", None) if self._workload_reader is not None else None
+        if native is not None and slot is not None:
+            try:
+                row = native.load_entry(int(slot))
+                tokens = float(row["active_tokens"])
+                prefill = float(row.get("prefill_cost") or 0.0)
+                cpu = float(row.get("cpu_hit_blocks") or 0.0)
+            except Exception as e:
+                logger.warning(
+                    "load_entry after CAS failed instance_id=%s endpoint_id=%s slot=%s: %s",
+                    instance_id,
+                    endpoint_id,
+                    slot,
+                    e,
+                )
+        self._cache.patch_workload_from_shm(instance_id, endpoint_id, role, tokens, prefill, cpu)
+
     async def _notify_instance_refreshed(self) -> None:
         """Fire the instance-refresh callback with the current active endpoints.
 
@@ -1455,13 +1489,12 @@ class AsyncSchedulerClient:
                         _format_request_commit_stamp(committed, candidate_policy),
                         self._cache.format_endpoint_load_snapshot(role, candidate_policy),
                     )
-                self._cache.patch_workload_from_shm(out_instance.id, out_endpoint.id, role, actual)
-                self._cache.apply_ledger_delta(
+                self._stamp_ledgers_from_shm(
                     out_instance.id,
                     out_endpoint.id,
                     role,
-                    committed.prefill_cost,
-                    committed.cpu_hit_blocks,
+                    actual,
+                    last_slot if isinstance(last_slot, int) else meta.get("slot"),
                 )
                 self._cache.track_running_request(out_instance.id, out_endpoint.id, WorkloadAction.ALLOCATION)
                 meta["active_tokens"] = actual
@@ -1771,13 +1804,12 @@ class AsyncSchedulerClient:
         # CAS already committed above; a cache-patch failure must not turn this into a retry
         # (a second cas_sub_floor0 would subtract the same delta twice).
         try:
-            self._cache.patch_workload_from_shm(params.instance_id, params.endpoint_id, role, actual)
-            self._cache.apply_ledger_delta(
+            self._stamp_ledgers_from_shm(
                 params.instance_id,
                 params.endpoint_id,
                 role,
-                float(getattr(params.workload_change, "prefill_cost", 0) or 0),
-                float(getattr(params.workload_change, "cpu_hit_blocks", 0) or 0),
+                actual,
+                meta.get("slot"),
             )
         except Exception as e:
             logger.warning(

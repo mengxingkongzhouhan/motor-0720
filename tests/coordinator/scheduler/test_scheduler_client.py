@@ -1445,6 +1445,67 @@ class TestSelectAndAllocateCas:
             writer.release()
 
     @pytest.mark.asyncio
+    async def test_cas_success_sets_prefill_and_cpu_from_shm(self, native_lib):
+        """Allocate/release SET prefill_cost and cpu_hit_blocks from SHM, like active_tokens."""
+        del native_lib
+        config = CoordinatorConfig()
+        im = InstanceManager(config)
+        await im.refresh_instances(EventType.ADD, [_make_cas_instance(1, 10)])
+        name = _cas_shm_name("set")
+        client, writer = await _client_with_shm(im, name, scheduler_type="smetric_gated")
+        inst = next(item for item in client._cache.get_instances(PDRole.ROLE_P) if item.id == 1)
+        ep = next(item for item in inst.get_all_endpoints() if item.id == 10)
+
+        def fake_select(instances, req_info, **kwargs):
+            req_info.smetric_gated_debug = {(1, 10): (12.0, 3.0)}
+            return [(inst, ep, 0.0)]
+
+        try:
+            with patch.object(SMetricGatedPolicy, "select_endpoint_candidates_from_list", side_effect=fake_select):
+                req = RequestInfo(
+                    req_id="req-set", req_data={}, req_len=4, api="completions", token_ids=[1, 2, 3, 4]
+                )
+                result = await client.select_and_allocate(PDRole.ROLE_P, req)
+            assert result is not None
+            instance, endpoint, committed = result
+            assert committed.prefill_cost == pytest.approx(12.0)
+            assert committed.cpu_hit_blocks == pytest.approx(3.0)
+            slot = client._workload_reader.entry_meta(instance.id, endpoint.id)["slot"]
+            row = client._workload_reader.native.load_entry(slot)
+            assert row["prefill_cost"] == pytest.approx(12.0)
+            assert row["cpu_hit_blocks"] == pytest.approx(3.0)
+            cached = client._cache._endpoint_map[(instance.id, endpoint.id)].workload
+            assert cached.prefill_cost == pytest.approx(12.0)
+            assert cached.cpu_hit_blocks == pytest.approx(3.0)
+            assert inst.gathered_workload.prefill_cost == pytest.approx(12.0)
+            assert inst.gathered_workload.cpu_hit_blocks == pytest.approx(3.0)
+
+            ok = await client.update_workload(
+                UpdateWorkloadParams(
+                    instance_id=instance.id,
+                    endpoint_id=endpoint.id,
+                    role=PDRole.ROLE_P,
+                    req_id="req-set",
+                    workload_action=WorkloadAction.RELEASE_TOKENS,
+                    workload_change=Workload(
+                        active_tokens=-committed.active_tokens,
+                        prefill_cost=-committed.prefill_cost,
+                        cpu_hit_blocks=-committed.cpu_hit_blocks,
+                    ),
+                )
+            )
+            assert ok is True
+            row = client._workload_reader.native.load_entry(slot)
+            cached = client._cache._endpoint_map[(instance.id, endpoint.id)].workload
+            assert row["prefill_cost"] == pytest.approx(0.0)
+            assert row["cpu_hit_blocks"] == pytest.approx(0.0)
+            assert cached.prefill_cost == pytest.approx(0.0)
+            assert cached.cpu_hit_blocks == pytest.approx(0.0)
+        finally:
+            client._workload_reader.detach()
+            writer.release()
+
+    @pytest.mark.asyncio
     async def test_update_workload_cas_success_survives_cache_patch_failure(self, native_lib):
         """A cache-patch error after cas_sub_floor0 commits must not fail the release (would
         cause the caller to retry and subtract the same delta twice).

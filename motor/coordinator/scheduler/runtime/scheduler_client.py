@@ -1494,7 +1494,7 @@ class AsyncSchedulerClient:
                     out_endpoint.id,
                     role,
                     actual,
-                    last_slot if isinstance(last_slot, int) else meta.get("slot"),
+                    meta.get("slot"),
                 )
                 self._cache.track_running_request(out_instance.id, out_endpoint.id, WorkloadAction.ALLOCATION)
                 meta["active_tokens"] = actual

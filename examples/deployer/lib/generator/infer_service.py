@@ -255,6 +255,14 @@ def _configure_engine_role(infer_doc, user_config, infer_name, role_name):
         build_engine_env_items(env_role, deploy_config, job_name_base, include_kv_store=True),
     )
     npu_num = int(deploy_config.get(npu_key, 1))
+    logger.info(
+        "Configured InferServiceSet role %s: role.replicas=%s (instances), "
+        "spec.replicas=%s (pods/instance), npu=%s",
+        role_name,
+        total_instances,
+        single_instance,
+        npu_num,
+    )
     set_container_npu(container, npu_num, deploy_config)
     weight_path = deploy_config.get(C.WEIGHT_MOUNT_PATH, C.DEFAULT_WEIGHT_MOUNT_PATH)
     set_weight_mount(pod_spec, container, weight_path)

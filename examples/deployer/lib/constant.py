@@ -152,6 +152,14 @@ HARDWARE_TYPE_800T_A3 = "800T_A3"
 # Group by chip generation — both 800I and 800T variants share the same accelerator labels
 HARDWARE_TYPE_A2 = {HARDWARE_TYPE_800I_A2, HARDWARE_TYPE_800T_A2}
 HARDWARE_TYPE_A3 = {HARDWARE_TYPE_800I_A3, HARDWARE_TYPE_800T_A3}
+# Cards on one node. Engine *_pod_npu_num is a per-pod request; Volcano / Infer
+# Operator will not create the pod if this exceeds what a single node can grant.
+HARDWARE_CARDS_PER_NODE = {
+    HARDWARE_TYPE_800I_A2: 8,
+    HARDWARE_TYPE_800T_A2: 8,
+    HARDWARE_TYPE_800I_A3: 16,
+    HARDWARE_TYPE_800T_A3: 16,
+}
 HARDWARE_TYPE_950I_A5 = [
     "350-Atlas-8",
     "350-Atlas-16",

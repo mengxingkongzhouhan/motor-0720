@@ -261,6 +261,43 @@ def _validate_node_labels_exist(labels, node_desc):
     logger.info(f"Node selector validated for {node_desc}: {labels} -> {len(nodes)} node(s) found")
 
 
+def cards_per_node_for_hardware(hardware_type):
+    """Return cards-per-node for a known hardware_type, or None if unknown."""
+    return C.HARDWARE_CARDS_PER_NODE.get(hardware_type)
+
+
+def validate_pod_npu_against_hardware(deploy_config):
+    """Reject per-pod NPU requests that no single node of this hardware can grant.
+
+    InferServiceSet engine roles request ``huawei.com/Ascend910`` (or A5 NPU)
+    on one pod. If ``p_pod_npu_num`` / ``d_pod_npu_num`` / ``hybrid_pod_npu_num``
+    exceeds the cards on one node, Infer Operator + Volcano never create the
+    engine pods — only controller / coordinator / kv-store come up.
+    """
+    if not isinstance(deploy_config, dict):
+        return
+    hardware_type = deploy_config.get(C.HARDWARE_TYPE)
+    cards = cards_per_node_for_hardware(hardware_type)
+    if cards is None:
+        return
+
+    npu_keys = (C.P_POD_NPU_NUM, C.D_POD_NPU_NUM, C.E_POD_NPU_NUM, C.HYBRID_POD_NPU_NUM)
+    for key in npu_keys:
+        if key not in deploy_config:
+            continue
+        try:
+            npu_num = int(deploy_config[key])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must be an integer, got {deploy_config[key]!r}") from exc
+        if npu_num > cards:
+            raise ValueError(
+                f"{key}={npu_num} exceeds cards per node ({cards}) for hardware_type={hardware_type}. "
+                "Each engine pod requests this many NPU on a single node; Infer Operator / Volcano "
+                "will not create prefill/decode/union pods. Use a smaller *_pod_npu_num or split "
+                "the instance across nodes with single_*_instance_pod_num."
+            )
+
+
 def validate_node_selectors(deploy_config):
     """Validate that cluster nodes exist for every nodeSelector combination to be used.
 

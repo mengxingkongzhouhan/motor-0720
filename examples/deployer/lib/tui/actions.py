@@ -50,14 +50,19 @@ class _DeployActionsMixin:  # pylint: disable=no-member,attribute-defined-outsid
 
     @staticmethod
     def _pod_prefix(pod_name: str) -> str:
-        """Return the role prefix of a Kubernetes pod name.
+        """Return the stable role identity of a Kubernetes pod name.
 
-        Pod names are ``{name}-{replicaset_hash}-{pod_hash}``; the prefix
-        (everything before the last two dashes) identifies the role across
-        restarts.  e.g. ``vllm-p0-abc123-def456`` → ``vllm-p0``.
+        Deployment pods are ``{name}-{replicaset_hash}-{pod_hash}``, so the
+        part before the last two dashes identifies the role across restarts,
+        e.g. ``vllm-p0-abc123-def456`` → ``vllm-p0``.  StatefulSet pods
+        (infer_service_set mode, e.g. ``vllm-0-prefill-1``) keep their name
+        across restarts and are returned unchanged.
         """
-        parts = pod_name.rsplit("-", 2)
-        return parts[0] if len(parts) == 3 else pod_name
+        from .step import ENGINE_DEPLOYMENT_POD_RE  # pylint: disable=import-outside-toplevel
+
+        if not ENGINE_DEPLOYMENT_POD_RE.search(pod_name):
+            return pod_name
+        return pod_name.rsplit("-", 2)[0]
 
     def _rescan_pods(self) -> None:
         """Check for newly-appeared pods and start monitoring them.

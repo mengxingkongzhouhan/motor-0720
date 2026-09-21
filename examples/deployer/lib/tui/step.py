@@ -418,11 +418,12 @@ def print_wait_diagnosis(name_space: str, engine_pods: list[tuple[str, str]], po
         return
 
     all_pods = shell_get_all_pods(name_space)
-    print(f"  No engine pod exists in namespace '{name_space}' — Infer Operator did not create them.")
-    print("  Controller / coordinator / kv-store do not request NPU and are scheduled by kube-scheduler.")
-    print("  Prefill / decode / union roles need Infer Operator + Volcano + huawei.com/Ascend910.")
-    print("  Typical causes: engine role replicas=0, missing volcano default queue,")
-    print("  or *_pod_npu_num larger than cards on one node (800I_A2=8, 800I_A3=16).")
+    print(f"  No engine pod exists in namespace '{name_space}'.")
+    print("  Controller / coordinator / kv-store do not request NPU and use kube-scheduler.")
+    print("  Prefill / decode / union InstanceSets need Infer Operator + Volcano + NPU.")
+    print("  If those InstanceSets already exist, the CR was created but pods were not;")
+    print("  check InstanceSet spec.replicas, Volcano default queue, and *_pod_npu_num")
+    print("  (800I_A2=8 cards/node, 800I_A3=16). encode/union/kv-conductor may exist with replicas=0.")
     if all_pods:
         print("  Pods currently in the namespace:")
         for name, status in all_pods:
@@ -440,9 +441,24 @@ def print_wait_diagnosis(name_space: str, engine_pods: list[tuple[str, str]], po
             "--no-headers",
         ),
     )
+    _print_indented_block(
+        "InstanceSet replicas:",
+        _kubectl_output(
+            "get",
+            "instanceset",
+            "-n",
+            name_space,
+            "-o",
+            "custom-columns=NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas",
+        ),
+    )
     _print_indented_block("Volcano queues:", _kubectl_output("get", "queue", "--no-headers"))
-    print(f"  Check CRs: kubectl -n {name_space} get inferserviceset,inferservice,instanceset")
-    print("  Check Infer Operator: kubectl -n mindx-dl logs deploy/infer-operator-manager --tail=100")
+    _print_indented_block(
+        "Volcano podgroups:",
+        _kubectl_output("get", "podgroup", "-n", name_space, "--no-headers"),
+    )
+    print(f"  Describe engine InstanceSet: kubectl -n {name_space} describe instanceset vllm-0-prefill")
+    print("  Check Infer Operator: kubectl -n mindx-dl logs deploy/infer-operator-manager --tail=200")
     print("  Check Volcano queue: kubectl get queue")
     print(f"  Check events: kubectl -n {name_space} get events --sort-by=.lastTimestamp")
     print("  Check generated replicas/NPU: grep -n 'name: prefill\\|name: decode\\|replicas:\\|Ascend910' ./output_yamls/infer_service.yaml")

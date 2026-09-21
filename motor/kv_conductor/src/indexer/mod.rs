@@ -78,15 +78,16 @@ pub struct QueryOptions {
     /// Split `cpu_blocks` into `cpu_local_blocks` / `cpu_remote_blocks` by
     /// whether the DP's own Pod holds the pooled block.
     ///
-    /// Off by default: the response then carries only the four legacy
-    /// counters and the owner-count pass over the lower-tier walk is skipped.
+    /// Off by default: the response then omits the local/remote split and the
+    /// owner-count pass over the lower-tier walk is skipped. `disk_block_hashes`
+    /// is independent of this switch.
     pub split_cpu_hits: bool,
 }
 
 /// Per-DP absolute coverage ends (in blocks) on each storage medium, plus how
 /// much of the pooled coverage this DP can read without a cross-machine
 /// transfer.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct MediumEnds {
     npu: u32,
     cpu: u32,
@@ -96,6 +97,9 @@ struct MediumEnds {
     /// sits in this DP's own Pod — hence on its own machine. The remainder of
     /// `cpu - npu` is what has to come over the wire.
     cpu_local: u32,
+    /// Engine `block_hash` of the exclusive Disk slice, prefix order.
+    /// Same range as `disk_blocks`: `[max(npu, cpu), disk)`.
+    disk_hashes: Vec<u64>,
 }
 
 /// The two accumulators a matching pass writes into.
@@ -585,12 +589,16 @@ impl IndexerEntry {
             // tier's exclusive block count. Skipped entirely unless the split
             // is switched on: the owner lookup is the one per-block cost the
             // ownership-blind walk would otherwise not pay.
+            let (npu_end, cpu_end) = sink
+                .medium_ends
+                .get(dp)
+                .map(|e| (e.npu, e.cpu))
+                .unwrap_or((0, 0));
+            let exclusive_from = match medium {
+                StorageMedium::Disk => npu_end.max(cpu_end),
+                _ => npu_end,
+            } as usize;
             let local = if self.query_options.split_cpu_hits {
-                let ends = sink.medium_ends.get(dp).copied().unwrap_or_default();
-                let exclusive_from = match medium {
-                    StorageMedium::Disk => ends.npu.max(ends.cpu),
-                    _ => ends.npu,
-                } as usize;
                 Some(tiers.count_owned(&worker, reached.blocks_from(exclusive_from)))
             } else {
                 None
@@ -604,6 +612,16 @@ impl IndexerEntry {
                 medium,
                 reached.hit.end_pos() as u32,
             );
+            if medium == StorageMedium::Disk {
+                sink.medium_ends
+                    .entry((instance_id.clone(), *dp_rank))
+                    .or_default()
+                    .disk_hashes = reached
+                    .blocks_from(exclusive_from)
+                    .iter()
+                    .map(|h| h.0)
+                    .collect();
+            }
             if let Some(local) = local {
                 Self::note_local_hits(sink.medium_ends, instance_id, *dp_rank, medium, local);
             }
@@ -1313,6 +1331,12 @@ impl Indexer {
             dp_match.npu_blocks = npu;
             dp_match.cpu_blocks = cpu;
             dp_match.disk_blocks = disk;
+            debug_assert_eq!(
+                ends.disk_hashes.len() as u32,
+                disk,
+                "disk_block_hashes must match exclusive disk_blocks"
+            );
+            dp_match.disk_block_hashes = ends.disk_hashes.clone();
             dp_match.matched_tokens = covered.saturating_mul(block_size);
             if self.query_options.split_cpu_hits {
                 // `cpu_local` is counted over the same exclusive range as `cpu`,

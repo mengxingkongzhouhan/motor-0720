@@ -281,7 +281,8 @@ pub struct QueryByHashRequest {
 // Python reads:
 //   rsp[tenant_id][instance_id]["longest_matched"]            (in tokens)
 //   rsp[tenant_id][instance_id]["DP"][dp_rank_str]            (DpBlocks obj:
-//     matched_tokens / npu_blocks / cpu_blocks / disk_blocks)
+//     matched_tokens / npu_blocks / cpu_blocks / disk_blocks /
+//     disk_block_hashes?)
 // ---------------------------------------------------------------------------
 
 /// Per-DP matched block counts across storage media.
@@ -301,6 +302,16 @@ pub struct DpBlocks {
     pub cpu_blocks: u32,
     /// Exclusive Disk matched block count (beyond max(NPU, CPU) coverage).
     pub disk_blocks: u32,
+    /// Engine sequence hashes (`block_hash`) of the exclusive Disk matched
+    /// blocks, in prefix order.
+    ///
+    /// Same slice as `disk_blocks`: after NPU > CPU > Disk partitioning, only
+    /// the blocks beyond `max(npu_end, cpu_end)`. Invariant:
+    /// `disk_block_hashes.len() == disk_blocks`. Empty / omitted when there is
+    /// no exclusive Disk contribution, so no-SSD (and same-prefix-replica)
+    /// responses stay the legacy four-counter shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disk_block_hashes: Vec<u64>,
     /// How `cpu_blocks` splits by how far the block has to travel.
     ///
     /// A pool event fans out to every DP in the Pod that reported it, so "this DP
@@ -330,13 +341,14 @@ pub struct DpBlocks {
 impl DpBlocks {
     /// Number of map entries the msgpack encoder must emit for this block.
     ///
-    /// `cpu_local_blocks` / `cpu_remote_blocks` are always set together, so the
-    /// count is 4 or 6 — the same keys serde writes for JSON.
+    /// `cpu_local_blocks` / `cpu_remote_blocks` are always set together. The
+    /// count is 4, 5, 6, or 7 — the same keys serde writes for JSON.
     fn wire_field_count(&self) -> u32 {
         let base = 4;
         let local = u32::from(self.cpu_local_blocks.is_some());
         let remote = u32::from(self.cpu_remote_blocks.is_some());
-        base + local + remote
+        let disk_hashes = u32::from(!self.disk_block_hashes.is_empty());
+        base + local + remote + disk_hashes
     }
 }
 
@@ -371,7 +383,8 @@ pub struct QueryResponse {
 //
 // ```text
 // { tenant_id: { instance_id: { longest_matched, DP:
-//   { rank: { matched_tokens, npu_blocks, cpu_blocks, disk_blocks } } } } }
+//   { rank: { matched_tokens, npu_blocks, cpu_blocks, disk_blocks,
+//             disk_block_hashes? } } } } }
 // ```
 
 /// Content-Type values accepted as MessagePack on the query endpoints.
@@ -434,6 +447,18 @@ pub fn encode_query_response_msgpack(response: &QueryResponse, out: &mut Vec<u8>
                 write_u32(out, blocks.cpu_blocks).expect("write cpu_blocks");
                 write_str(out, "disk_blocks").expect("write key");
                 write_u32(out, blocks.disk_blocks).expect("write disk_blocks");
+                if !blocks.disk_block_hashes.is_empty() {
+                    write_str(out, "disk_block_hashes").expect("write key");
+                    write_array_len(
+                        out,
+                        u32::try_from(blocks.disk_block_hashes.len())
+                            .expect("disk_block_hashes len fits u32"),
+                    )
+                    .expect("write array len");
+                    for hash in &blocks.disk_block_hashes {
+                        write_u64(out, *hash).expect("write disk_block_hash");
+                    }
+                }
                 if let Some(local) = blocks.cpu_local_blocks {
                     write_str(out, "cpu_local_blocks").expect("write key");
                     write_u32(out, local).expect("write cpu_local_blocks");
@@ -905,6 +930,7 @@ mod tests {
                 disk_blocks: 0,
                 cpu_local_blocks: Some(1),
                 cpu_remote_blocks: Some(3),
+                ..Default::default()
             },
         );
 
@@ -925,6 +951,35 @@ mod tests {
         assert_eq!(parsed["DP"]["1"]["cpu_blocks"], 4);
         assert_eq!(parsed["DP"]["1"]["cpu_local_blocks"], 1);
         assert_eq!(parsed["DP"]["1"]["cpu_remote_blocks"], 3);
+        assert!(parsed["DP"]["0"].get("disk_block_hashes").is_none());
+        assert!(parsed["DP"]["1"].get("disk_block_hashes").is_none());
+    }
+
+    #[test]
+    fn test_disk_block_hashes_serialization() {
+        let mut imd = InstanceMatchData {
+            longest_matched: 384,
+            ..Default::default()
+        };
+        imd.dp.insert(
+            "0".into(),
+            DpBlocks {
+                matched_tokens: 384,
+                npu_blocks: 1,
+                cpu_blocks: 0,
+                disk_blocks: 2,
+                disk_block_hashes: vec![201, 202],
+                ..Default::default()
+            },
+        );
+
+        let json = serde_json::to_string(&imd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["DP"]["0"]["disk_block_hashes"],
+            serde_json::json!([201, 202])
+        );
+        assert_eq!(parsed["DP"]["0"]["disk_blocks"], 2);
     }
 
     // ── KvEventWirePayload normalization ────────────────────────────────
@@ -1157,10 +1212,11 @@ mod tests {
                 matched_tokens: 512,
                 npu_blocks: 1,
                 cpu_blocks: 3,
-                disk_blocks: 0,
+                disk_blocks: 2,
                 // 2 of the 3 pooled blocks are on this DP's own machine.
                 cpu_local_blocks: Some(2),
                 cpu_remote_blocks: Some(1),
+                disk_block_hashes: vec![900, 901],
             },
         );
         instances.insert(
@@ -1197,14 +1253,16 @@ mod tests {
         let dps = &json["default"]["prefill-0"]["DP"];
         assert_eq!(dps["0"].as_object().unwrap().len(), 4);
         assert!(dps["0"].get("cpu_local_blocks").is_none());
-        assert_eq!(dps["1"].as_object().unwrap().len(), 6);
+        assert!(dps["0"].get("disk_block_hashes").is_none());
+        assert_eq!(dps["1"].as_object().unwrap().len(), 7);
         assert_eq!(dps["1"]["cpu_local_blocks"], 2);
         assert_eq!(dps["1"]["cpu_remote_blocks"], 1);
+        assert_eq!(dps["1"]["disk_block_hashes"], serde_json::json!([900, 901]));
     }
 
     #[test]
     fn test_query_response_msgpack_without_cpu_split_is_legacy_shape() {
-        // With the split switched off every DP carries exactly the four
+        // With optional fields cleared every DP carries exactly the four
         // pre-split counters, so older clients see an unchanged payload.
         let mut response = sample_query_response();
         for instances in response.tenants.values_mut() {
@@ -1212,6 +1270,7 @@ mod tests {
                 for blocks in imd.dp.values_mut() {
                     blocks.cpu_local_blocks = None;
                     blocks.cpu_remote_blocks = None;
+                    blocks.disk_block_hashes.clear();
                 }
             }
         }

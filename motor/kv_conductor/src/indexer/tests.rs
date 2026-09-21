@@ -390,6 +390,8 @@ fn test_disk_continuation_from_cpu_breakpoint() {
     assert_eq!(dp0.npu_blocks, 1);
     assert_eq!(dp0.cpu_blocks, 1);
     assert_eq!(dp0.disk_blocks, 1);
+    // Disk only holds the tail; the SSD-resident hash list is that tail.
+    assert_eq!(dp0.disk_block_hashes, vec![300]);
     // Unweighted coverage = exclusive sum × block_size.
     assert_eq!(dp0.matched_tokens, 3 * 4);
 }
@@ -487,6 +489,10 @@ fn test_overlapping_npu_cpu_disk_replicas_do_not_inflate_matched_tokens() {
     assert_eq!(dp0.npu_blocks, 2);
     assert_eq!(dp0.cpu_blocks, 0);
     assert_eq!(dp0.disk_blocks, 0);
+    assert!(
+        dp0.disk_block_hashes.is_empty(),
+        "same-prefix Disk replica is exclusive-attributed to NPU"
+    );
     assert_eq!(dp0.matched_tokens, 2 * 4);
     assert!(
         dp0.matched_tokens <= tokens.len() as u32,
@@ -864,6 +870,7 @@ fn test_cpu_split_is_off_by_default_and_leaves_coverage_unchanged() {
             assert_eq!(plain_dp.npu_blocks, split_dp.npu_blocks);
             assert_eq!(plain_dp.cpu_blocks, split_dp.cpu_blocks);
             assert_eq!(plain_dp.disk_blocks, split_dp.disk_blocks);
+            assert_eq!(plain_dp.disk_block_hashes, split_dp.disk_block_hashes);
             assert_eq!(
                 plain_dp.cpu_local_blocks, None,
                 "default must not report the split: {plain_dp:?}"
@@ -1231,6 +1238,7 @@ fn test_disk_continuation_from_hbm_when_cpu_miss() {
     assert_eq!(dp0.npu_blocks, 1);
     assert_eq!(dp0.cpu_blocks, 0);
     assert_eq!(dp0.disk_blocks, 1);
+    assert_eq!(dp0.disk_block_hashes, vec![300]);
     // Unweighted coverage includes exclusive disk extension.
     assert_eq!(dp0.matched_tokens, 2 * 4);
 }
@@ -1289,6 +1297,7 @@ fn test_disk_replica_reported_when_cpu_hits_same_dp() {
     assert_eq!(dp0.cpu_blocks, 1);
     // Same-prefix Disk replica is exclusive-attributed to CPU.
     assert_eq!(dp0.disk_blocks, 0);
+    assert!(dp0.disk_block_hashes.is_empty());
     assert_eq!(dp0.matched_tokens, 4);
 }
 
@@ -1345,6 +1354,7 @@ fn test_disk_replica_reported_when_hbm_hits_same_dp() {
     assert_eq!(dp0.npu_blocks, 1);
     // Same-prefix Disk replica is exclusive-attributed to NPU.
     assert_eq!(dp0.disk_blocks, 0);
+    assert!(dp0.disk_block_hashes.is_empty());
     assert_eq!(dp0.matched_tokens, 4);
 }
 
@@ -1420,6 +1430,12 @@ fn test_lower_tier_longer_replica_extends_coverage() {
         dp0.disk_blocks, 2,
         "exclusive Disk blocks are the extension beyond NPU"
     );
+    assert_eq!(
+        dp0.disk_block_hashes,
+        vec![201, 202],
+        "SSD hash list is the exclusive Disk extension beyond NPU"
+    );
+    assert_eq!(dp0.disk_block_hashes.len() as u32, dp0.disk_blocks);
     assert_eq!(
         dp0.matched_tokens,
         3 * 4,
@@ -1574,6 +1590,7 @@ fn test_exclusive_sum_is_unweighted_matched_tokens() {
     assert_eq!(dp0.npu_blocks, 1);
     assert_eq!(dp0.cpu_blocks, 1);
     assert_eq!(dp0.disk_blocks, 1);
+    assert_eq!(dp0.disk_block_hashes, vec![300]);
     assert_eq!(
         dp0.matched_tokens,
         (dp0.npu_blocks + dp0.cpu_blocks + dp0.disk_blocks) * 4
@@ -1613,7 +1630,60 @@ fn test_disk_only_coverage_matched_tokens() {
     assert_eq!(dp0.npu_blocks, 0);
     assert_eq!(dp0.cpu_blocks, 0);
     assert_eq!(dp0.disk_blocks, 1);
+    assert_eq!(dp0.disk_block_hashes, vec![100]);
     assert_eq!(dp0.matched_tokens, 4);
+}
+
+#[test]
+fn test_query_omits_disk_block_hashes_when_ssd_misses() {
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-no-ssd", "t1");
+    let tokens: Vec<i64> = vec![1, 2, 3, 4];
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+    store_chain(
+        &entry,
+        &worker_of("inst-1", 0, StorageMedium::Npu),
+        None,
+        &[(100, hashes[0].0)],
+    );
+
+    let resp = indexer.query("model-no-ssd", "t1", &tokens, 4).unwrap();
+    let dp0 = &resp.tenants["t1"]["inst-1"].dp["0"];
+    assert!(dp0.disk_block_hashes.is_empty());
+    let json = serde_json::to_value(&resp).unwrap();
+    assert!(
+        json["t1"]["inst-1"]["DP"]["0"]
+            .get("disk_block_hashes")
+            .is_none(),
+        "empty SSD hash list must be omitted from the wire"
+    );
+}
+
+#[test]
+fn test_query_by_hash_returns_ssd_block_hashes() {
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-by-hash-ssd", "t1");
+    let tokens: Vec<i64> = (0..8).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+    store_chain(
+        &entry,
+        &worker_of("inst-1", 0, StorageMedium::Npu),
+        None,
+        &[(100, hashes[0].0)],
+    );
+    store_chain(
+        &entry,
+        &worker_of("inst-1", 0, StorageMedium::Disk),
+        Some(100),
+        &[(300, hashes[1].0)],
+    );
+
+    let resp = indexer
+        .query_by_hash("model-by-hash-ssd", "t1", &hashes)
+        .unwrap();
+    let dp0 = &resp.tenants["t1"]["inst-1"].dp["0"];
+    assert_eq!(dp0.disk_blocks, 1);
+    assert_eq!(dp0.disk_block_hashes, vec![300]);
 }
 
 /// Registration pod → DP table is the query target list. A store-only

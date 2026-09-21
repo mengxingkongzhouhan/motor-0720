@@ -493,6 +493,128 @@ class TestKvCacheAffinityPolicy(unittest.TestCase):
         debug = mock_req_info.kv_affinity_debug[(mock_instance.id, ep.id)]
         self.assertEqual(debug[3], (768, 128, 0))
 
+    def test_disk_block_hashes_from_conductor_dp(self):
+        """Exclusive SSD hashes are ints; junk values are skipped."""
+        self.assertEqual(
+            KvCacheAffinityPolicy._disk_block_hashes(
+                {"disk_blocks": 2, "disk_block_hashes": [201, "202", "x", None]}
+            ),
+            [201, 202],
+        )
+        self.assertEqual(KvCacheAffinityPolicy._disk_block_hashes(200), [])
+        self.assertEqual(KvCacheAffinityPolicy._disk_block_hashes({"matched_tokens": 120}), [])
+        self.assertEqual(KvCacheAffinityPolicy._disk_block_hashes({"disk_block_hashes": "201"}), [])
+
+    @patch.object(KvCacheAffinityPolicy, "_conductor_block_size", return_value=128)
+    @patch("motor.coordinator.scheduler.policy.kv_cache_affinity.ConductorApiClient.query_conductor")
+    @patch("motor.coordinator.scheduler.policy.kv_cache_affinity.TokenizerManager")
+    def test_selection_stashes_exclusive_disk_block_hashes(
+        self, mock_tokenizer_manager, mock_query_conductor, _mock_block_size
+    ):
+        """Affinity selection caches per-DP exclusive SSD hashes for post-CAS prefetch."""
+        ep0 = _make_endpoint(0, active_tokens=10.0)
+        ep1 = _make_endpoint(1, active_tokens=50.0)
+        mock_instance = Mock()
+        mock_instance.id = 7
+        mock_instance.endpoints = {"group": {0: ep0, 1: ep1}}
+        mock_instance.get_all_endpoints.return_value = (ep0, ep1)
+        instances = [mock_instance]
+
+        mock_req_info = Mock()
+        mock_req_info.req_data = {"prompt": "hello"}
+        mock_tokenizer = Mock()
+        mock_tokenizer.encode.return_value = list(range(1000))
+        mock_tokenizer_manager.return_value = mock_tokenizer
+
+        mock_query_conductor.return_value = {
+            TENANT_ID: {
+                "vllm-prefill-7": {
+                    "DP": {
+                        "0": {
+                            "npu_blocks": 1,
+                            "cpu_blocks": 0,
+                            "disk_blocks": 2,
+                            "matched_tokens": 384,
+                            "disk_block_hashes": [201, 202],
+                        },
+                        "1": {
+                            "npu_blocks": 2,
+                            "cpu_blocks": 0,
+                            "disk_blocks": 0,
+                            "matched_tokens": 256,
+                        },
+                    }
+                }
+            }
+        }
+
+        result = KvCacheAffinityPolicy.select_endpoint_from_list(instances, mock_req_info, load_weight=0.0)
+        self.assertIsNotNone(result)
+        self.assertEqual(mock_req_info.kv_disk_block_hashes[(7, 0)], [201, 202])
+        self.assertNotIn((7, 1), mock_req_info.kv_disk_block_hashes)
+
+    @patch.object(KvCacheAffinityPolicy, "_conductor_block_size", return_value=128)
+    @patch("motor.coordinator.scheduler.policy.kv_cache_affinity.ConductorApiClient.query_conductor")
+    @patch("motor.coordinator.scheduler.policy.kv_cache_affinity.TokenizerManager")
+    def test_load_gated_selection_also_stashes_disk_block_hashes(
+        self, mock_tokenizer_manager, mock_query_conductor, _mock_block_size
+    ):
+        ep = _make_endpoint(0, active_tokens=1.0)
+        mock_instance = Mock()
+        mock_instance.id = 3
+        mock_instance.endpoints = {"group": {0: ep}}
+        mock_instance.get_all_endpoints.return_value = (ep,)
+
+        mock_req_info = Mock()
+        mock_req_info.req_data = {"prompt": "hello"}
+        mock_tokenizer = Mock()
+        mock_tokenizer.encode.return_value = list(range(400))
+        mock_tokenizer_manager.return_value = mock_tokenizer
+        mock_query_conductor.return_value = {
+            TENANT_ID: {
+                "vllm-prefill-3": {
+                    "DP": {
+                        "0": {
+                            "npu_blocks": 0,
+                            "cpu_blocks": 0,
+                            "disk_blocks": 2,
+                            "matched_tokens": 256,
+                            "disk_block_hashes": [300, 301],
+                        }
+                    }
+                }
+            }
+        }
+
+        result = KvCacheAffinityPolicy.select_endpoint_from_list(
+            [mock_instance], mock_req_info, mode="load_gated", load_gate_topn=1
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(mock_req_info.kv_disk_block_hashes[(3, 0)], [300, 301])
+
+    @patch("motor.coordinator.api_client.memcache_store_client.MemcacheStoreClient.prefetch_disk_blocks")
+    def test_prefetch_ssd_hits_for_committed_dp(self, mock_prefetch):
+        """Only the final DP's stashed exclusive hashes are prefetched."""
+        mock_prefetch.return_value = True
+        req_info = RequestInfo(req_id="r1", req_data={}, req_len=0, api="v1/completions")
+        req_info.kv_disk_block_hashes = {(1, 0): [201, 202], (2, 1): [900]}
+
+        self.assertTrue(KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp(req_info, 1, 0))
+        mock_prefetch.assert_called_once_with([201, 202])
+
+        mock_prefetch.reset_mock()
+        self.assertFalse(KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp(req_info, 9, 9))
+        mock_prefetch.assert_not_called()
+        self.assertFalse(KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp(None, 1, 0))
+        mock_prefetch.assert_not_called()
+
+    @patch("motor.coordinator.api_client.memcache_store_client.MemcacheStoreClient.prefetch_disk_blocks")
+    def test_prefetch_ssd_hits_fail_open(self, mock_prefetch):
+        mock_prefetch.side_effect = RuntimeError("store down")
+        req_info = RequestInfo(req_id="r2", req_data={}, req_len=0, api="v1/completions")
+        req_info.kv_disk_block_hashes = {(1, 0): [201]}
+        self.assertFalse(KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp(req_info, 1, 0))
+
     @patch('motor.coordinator.scheduler.policy.kv_cache_affinity.ConductorApiClient.query_conductor')
     @patch('motor.coordinator.scheduler.policy.kv_cache_affinity.TokenizerManager')
     def test_select_endpoint_mixed_dp_format_old_and_new(self, mock_tokenizer_manager, mock_query_conductor):

@@ -302,14 +302,14 @@ pub struct DpBlocks {
     pub cpu_blocks: u32,
     /// Exclusive Disk matched block count (beyond max(NPU, CPU) coverage).
     pub disk_blocks: u32,
-    /// Engine sequence hashes (`block_hash`) of every SSD-resident matched
-    /// block, in prefix order.
+    /// Engine sequence hashes (`block_hash`) of the exclusive Disk matched
+    /// blocks, in prefix order.
     ///
-    /// This is "what the Disk index actually holds for this query", not the
-    /// exclusive `disk_blocks` slice: a same-prefix replica that was attributed
-    /// to NPU/CPU is still listed. Empty when the Disk walk found nothing, and
-    /// omitted from the wire in that case so no-SSD responses stay the legacy
-    /// four-counter shape.
+    /// Same slice as `disk_blocks`: after NPU > CPU > Disk partitioning, only
+    /// the blocks beyond `max(npu_end, cpu_end)`. Invariant:
+    /// `disk_block_hashes.len() == disk_blocks`. Empty / omitted when there is
+    /// no exclusive Disk contribution, so no-SSD (and same-prefix-replica)
+    /// responses stay the legacy four-counter shape.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disk_block_hashes: Vec<u64>,
     /// How `cpu_blocks` splits by how far the block has to travel.
@@ -968,7 +968,7 @@ mod tests {
                 npu_blocks: 1,
                 cpu_blocks: 0,
                 disk_blocks: 2,
-                disk_block_hashes: vec![200, 201, 202],
+                disk_block_hashes: vec![201, 202],
                 ..Default::default()
             },
         );
@@ -977,7 +977,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             parsed["DP"]["0"]["disk_block_hashes"],
-            serde_json::json!([200, 201, 202])
+            serde_json::json!([201, 202])
         );
         assert_eq!(parsed["DP"]["0"]["disk_blocks"], 2);
     }
@@ -1212,7 +1212,7 @@ mod tests {
                 matched_tokens: 512,
                 npu_blocks: 1,
                 cpu_blocks: 3,
-                disk_blocks: 0,
+                disk_blocks: 2,
                 // 2 of the 3 pooled blocks are on this DP's own machine.
                 cpu_local_blocks: Some(2),
                 cpu_remote_blocks: Some(1),

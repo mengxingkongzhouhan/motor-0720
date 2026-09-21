@@ -489,7 +489,10 @@ fn test_overlapping_npu_cpu_disk_replicas_do_not_inflate_matched_tokens() {
     assert_eq!(dp0.npu_blocks, 2);
     assert_eq!(dp0.cpu_blocks, 0);
     assert_eq!(dp0.disk_blocks, 0);
-    assert_eq!(dp0.disk_block_hashes, vec![100, 200]);
+    assert!(
+        dp0.disk_block_hashes.is_empty(),
+        "same-prefix Disk replica is exclusive-attributed to NPU"
+    );
     assert_eq!(dp0.matched_tokens, 2 * 4);
     assert!(
         dp0.matched_tokens <= tokens.len() as u32,
@@ -1292,10 +1295,9 @@ fn test_disk_replica_reported_when_cpu_hits_same_dp() {
     let resp = indexer.query("model-g", "t1", &tokens, 4).unwrap();
     let dp0 = &resp.tenants["t1"]["inst-1"].dp["0"];
     assert_eq!(dp0.cpu_blocks, 1);
-    // Same-prefix Disk replica is exclusive-attributed to CPU, but the SSD
-    // identity is still returned so callers can look the block up in the store.
+    // Same-prefix Disk replica is exclusive-attributed to CPU.
     assert_eq!(dp0.disk_blocks, 0);
-    assert_eq!(dp0.disk_block_hashes, vec![200]);
+    assert!(dp0.disk_block_hashes.is_empty());
     assert_eq!(dp0.matched_tokens, 4);
 }
 
@@ -1352,7 +1354,7 @@ fn test_disk_replica_reported_when_hbm_hits_same_dp() {
     assert_eq!(dp0.npu_blocks, 1);
     // Same-prefix Disk replica is exclusive-attributed to NPU.
     assert_eq!(dp0.disk_blocks, 0);
-    assert_eq!(dp0.disk_block_hashes, vec![200]);
+    assert!(dp0.disk_block_hashes.is_empty());
     assert_eq!(dp0.matched_tokens, 4);
 }
 
@@ -1430,9 +1432,10 @@ fn test_lower_tier_longer_replica_extends_coverage() {
     );
     assert_eq!(
         dp0.disk_block_hashes,
-        vec![200, 201, 202],
-        "SSD hash list is the full Disk replica, including the NPU-overlapping prefix"
+        vec![201, 202],
+        "SSD hash list is the exclusive Disk extension beyond NPU"
     );
+    assert_eq!(dp0.disk_block_hashes.len() as u32, dp0.disk_blocks);
     assert_eq!(
         dp0.matched_tokens,
         3 * 4,

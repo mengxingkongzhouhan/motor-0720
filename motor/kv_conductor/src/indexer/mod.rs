@@ -42,7 +42,7 @@ use serde::Serialize;
 use crate::concurrent_tree::{ConcurrentRadixTree, PrefixMatch, WorkerLookup};
 use crate::error::KvConductorError;
 use crate::hashing::compute_block_hash_for_seq;
-use crate::lower_tier::{LowerTierIndexer, ReachableChain};
+use crate::lower_tier::LowerTierIndexer;
 use crate::protocols::*;
 
 /// TTL for stale pending pool entries (60 seconds).
@@ -97,9 +97,8 @@ struct MediumEnds {
     /// sits in this DP's own Pod — hence on its own machine. The remainder of
     /// `cpu - npu` is what has to come over the wire.
     cpu_local: u32,
-    /// Engine `block_hash` of every SSD-resident matched block, prefix order.
-    /// Includes blocks also present on NPU/CPU — this is "what's on disk", not
-    /// the exclusive `disk_blocks` slice.
+    /// Engine `block_hash` of the exclusive Disk slice, prefix order.
+    /// Same range as `disk_blocks`: `[max(npu, cpu), disk)`.
     disk_hashes: Vec<u64>,
 }
 
@@ -590,16 +589,16 @@ impl IndexerEntry {
             // tier's exclusive block count. Skipped entirely unless the split
             // is switched on: the owner lookup is the one per-block cost the
             // ownership-blind walk would otherwise not pay.
+            let (npu_end, cpu_end) = sink
+                .medium_ends
+                .get(dp)
+                .map(|e| (e.npu, e.cpu))
+                .unwrap_or((0, 0));
+            let exclusive_from = match medium {
+                StorageMedium::Disk => npu_end.max(cpu_end),
+                _ => npu_end,
+            } as usize;
             let local = if self.query_options.split_cpu_hits {
-                let (npu_end, cpu_end) = sink
-                    .medium_ends
-                    .get(dp)
-                    .map(|e| (e.npu, e.cpu))
-                    .unwrap_or((0, 0));
-                let exclusive_from = match medium {
-                    StorageMedium::Disk => npu_end.max(cpu_end),
-                    _ => npu_end,
-                } as usize;
                 Some(tiers.count_owned(&worker, reached.blocks_from(exclusive_from)))
             } else {
                 None
@@ -617,7 +616,11 @@ impl IndexerEntry {
                 sink.medium_ends
                     .entry((instance_id.clone(), *dp_rank))
                     .or_default()
-                    .disk_hashes = Self::collect_disk_hashes(root_chain.as_ref(), reached);
+                    .disk_hashes = reached
+                    .blocks_from(exclusive_from)
+                    .iter()
+                    .map(|h| h.0)
+                    .collect();
             }
             if let Some(local) = local {
                 Self::note_local_hits(sink.medium_ends, instance_id, *dp_rank, medium, local);
@@ -633,24 +636,6 @@ impl IndexerEntry {
         }
 
         breaks
-    }
-
-    /// Engine `block_hash` of every SSD-resident matched block, in prefix order.
-    ///
-    /// The ownership-blind root walk and the per-DP continuation are merged so
-    /// a replica that only exists as a tail (or only as a root chain) still
-    /// reports every hash the Disk index actually holds for this query.
-    fn collect_disk_hashes(root: Option<&ReachableChain>, best: &ReachableChain) -> Vec<u64> {
-        let mut hashes = match root {
-            Some(root) => root.chain.iter().map(|h| h.0).collect::<Vec<_>>(),
-            None => Vec::new(),
-        };
-        let start = best.hit.start_pos;
-        if start < hashes.len() {
-            hashes.truncate(start);
-        }
-        hashes.extend(best.chain.iter().map(|h| h.0));
-        hashes
     }
 
     // -----------------------------------------------------------------------
@@ -1346,6 +1331,11 @@ impl Indexer {
             dp_match.npu_blocks = npu;
             dp_match.cpu_blocks = cpu;
             dp_match.disk_blocks = disk;
+            debug_assert_eq!(
+                ends.disk_hashes.len() as u32,
+                disk,
+                "disk_block_hashes must match exclusive disk_blocks"
+            );
             dp_match.disk_block_hashes = ends.disk_hashes.clone();
             dp_match.matched_tokens = covered.saturating_mul(block_size);
             if self.query_options.split_cpu_hits {

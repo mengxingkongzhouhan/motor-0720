@@ -192,7 +192,7 @@ fn ok_query_response(response: QueryResponse, msgpack: bool) -> Response {
 ///
 /// Response: `{ "<tenant_id>": { "<instance_id>": { "longest_matched": N,
 /// "DP": { "<rank>": { "matched_tokens": N, "npu_blocks": N,
-/// "cpu_blocks": N, "disk_blocks": N } } } } }`
+/// "cpu_blocks": N, "disk_blocks": N, "disk_block_hashes": [..] } } } } }`
 ///
 /// Both JSON (default) and MessagePack (`Content-Type: application/msgpack`)
 /// encodings are accepted; the response is returned in the request's encoding.

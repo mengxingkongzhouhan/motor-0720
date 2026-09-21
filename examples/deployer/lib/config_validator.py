@@ -298,26 +298,47 @@ def validate_pod_npu_against_hardware(deploy_config):
             )
 
 
+def _node_selector_override(deploy_config, selector_key):
+    """Return user-defined nodeSelector extras for *selector_key*, or {}."""
+    selector = deploy_config.get(selector_key, {})
+    if not selector:
+        return {}
+    if not isinstance(selector, dict):
+        raise ValueError(f"{C.MOTOR_DEPLOY_CONFIG}.{selector_key} must be a JSON object")
+    return {key: value for key, value in selector.items() if key}
+
+
 def validate_node_selectors(deploy_config):
     """Validate that cluster nodes exist for every nodeSelector combination to be used.
 
     Always validates base hardware labels (accelerator-type, accelerator).
     When PD heterogeneous deployment is enabled, additionally validates the
     combined prefill/decode labels per node type.
+    Custom ``prefill_node_selector`` / ``decode_node_selector`` are AND-merged
+    into the same check — validating only hardware labels would pass while
+    Volcano still cannot create engine pods.
     """
     hardware_type = deploy_config.get(C.HARDWARE_TYPE)
     base_labels = _get_hardware_node_labels(hardware_type)
+    prefill_override = _node_selector_override(deploy_config, C.PREFILL_NODE_SELECTOR)
+    decode_override = _node_selector_override(deploy_config, C.DECODE_NODE_SELECTOR)
 
     pd_config = _get_pd_heterogeneous_config(deploy_config)
 
     if pd_config is not None:
         label_key = pd_config["label_key"]
-        prefill_labels = {**base_labels, label_key: pd_config["prefill_value"]}
-        decode_labels = {**base_labels, label_key: pd_config["decode_value"]}
+        prefill_labels = {**base_labels, label_key: pd_config["prefill_value"], **prefill_override}
+        decode_labels = {**base_labels, label_key: pd_config["decode_value"], **decode_override}
         _validate_node_labels_exist(prefill_labels, "prefill(P)")
         _validate_node_labels_exist(decode_labels, "decode(D)")
         logger.info(
             f"PD heterogeneous node selectors validated: prefill -> {prefill_labels}, decode -> {decode_labels}"
         )
-    else:
-        _validate_node_labels_exist(base_labels, "engine")
+        return
+
+    if prefill_override or decode_override:
+        _validate_node_labels_exist({**base_labels, **prefill_override}, "prefill(P)")
+        _validate_node_labels_exist({**base_labels, **decode_override}, "decode(D)")
+        return
+
+    _validate_node_labels_exist(base_labels, "engine")

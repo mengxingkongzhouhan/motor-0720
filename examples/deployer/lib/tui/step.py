@@ -422,8 +422,9 @@ def print_wait_diagnosis(name_space: str, engine_pods: list[tuple[str, str]], po
     print("  Controller / coordinator / kv-store do not request NPU and use kube-scheduler.")
     print("  Prefill / decode / union InstanceSets need Infer Operator + Volcano + NPU.")
     print("  If those InstanceSets already exist, the CR was created but pods were not;")
-    print("  check InstanceSet spec.replicas, Volcano default queue, and *_pod_npu_num")
-    print("  (800I_A2=8 cards/node, 800I_A3=16). encode/union/kv-conductor may exist with replicas=0.")
+    print("  check InstanceSet spec.replicas, extra nodeSelector (e.g. ai-worker),")
+    print("  Volcano default queue, and *_pod_npu_num (800I_A2=8 cards/node, 800I_A3=16).")
+    print("  encode/union/kv-conductor may exist with replicas=0.")
     if all_pods:
         print("  Pods currently in the namespace:")
         for name, status in all_pods:

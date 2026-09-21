@@ -1020,6 +1020,54 @@ class TestSelectAndAllocateCas:
             writer.release()
 
     @pytest.mark.asyncio
+    async def test_select_and_allocate_prefetches_committed_dp_ssd_hits(self, native_lib):
+        """After CAS commits, prefetch uses the final DP's stashed disk_block_hashes."""
+        del native_lib
+        config = CoordinatorConfig()
+        im = InstanceManager(config)
+        await im.refresh_instances(EventType.ADD, [_make_cas_instance(1, 10)])
+        name = _cas_shm_name("pf")
+        client, writer = await _client_with_shm(im, name)
+        _seed_shm_tokens(writer, 1, 10, 1.0)
+        req = RequestInfo(req_id="req-pf", req_data={}, req_len=8, api="completions", token_ids=[1, 2, 3, 4])
+        req.kv_disk_block_hashes = {(1, 10): [201, 202], (2, 20): [900]}
+        try:
+            with patch(
+                "motor.coordinator.scheduler.runtime.scheduler_client.KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp"
+            ) as mock_prefetch:
+                result = await client.select_and_allocate(PDRole.ROLE_P, req)
+                assert result is not None
+                instance, endpoint, _committed = result
+                mock_prefetch.assert_called_once_with(req, instance.id, endpoint.id)
+                assert (instance.id, endpoint.id) == (1, 10)
+        finally:
+            client._workload_reader.detach()
+            writer.release()
+
+    @pytest.mark.asyncio
+    async def test_select_and_allocate_prefetch_failure_does_not_drop_cas(self, native_lib):
+        """Prefetch is fail-open: a store error must not undo a committed allocate."""
+        del native_lib
+        config = CoordinatorConfig()
+        im = InstanceManager(config)
+        await im.refresh_instances(EventType.ADD, [_make_cas_instance(1, 10)])
+        name = _cas_shm_name("pfe")
+        client, writer = await _client_with_shm(im, name)
+        _seed_shm_tokens(writer, 1, 10, 1.0)
+        req = RequestInfo(req_id="req-pfe", req_data={}, req_len=8, api="completions", token_ids=[1, 2])
+        try:
+            with patch(
+                "motor.coordinator.scheduler.runtime.scheduler_client.KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp",
+                side_effect=RuntimeError("prefetch boom"),
+            ):
+                result = await client.select_and_allocate(PDRole.ROLE_P, req)
+            assert result is not None
+            assert result[0].id == 1
+        finally:
+            client._workload_reader.detach()
+            writer.release()
+
+    @pytest.mark.asyncio
     async def test_select_and_allocate_fast_path_refreshes_once(self, native_lib):
         """First CAS attempt must not redo the refresh candidate selection already did."""
         del native_lib

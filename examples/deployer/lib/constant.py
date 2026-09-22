@@ -390,6 +390,7 @@ CONTROLLER_OBSERVABILITY_NODE_PORT = "controller_observability_node_port"
 NODEPORT_CONFLICT_COORDINATOR_FILE = "nodeport_conflict_coordinator.txt"
 NODEPORT_CONFLICT_CONTROLLER_FILE = "nodeport_conflict_controller.txt"
 VOLCANO_QUEUE_ANNOTATION = "scheduling.volcano.sh/queue-name"
+GANG_SCHEDULE_LABEL = "infer.huawei.com/gang-schedule"
 
 # Docker-only create templates (examples/deployer/docker_deploy.py --create / one-click).
 # Edit these literals to change host devices and binds. Do not add --rm.

@@ -236,6 +236,7 @@ def _configure_engine_role(infer_doc, user_config, infer_name, role_name):
     role[C.REPLICAS] = total_instances
     workload_spec = role.setdefault(C.SPEC, {})
     workload_spec[C.REPLICAS] = single_instance
+    _set_engine_gang_schedule(role, single_instance)
     selector = workload_spec.setdefault(C.SELECTOR, {}).setdefault(C.MATCHLABELS, {})
     selector[C.APP] = infer_name
     template = workload_spec.setdefault(C.TEMPLATE, {})
@@ -272,6 +273,26 @@ def _configure_engine_role(infer_doc, user_config, infer_name, role_name):
     _apply_infer_node_selector_and_sp_block(deploy_config, pod_spec, template, pods_key, npu_key, role_name)
     apply_engine_node_selector_overrides(pod_spec, deploy_config, prefix)
     k8s_utils.apply_additional_labels_annotations(role, user_config.get(get_config_key(role_name), {}))
+
+
+def _set_engine_gang_schedule(role, single_instance):
+    """Keep gang-schedule only when one instance spans multiple pods.
+
+    Infer Operator + Volcano create a PodGroup first when
+    ``infer.huawei.com/gang-schedule=true``. Volcano then waits for
+    ``minAvailable`` pods (``0/0 tasks in gang unschedulable``). For a
+    single-pod instance that deadlock never creates prefill/decode pods.
+    """
+    labels = role.setdefault(C.METADATA, {}).setdefault(C.LABELS, {})
+    enabled = int(single_instance) > 1
+    labels[C.GANG_SCHEDULE_LABEL] = "true" if enabled else "false"
+    logger.info(
+        "Set %s=%s for role %s (spec.replicas=%s)",
+        C.GANG_SCHEDULE_LABEL,
+        labels[C.GANG_SCHEDULE_LABEL],
+        role.get(C.NAME),
+        single_instance,
+    )
 
 
 def _set_role_primary_service_port(role, service_port):

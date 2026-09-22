@@ -148,8 +148,8 @@ def test_print_wait_diagnosis_reports_missing_workload(monkeypatch, capsys):
     assert "vllm-0-controller-0-675c454485-dzjqw" in output
     assert "Infer Operator" in output
     assert "InstanceSet" in output
-    assert f"describe instanceset vllm-0-prefill" in output
-    assert "800I_A2=8" in output
+    assert "0/0 tasks in gang" in output
+    assert "describe instanceset vllm-0-prefill" in output
 
 
 def test_print_wait_diagnosis_reports_stuck_engine_pods(monkeypatch, capsys):

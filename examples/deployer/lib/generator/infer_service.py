@@ -53,7 +53,11 @@ from lib.generator.kv_cache_store import (
     normalize_kv_cache_store_config,
     gen_kv_store_env,
 )
-from lib.generator.storage import apply_storage_volumes, apply_dshm_size
+from lib.generator.storage import (
+    apply_storage_volumes,
+    apply_dshm_size,
+    validate_infer_service_block_volume_devices,
+)
 from lib.generator.kv_conductor import normalize_kv_conductor_config
 from lib.generator.render import configure_render_sidecar
 
@@ -445,6 +449,7 @@ def generate_yaml_infer_service_set(input_yaml, output_file, user_config):
         _zero_engine_role_replicas(infer_doc, user_config, C.ROLE_UNION)
     _configure_kv_store_role(infer_doc, user_config)
     _configure_kv_conductor_role(infer_doc, user_config)
+    validate_infer_service_block_volume_devices(infer_doc)
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     write_yaml(all_docs, output_file, False)
     k8s_utils.g_generate_yaml_list.append(output_file)

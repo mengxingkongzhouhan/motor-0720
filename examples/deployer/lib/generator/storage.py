@@ -392,3 +392,50 @@ def apply_dshm_size(pod_spec, user_config):
         dshm_size,
         C.DSHM_VOLUME,
     )
+
+
+_BLOCK_VOLUME_SOURCES = (C.PERSISTENT_VOLUME_CLAIM, C.EPHEMERAL)
+
+
+def validate_pod_block_volume_devices(pod_spec, role_name=""):
+    """Reject volumeDevices backed by hostPath or any non-PVC/ephemeral source.
+
+    Kubernetes only allows PersistentVolumeClaim or ephemeral volumes in block
+    mode. A hostPath BlockDevice (for example ubsio-disk → /dev/loop0) makes
+    statefulset-controller fail with FailedCreate and leaves the Volcano
+    PodGroup empty (``0/0 tasks in gang unschedulable``).
+    """
+    if not isinstance(pod_spec, dict):
+        return
+    volumes = {
+        volume.get(C.NAME): volume
+        for volume in pod_spec.get(C.VOLUMES) or []
+        if isinstance(volume, dict) and volume.get(C.NAME)
+    }
+    where = f"role {role_name}" if role_name else "pod"
+    for container in pod_spec.get(C.CONTAINERS) or []:
+        if not isinstance(container, dict):
+            continue
+        for device in container.get(C.VOLUME_DEVICES) or []:
+            if not isinstance(device, dict):
+                continue
+            name = device.get(C.NAME)
+            volume = volumes.get(name) or {}
+            if any(source in volume for source in _BLOCK_VOLUME_SOURCES):
+                continue
+            source = "hostPath" if C.HOST_PATH in volume else "a non-PVC/ephemeral volume"
+            raise ValueError(
+                f"{where}: volumeDevices[{name!r}] uses {source}; Kubernetes block mode "
+                "only allows PersistentVolumeClaim or ephemeral. Mount hostPath "
+                f"{name!r} (e.g. /dev/loop0) with volumeMounts, or use a Block PVC."
+            )
+
+
+def validate_infer_service_block_volume_devices(infer_doc):
+    """Walk InferServiceSet roles and reject invalid block volumeDevices."""
+    roles = infer_doc.get(C.SPEC, {}).get(C.TEMPLATE, {}).get(C.ROLES, [])
+    for role in roles:
+        if not isinstance(role, dict):
+            continue
+        pod_spec = role.get(C.SPEC, {}).get(C.TEMPLATE, {}).get(C.SPEC, {})
+        validate_pod_block_volume_devices(pod_spec, role.get(C.NAME, ""))

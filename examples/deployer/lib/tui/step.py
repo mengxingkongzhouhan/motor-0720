@@ -421,9 +421,10 @@ def print_wait_diagnosis(name_space: str, engine_pods: list[tuple[str, str]], po
     print(f"  No engine pod exists in namespace '{name_space}'.")
     print("  Controller / coordinator / kv-store do not request NPU and use kube-scheduler.")
     print("  Prefill / decode / union InstanceSets need Infer Operator + Volcano + NPU.")
-    print("  If those InstanceSets already exist, the CR was created but pods were not;")
-    print("  Volcano '0/0 tasks in gang unschedulable' means the PodGroup is empty —")
-    print("  Infer Operator never created pods (often gang-schedule=true on a 1-pod instance).")
+    print("  If those InstanceSets already exist, the CR was created but pods were not.")
+    print("  Check StatefulSet FailedCreate first: volumeDevices + hostPath (e.g.")
+    print("  ubsio-disk /dev/loop0) is invalid — block mode allows PVC/ephemeral only.")
+    print("  Volcano '0/0 tasks in gang' is then a consequence of the empty PodGroup.")
     print("  Also check extra nodeSelector, queue capability, and *_pod_npu_num.")
     print("  encode/union/kv-conductor may exist with replicas=0.")
     if all_pods:
@@ -454,11 +455,16 @@ def print_wait_diagnosis(name_space: str, engine_pods: list[tuple[str, str]], po
             "custom-columns=NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas",
         ),
     )
+    _print_indented_block(
+        "StatefulSets:",
+        _kubectl_output("get", "sts", "-n", name_space, "--no-headers"),
+    )
     _print_indented_block("Volcano queues:", _kubectl_output("get", "queue", "--no-headers"))
     _print_indented_block(
         "Volcano podgroups:",
         _kubectl_output("get", "podgroup", "-n", name_space, "--no-headers"),
     )
+    print(f"  Describe engine STS: kubectl -n {name_space} describe sts vllm-0-prefill-0")
     print(f"  Describe engine InstanceSet: kubectl -n {name_space} describe instanceset vllm-0-prefill")
     print("  Check Infer Operator: kubectl -n mindx-dl logs deploy/infer-operator-manager --tail=200")
     print("  Check Volcano queue: kubectl get queue")

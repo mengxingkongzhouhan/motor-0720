@@ -242,6 +242,8 @@ ENV_MODEL_NAME = "MODEL_NAME"
 
 VOLUMES = "volumes"
 VOLUME_MOUNTS = "volumeMounts"
+VOLUME_DEVICES = "volumeDevices"
+EPHEMERAL = "ephemeral"
 PATH = "path"
 WEIGHT_MOUNT_PATH = "weight_mount_path"
 

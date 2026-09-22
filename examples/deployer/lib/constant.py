@@ -152,6 +152,14 @@ HARDWARE_TYPE_800T_A3 = "800T_A3"
 # Group by chip generation — both 800I and 800T variants share the same accelerator labels
 HARDWARE_TYPE_A2 = {HARDWARE_TYPE_800I_A2, HARDWARE_TYPE_800T_A2}
 HARDWARE_TYPE_A3 = {HARDWARE_TYPE_800I_A3, HARDWARE_TYPE_800T_A3}
+# Cards on one node. Engine *_pod_npu_num is a per-pod request; Volcano / Infer
+# Operator will not create the pod if this exceeds what a single node can grant.
+HARDWARE_CARDS_PER_NODE = {
+    HARDWARE_TYPE_800I_A2: 8,
+    HARDWARE_TYPE_800T_A2: 8,
+    HARDWARE_TYPE_800I_A3: 16,
+    HARDWARE_TYPE_800T_A3: 16,
+}
 HARDWARE_TYPE_950I_A5 = [
     "350-Atlas-8",
     "350-Atlas-16",
@@ -234,6 +242,8 @@ ENV_MODEL_NAME = "MODEL_NAME"
 
 VOLUMES = "volumes"
 VOLUME_MOUNTS = "volumeMounts"
+VOLUME_DEVICES = "volumeDevices"
+EPHEMERAL = "ephemeral"
 PATH = "path"
 WEIGHT_MOUNT_PATH = "weight_mount_path"
 
@@ -382,6 +392,7 @@ CONTROLLER_OBSERVABILITY_NODE_PORT = "controller_observability_node_port"
 NODEPORT_CONFLICT_COORDINATOR_FILE = "nodeport_conflict_coordinator.txt"
 NODEPORT_CONFLICT_CONTROLLER_FILE = "nodeport_conflict_controller.txt"
 VOLCANO_QUEUE_ANNOTATION = "scheduling.volcano.sh/queue-name"
+GANG_SCHEDULE_LABEL = "infer.huawei.com/gang-schedule"
 
 # Docker-only create templates (examples/deployer/docker_deploy.py --create / one-click).
 # Edit these literals to change host devices and binds. Do not add --rm.

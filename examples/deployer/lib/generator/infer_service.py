@@ -53,7 +53,11 @@ from lib.generator.kv_cache_store import (
     normalize_kv_cache_store_config,
     gen_kv_store_env,
 )
-from lib.generator.storage import apply_storage_volumes, apply_dshm_size
+from lib.generator.storage import (
+    apply_storage_volumes,
+    apply_dshm_size,
+    validate_infer_service_block_volume_devices,
+)
 from lib.generator.kv_conductor import normalize_kv_conductor_config
 from lib.generator.render import configure_render_sidecar
 
@@ -236,6 +240,7 @@ def _configure_engine_role(infer_doc, user_config, infer_name, role_name):
     role[C.REPLICAS] = total_instances
     workload_spec = role.setdefault(C.SPEC, {})
     workload_spec[C.REPLICAS] = single_instance
+    _set_engine_gang_schedule(role, single_instance)
     selector = workload_spec.setdefault(C.SELECTOR, {}).setdefault(C.MATCHLABELS, {})
     selector[C.APP] = infer_name
     template = workload_spec.setdefault(C.TEMPLATE, {})
@@ -255,6 +260,14 @@ def _configure_engine_role(infer_doc, user_config, infer_name, role_name):
         build_engine_env_items(env_role, deploy_config, job_name_base, include_kv_store=True),
     )
     npu_num = int(deploy_config.get(npu_key, 1))
+    logger.info(
+        "Configured InferServiceSet role %s: role.replicas=%s (instances), "
+        "spec.replicas=%s (pods/instance), npu=%s",
+        role_name,
+        total_instances,
+        single_instance,
+        npu_num,
+    )
     set_container_npu(container, npu_num, deploy_config)
     weight_path = deploy_config.get(C.WEIGHT_MOUNT_PATH, C.DEFAULT_WEIGHT_MOUNT_PATH)
     set_weight_mount(pod_spec, container, weight_path)
@@ -264,6 +277,26 @@ def _configure_engine_role(infer_doc, user_config, infer_name, role_name):
     _apply_infer_node_selector_and_sp_block(deploy_config, pod_spec, template, pods_key, npu_key, role_name)
     apply_engine_node_selector_overrides(pod_spec, deploy_config, prefix)
     k8s_utils.apply_additional_labels_annotations(role, user_config.get(get_config_key(role_name), {}))
+
+
+def _set_engine_gang_schedule(role, single_instance):
+    """Keep gang-schedule only when one instance spans multiple pods.
+
+    Infer Operator + Volcano create a PodGroup first when
+    ``infer.huawei.com/gang-schedule=true``. Volcano then waits for
+    ``minAvailable`` pods (``0/0 tasks in gang unschedulable``). For a
+    single-pod instance that deadlock never creates prefill/decode pods.
+    """
+    labels = role.setdefault(C.METADATA, {}).setdefault(C.LABELS, {})
+    enabled = int(single_instance) > 1
+    labels[C.GANG_SCHEDULE_LABEL] = "true" if enabled else "false"
+    logger.info(
+        "Set %s=%s for role %s (spec.replicas=%s)",
+        C.GANG_SCHEDULE_LABEL,
+        labels[C.GANG_SCHEDULE_LABEL],
+        role.get(C.NAME),
+        single_instance,
+    )
 
 
 def _set_role_primary_service_port(role, service_port):
@@ -416,6 +449,7 @@ def generate_yaml_infer_service_set(input_yaml, output_file, user_config):
         _zero_engine_role_replicas(infer_doc, user_config, C.ROLE_UNION)
     _configure_kv_store_role(infer_doc, user_config)
     _configure_kv_conductor_role(infer_doc, user_config)
+    validate_infer_service_block_volume_devices(infer_doc)
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     write_yaml(all_docs, output_file, False)
     k8s_utils.g_generate_yaml_list.append(output_file)

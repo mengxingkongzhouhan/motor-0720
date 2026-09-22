@@ -56,6 +56,7 @@ from lib.config_validator import (
     validate_pd_hybrid_config,
     validate_pd_hybrid_infer_service_template,
     validate_node_selectors,
+    validate_pod_npu_against_hardware,
     validate_reserved_labels,
 )
 
@@ -460,6 +461,7 @@ def main():
         paths = get_deploy_paths()
         validate_pd_hybrid_infer_service_template(user_config, paths["infer_service_input_yaml"])
     validate_instance_nums(user_config)
+    validate_pod_npu_against_hardware(user_config.get(C.MOTOR_DEPLOY_CONFIG, {}))
 
     if args.update_config:
         handle_update_config(user_config)

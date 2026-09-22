@@ -223,42 +223,185 @@ def _get_hardware_node_labels(hardware_type):
     raise ValueError(f"Unknown hardware_type '{hardware_type}'. Supported values: {known}")
 
 
-def _validate_node_labels_exist(labels, node_desc):
-    """Assert that at least one node in the cluster matches ALL given labels (AND).
+# Engine templates only tolerate these taints; control-plane NoSchedule is not among them.
+_ENGINE_TOLERATED_TAINT_KEYS = {
+    "node.kubernetes.io/not-ready",
+    "node.kubernetes.io/unreachable",
+}
+_BLOCKING_TAINT_EFFECTS = {"NoSchedule", "NoExecute"}
 
-    Args:
-        labels: dict of label key -> value that must all be present on a single node.
-        node_desc: human-readable description for error messages (e.g. "prefill(P)").
-    """
-    if not labels:
-        return
+
+def _npu_resource_name(hardware_type):
+    if hardware_type in C.HARDWARE_TYPE_950I_A5:
+        return C.ASCEND_950_NPU_NUM
+    return C.ASCEND_910_NPU_NUM
+
+
+def _pod_npu_request(deploy_config, npu_key, default=1):
+    if npu_key not in deploy_config:
+        return default
+    try:
+        return int(deploy_config[npu_key])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{npu_key} must be an integer, got {deploy_config[npu_key]!r}") from exc
+
+
+def _taint_blocks_engine(taint):
+    if not isinstance(taint, dict):
+        return False
+    if taint.get("effect") not in _BLOCKING_TAINT_EFFECTS:
+        return False
+    return taint.get("key") not in _ENGINE_TOLERATED_TAINT_KEYS
+
+
+def _node_blocking_taints(node):
+    return [taint for taint in (node.get("spec") or {}).get("taints") or [] if _taint_blocks_engine(taint)]
+
+
+def _node_allocatable_npu(node, resource_name):
+    raw = ((node.get("status") or {}).get("allocatable") or {}).get(resource_name, 0)
+    try:
+        return int(str(raw).split(".")[0])
+    except (TypeError, ValueError):
+        return 0
+
+
+def _node_name(node):
+    return (node.get("metadata") or {}).get("name", "<unknown>")
+
+
+def _get_matching_nodes(labels, node_desc):
+    """Return node objects matching ALL labels. Raises if kubectl fails or none match."""
     label_selector = ",".join(f"{k}={v}" for k, v in labels.items())
     kubectl = shutil.which("kubectl")
     if kubectl is None:
         raise RuntimeError("kubectl not found in PATH")
     try:
         result = subprocess.run(
-            [kubectl, "get", "nodes", "-l", label_selector, "-o", "name"],
+            [kubectl, "get", "nodes", "-l", label_selector, "-o", "json"],
             capture_output=True,
             text=True,
             check=False,
         )
     except Exception as e:
-        raise RuntimeError(f"Failed to query cluster nodes for {node_desc} with labels {labels}: {e}")
+        raise RuntimeError(f"Failed to query cluster nodes for {node_desc} with labels {labels}: {e}") from e
 
     if result.returncode != 0:
         raise RuntimeError(
             f"kubectl get nodes failed for {node_desc} with labels {labels}. stderr: {result.stderr.strip()}"
         )
 
-    nodes = [line for line in result.stdout.strip().split("\n") if line]
-    if not nodes:
+    try:
+        items = (json.loads(result.stdout or "{}") or {}).get("items") or []
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"kubectl get nodes returned invalid JSON for {node_desc}: {exc}") from exc
+
+    if not items:
         raise RuntimeError(
             f"No node in cluster matches nodeSelector for {node_desc}: {labels}. "
             f"Please ensure suitable nodes are labeled correctly."
         )
+    return items
 
-    logger.info(f"Node selector validated for {node_desc}: {labels} -> {len(nodes)} node(s) found")
+
+def _validate_nodes_schedulable_for_engine(nodes, node_desc, labels, npu_num, npu_resource):
+    """Reject label matches that Volcano still cannot use (taints / allocatable NPU)."""
+    schedulable = []
+    tainted = []
+    short_npu = []
+    for node in nodes:
+        name = _node_name(node)
+        blocking = _node_blocking_taints(node)
+        if blocking:
+            keys = ",".join(str(taint.get("key")) for taint in blocking)
+            tainted.append(f"{name}({keys})")
+            continue
+        allocatable = _node_allocatable_npu(node, npu_resource)
+        if npu_num and allocatable < npu_num:
+            short_npu.append(f"{name}({npu_resource}={allocatable}<{npu_num})")
+            continue
+        schedulable.append(name)
+
+    if schedulable:
+        logger.info(
+            "Node selector validated for %s: %s -> %s schedulable node(s): %s",
+            node_desc,
+            labels,
+            len(schedulable),
+            schedulable,
+        )
+        return schedulable
+
+    details = []
+    if tainted:
+        details.append(f"tainted (engine pods have no toleration): {', '.join(tainted)}")
+    if short_npu:
+        details.append(f"insufficient allocatable NPU: {', '.join(short_npu)}")
+    raise RuntimeError(
+        f"Nodes match nodeSelector for {node_desc}: {labels}, but none can schedule the engine pod. "
+        + "; ".join(details)
+        + ". Control-plane taints or pinning prefill+decode (8+8 NPU) onto one 8-card node "
+        "will make Infer Operator / Volcano create InstanceSets without pods."
+    )
+
+
+def _validate_node_labels_exist(labels, node_desc, npu_num=None, npu_resource=None):
+    """Assert that at least one node matches labels and can run an engine pod."""
+    if not labels:
+        return []
+    nodes = _get_matching_nodes(labels, node_desc)
+    if npu_num is None:
+        names = [_node_name(node) for node in nodes]
+        logger.info(f"Node selector validated for {node_desc}: {labels} -> {len(nodes)} node(s) found")
+        return names
+    return _validate_nodes_schedulable_for_engine(nodes, node_desc, labels, npu_num, npu_resource)
+
+
+def cards_per_node_for_hardware(hardware_type):
+    """Return cards-per-node for a known hardware_type, or None if unknown."""
+    return C.HARDWARE_CARDS_PER_NODE.get(hardware_type)
+
+
+def validate_pod_npu_against_hardware(deploy_config):
+    """Reject per-pod NPU requests that no single node of this hardware can grant.
+
+    InferServiceSet engine roles request ``huawei.com/Ascend910`` (or A5 NPU)
+    on one pod. If ``p_pod_npu_num`` / ``d_pod_npu_num`` / ``hybrid_pod_npu_num``
+    exceeds the cards on one node, Infer Operator + Volcano never create the
+    engine pods — only controller / coordinator / kv-store come up.
+    """
+    if not isinstance(deploy_config, dict):
+        return
+    hardware_type = deploy_config.get(C.HARDWARE_TYPE)
+    cards = cards_per_node_for_hardware(hardware_type)
+    if cards is None:
+        return
+
+    npu_keys = (C.P_POD_NPU_NUM, C.D_POD_NPU_NUM, C.E_POD_NPU_NUM, C.HYBRID_POD_NPU_NUM)
+    for key in npu_keys:
+        if key not in deploy_config:
+            continue
+        try:
+            npu_num = int(deploy_config[key])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must be an integer, got {deploy_config[key]!r}") from exc
+        if npu_num > cards:
+            raise ValueError(
+                f"{key}={npu_num} exceeds cards per node ({cards}) for hardware_type={hardware_type}. "
+                "Each engine pod requests this many NPU on a single node; Infer Operator / Volcano "
+                "will not create prefill/decode/union pods. Use a smaller *_pod_npu_num or split "
+                "the instance across nodes with single_*_instance_pod_num."
+            )
+
+
+def _node_selector_override(deploy_config, selector_key):
+    """Return user-defined nodeSelector extras for *selector_key*, or {}."""
+    selector = deploy_config.get(selector_key, {})
+    if not selector:
+        return {}
+    if not isinstance(selector, dict):
+        raise ValueError(f"{C.MOTOR_DEPLOY_CONFIG}.{selector_key} must be a JSON object")
+    return {key: value for key, value in selector.items() if key}
 
 
 def validate_node_selectors(deploy_config):
@@ -267,20 +410,47 @@ def validate_node_selectors(deploy_config):
     Always validates base hardware labels (accelerator-type, accelerator).
     When PD heterogeneous deployment is enabled, additionally validates the
     combined prefill/decode labels per node type.
+    Custom ``prefill_node_selector`` / ``decode_node_selector`` are AND-merged
+    into the same check — validating only hardware labels would pass while
+    Volcano still cannot create engine pods.
     """
     hardware_type = deploy_config.get(C.HARDWARE_TYPE)
     base_labels = _get_hardware_node_labels(hardware_type)
+    prefill_override = _node_selector_override(deploy_config, C.PREFILL_NODE_SELECTOR)
+    decode_override = _node_selector_override(deploy_config, C.DECODE_NODE_SELECTOR)
+    npu_resource = _npu_resource_name(hardware_type)
+    p_npu = _pod_npu_request(deploy_config, C.P_POD_NPU_NUM)
+    d_npu = _pod_npu_request(deploy_config, C.D_POD_NPU_NUM)
 
     pd_config = _get_pd_heterogeneous_config(deploy_config)
 
     if pd_config is not None:
         label_key = pd_config["label_key"]
-        prefill_labels = {**base_labels, label_key: pd_config["prefill_value"]}
-        decode_labels = {**base_labels, label_key: pd_config["decode_value"]}
-        _validate_node_labels_exist(prefill_labels, "prefill(P)")
-        _validate_node_labels_exist(decode_labels, "decode(D)")
+        prefill_labels = {**base_labels, label_key: pd_config["prefill_value"], **prefill_override}
+        decode_labels = {**base_labels, label_key: pd_config["decode_value"], **decode_override}
+        _validate_node_labels_exist(prefill_labels, "prefill(P)", p_npu, npu_resource)
+        _validate_node_labels_exist(decode_labels, "decode(D)", d_npu, npu_resource)
         logger.info(
             f"PD heterogeneous node selectors validated: prefill -> {prefill_labels}, decode -> {decode_labels}"
         )
-    else:
-        _validate_node_labels_exist(base_labels, "engine")
+        return
+
+    if prefill_override or decode_override:
+        prefill_labels = {**base_labels, **prefill_override}
+        decode_labels = {**base_labels, **decode_override}
+        prefill_nodes = _validate_node_labels_exist(prefill_labels, "prefill(P)", p_npu, npu_resource)
+        decode_nodes = _validate_node_labels_exist(decode_labels, "decode(D)", d_npu, npu_resource)
+        if prefill_labels == decode_labels and prefill_nodes == decode_nodes and len(prefill_nodes) == 1:
+            items = _get_matching_nodes(prefill_labels, "prefill+decode")
+            schedulable = [node for node in items if _node_name(node) in prefill_nodes]
+            allocatable = max((_node_allocatable_npu(node, npu_resource) for node in schedulable), default=0)
+            if p_npu + d_npu > allocatable:
+                raise RuntimeError(
+                    f"prefill ({p_npu}) + decode ({d_npu}) NPU requests exceed allocatable "
+                    f"{npu_resource}={allocatable} on the only matching node {prefill_nodes[0]} "
+                    f"for nodeSelector {prefill_labels}. Pin each role to a different worker, "
+                    f"or drop the extra nodeSelector."
+                )
+        return
+
+    _validate_node_labels_exist(base_labels, "engine", max(p_npu, d_npu), npu_resource)

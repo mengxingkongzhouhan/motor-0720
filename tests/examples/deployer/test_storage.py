@@ -23,6 +23,8 @@ from lib.generator.storage import (  # noqa: E402
     build_storage_pvc_docs,
     apply_storage_volumes,
     apply_dshm_size,
+    validate_pod_block_volume_devices,
+    validate_infer_service_block_volume_devices,
 )
 
 PVC_TEMPLATE = str(DEPLOYER_ROOT / "yaml_template" / "storage_pvc_template.yaml")
@@ -436,3 +438,63 @@ def test_apply_dshm_size_warns_when_no_dshm_volume(caplog):
         apply_dshm_size(pod_spec, _uc(dshm="128Gi"))
     assert pod_spec["volumes"] == [{"name": "other", "emptyDir": {}}]
     assert any("dshm" in record.message for record in caplog.records)
+
+
+def test_validate_pod_block_volume_devices_rejects_hostpath():
+    pod_spec = {
+        "containers": [
+            {
+                "name": "vllm",
+                "volumeDevices": [{"name": "ubsio-disk", "devicePath": "/dev/loop0"}],
+            }
+        ],
+        "volumes": [
+            {
+                "name": "ubsio-disk",
+                "hostPath": {"path": "/dev/loop0", "type": "BlockDevice"},
+            }
+        ],
+    }
+    with pytest.raises(ValueError, match="volumeDevices\\['ubsio-disk'\\] uses hostPath"):
+        validate_pod_block_volume_devices(pod_spec, "prefill")
+
+
+def test_validate_pod_block_volume_devices_allows_pvc():
+    pod_spec = {
+        "containers": [
+            {"name": "vllm", "volumeDevices": [{"name": "ssd", "devicePath": "/dev/xvda"}]}
+        ],
+        "volumes": [{"name": "ssd", "persistentVolumeClaim": {"claimName": "ssd-block"}}],
+    }
+    validate_pod_block_volume_devices(pod_spec, "prefill")
+
+
+def test_validate_infer_service_block_volume_devices_scans_roles():
+    infer_doc = {
+        "spec": {
+            "template": {
+                "roles": [
+                    {
+                        "name": "prefill",
+                        "spec": {
+                            "template": {
+                                "spec": {
+                                    "containers": [
+                                        {
+                                            "name": "vllm",
+                                            "volumeDevices": [{"name": "ubsio-disk"}],
+                                        }
+                                    ],
+                                    "volumes": [
+                                        {"name": "ubsio-disk", "hostPath": {"path": "/dev/loop0"}}
+                                    ],
+                                }
+                            }
+                        },
+                    }
+                ]
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="role prefill"):
+        validate_infer_service_block_volume_devices(infer_doc)

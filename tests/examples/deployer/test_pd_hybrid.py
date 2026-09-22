@@ -468,6 +468,7 @@ def test_generate_yaml_infer_service_set_configures_union_for_hybrid(tmp_path, m
     assert union_role[C.REPLICAS] == 1
     assert prefill_role[C.REPLICAS] == 0
     assert decode_role[C.REPLICAS] == 0
+    assert union_role[C.METADATA][C.LABELS][C.GANG_SCHEDULE_LABEL] == "false"
     container = union_role[C.SPEC][C.TEMPLATE][C.SPEC][C.CONTAINERS][0]
     env = {item[C.NAME]: item[C.VALUE] for item in container[C.ENV] if C.VALUE in item}
     assert env[C.ENV_ROLE] == C.ROLE_UNION
@@ -495,6 +496,28 @@ def test_generate_yaml_infer_service_set_zeros_union_for_pd_separation(tmp_path,
     assert union_role[C.REPLICAS] == 0
     assert prefill_role[C.REPLICAS] == 1
     assert decode_role[C.REPLICAS] == 1
+    assert prefill_role[C.METADATA][C.LABELS][C.GANG_SCHEDULE_LABEL] == "false"
+    assert decode_role[C.METADATA][C.LABELS][C.GANG_SCHEDULE_LABEL] == "false"
+
+
+def test_generate_yaml_infer_service_set_enables_gang_schedule_for_multi_pod_instance(tmp_path, monkeypatch):
+    user_config = make_pd_separation_user_config()
+    user_config[C.MOTOR_DEPLOY_CONFIG][C.SINGER_P_INSTANCES_NUM] = 2
+    user_config[C.MOTOR_DEPLOY_CONFIG][C.SINGER_D_INSTANCES_NUM] = 1
+    paths = make_deploy_paths(tmp_path)
+    k8s_utils.g_generate_yaml_list = []
+    monkeypatch.setattr(k8s_utils, "g_controller_service", "ctrl.pd-separate.svc.cluster.local")
+    monkeypatch.setattr(k8s_utils, "g_coordinator_service", "coord.pd-separate.svc.cluster.local")
+
+    generate_yaml_infer_service_set(
+        paths["infer_service_input_yaml"],
+        paths["infer_service_output_yaml"],
+        user_config,
+    )
+
+    infer_doc = _find_infer_service_set_doc(load_yaml(paths["infer_service_output_yaml"], False))
+    assert get_infer_role(infer_doc, C.ROLE_PREFILL)[C.METADATA][C.LABELS][C.GANG_SCHEDULE_LABEL] == "true"
+    assert get_infer_role(infer_doc, C.ROLE_DECODE)[C.METADATA][C.LABELS][C.GANG_SCHEDULE_LABEL] == "false"
 
 
 def test_update_infer_service_replicas_only_updates_union_for_hybrid(tmp_path):

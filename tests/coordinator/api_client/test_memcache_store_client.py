@@ -10,10 +10,12 @@
 
 """Tests for coordinator-side MemCache SSD→DRAM prefetch."""
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
+from motor.coordinator.api_client import memcache_store_client as mmc
 from motor.coordinator.api_client.memcache_store_client import MemcacheStoreClient
 
 
@@ -140,3 +142,100 @@ def test_connect_fails_when_init_returns_error(monkeypatch):
 
     with patch.dict(sys.modules, {"memcache_hybrid": hybrid}):
         assert MemcacheStoreClient._connect() is None
+
+
+def test_host_from_meta_url_ipv4_and_ipv6():
+    assert mmc._host_from_meta_url("tcp://kv_store_service:50088") == "kv_store_service"
+    assert mmc._host_from_meta_url("tcp://[fd00::1]:50088") == "fd00::1"
+    assert mmc._host_from_meta_url(None) == ""
+
+
+def test_resolve_kv_store_ips_prefers_k8s_pod_ip():
+    with patch.object(mmc, "_k8s_kv_store_pod_ips", return_value=("10.20.0.8",)):
+        assert MemcacheStoreClient._resolve_kv_store_ips("tcp://mindie-motor-kvs-master:50088") == (
+            "10.20.0.8",
+        )
+
+
+def test_resolve_kv_store_ips_uses_literal_when_no_k8s():
+    with patch.object(mmc, "_k8s_kv_store_pod_ips", return_value=()):
+        assert MemcacheStoreClient._resolve_kv_store_ips("tcp://10.0.0.3:50088") == ("10.0.0.3",)
+        assert MemcacheStoreClient._resolve_kv_store_ips("tcp://[2001:db8::9]:50088") == ("2001:db8::9",)
+
+
+def test_resolve_kv_store_ips_falls_back_to_dns():
+    with (
+        patch.object(mmc, "_k8s_kv_store_pod_ips", return_value=()),
+        patch.object(mmc, "_dns_ips", return_value=("10.96.1.15",)) as dns,
+    ):
+        assert MemcacheStoreClient._resolve_kv_store_ips("tcp://mindie-motor-kvs-master:50088") == (
+            "10.96.1.15",
+        )
+        dns.assert_called_once_with("mindie-motor-kvs-master")
+
+
+def test_running_pod_ips_filters_label_and_name():
+    pods = SimpleNamespace(
+        items=[
+            SimpleNamespace(
+                metadata=SimpleNamespace(name="vllm-0-kv-store-0-5785989568-kgtsq"),
+                status=SimpleNamespace(phase="Running", pod_ip="10.20.0.8"),
+            ),
+            SimpleNamespace(
+                metadata=SimpleNamespace(name="vllm-0-coordinator-0"),
+                status=SimpleNamespace(phase="Running", pod_ip="10.20.0.9"),
+            ),
+            SimpleNamespace(
+                metadata=SimpleNamespace(name="vllm-0-kv-store-0-old"),
+                status=SimpleNamespace(phase="Succeeded", pod_ip="10.20.0.7"),
+            ),
+        ]
+    )
+    assert mmc._running_pod_ips(pods) == ("10.20.0.8", "10.20.0.9")
+    assert mmc._running_pod_ips(pods, name_substr="kv-store") == ("10.20.0.8",)
+
+
+def test_k8s_kv_store_pod_ips_skips_without_token(monkeypatch, tmp_path):
+    monkeypatch.setattr(mmc, "_SA_TOKEN_PATH", str(tmp_path / "missing-token"))
+    monkeypatch.setenv("POD_NAMESPACE", "mindie-motor")
+    assert mmc._k8s_kv_store_pod_ips() == ()
+
+
+def test_k8s_kv_store_pod_ips_uses_label_then_name(monkeypatch, tmp_path):
+    token = tmp_path / "token"
+    token.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(mmc, "_SA_TOKEN_PATH", str(token))
+    monkeypatch.setenv("POD_NAMESPACE", "mindie-motor")
+
+    labeled = SimpleNamespace(items=[])
+    named = SimpleNamespace(
+        items=[
+            SimpleNamespace(
+                metadata=SimpleNamespace(name="vllm-0-kv-store-0-5785989568-kgtsq"),
+                status=SimpleNamespace(phase="Running", pod_ip="10.20.0.8"),
+            )
+        ]
+    )
+    v1 = Mock()
+    v1.list_namespaced_pod.side_effect = [labeled, named]
+    kube = Mock()
+    kube.config.load_incluster_config = Mock()
+    kube.client.CoreV1Api.return_value = v1
+
+    with patch.dict("sys.modules", {"kubernetes": kube, "kubernetes.client": kube.client, "kubernetes.config": kube.config}):
+        assert mmc._k8s_kv_store_pod_ips() == ("10.20.0.8",)
+    assert v1.list_namespaced_pod.call_args_list[0].args[0] == "mindie-motor"
+    assert v1.list_namespaced_pod.call_args_list[0].kwargs["label_selector"] == "app=mindie-motor-kv-store"
+
+
+@patch.object(MemcacheStoreClient, "_is_memcache_backend", return_value=True)
+def test_prefetch_failed_log_includes_kv_store_ip(_mock_backend, caplog):
+    store = Mock()
+    store.prefetch.return_value = 7
+    MemcacheStoreClient._store = store
+    MemcacheStoreClient._meta_url = "tcp://mindie-motor-kvs-master:50088"
+    MemcacheStoreClient._kv_store_ips = ("10.20.0.8",)
+    with caplog.at_level("WARNING"):
+        assert MemcacheStoreClient.prefetch_disk_blocks([201]) is False
+    assert "kv_store_ip=10.20.0.8" in caplog.text
+    assert "url=tcp://mindie-motor-kvs-master:50088" in caplog.text

@@ -33,6 +33,7 @@ from motor.coordinator.domain.request_manager import RequestManager
 from motor.coordinator.process.base import BaseProcessManager
 from motor.coordinator.process.utils import set_process_title
 from motor.coordinator.scheduler.policy.kv_cache_affinity import TokenizerManager
+from motor.coordinator.scheduler.policy.smetric_gated import SMetricTokenizer
 
 logger = get_logger(__name__)
 
@@ -188,6 +189,8 @@ def run_inference_worker_proc(
 
     # init TokenizerManager
     TokenizerManager(config)
+    if config.scheduler_config.uses_smetric_gated():
+        SMetricTokenizer(config)
 
     # Get the inference app and configure uvicorn
     app = inference_server.app

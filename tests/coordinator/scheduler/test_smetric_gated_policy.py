@@ -28,12 +28,14 @@ from motor.coordinator.scheduler import allocate_arbitration
 from motor.coordinator.scheduler.allocate_arbitration import ArbitrationContext
 from motor.coordinator.scheduler.policy.factory import create
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
+from motor.common.utils.singleton import ThreadSafeSingleton
 from motor.coordinator.scheduler.policy.smetric_gated import (
     PICK_ACTIVE_GATE,
     PICK_BOTH_GATES,
     PICK_MIN_LEDGER_PREFILL,
     GatedCandidate,
     SMetricGatedPolicy,
+    SMetricTokenizer,
     _cpu_hit_blocks,
     pick_gated,
     sort_candidates,
@@ -170,6 +172,22 @@ class TestCpuHitLedger:
         change, role = await handler.compute_and_update(resource, "req", WorkloadAction.RELEASE_TOKENS, _req_info())
         assert role == PDRole.ROLE_P
         assert (change.active_tokens, change.prefill_cost, change.cpu_hit_blocks) == (-10, -4, -3)
+
+
+class TestSMetricTokenizer:
+    def setup_method(self):
+        ThreadSafeSingleton._instances.pop(SMetricTokenizer, None)
+
+    def teardown_method(self):
+        ThreadSafeSingleton._instances.pop(SMetricTokenizer, None)
+
+    def test_encode_without_model_returns_empty(self):
+        assert SMetricTokenizer().encode("hello") == []
+
+    def test_is_not_kv_affinity_tokenizer(self):
+        from motor.coordinator.scheduler.policy.kv_cache_affinity import TokenizerManager
+
+        assert SMetricTokenizer is not TokenizerManager
 
 
 class TestConductorParsing:
@@ -378,12 +396,30 @@ class TestPolicy:
         assert SMetricGatedPolicy.score_endpoints([_instance(1, [_endpoint(10)])], _req_info()) is None
 
     @patch("motor.coordinator.scheduler.policy.smetric_gated.ConductorApiClient.query_conductor")
-    def test_missing_token_ids_does_not_import_tokenizer_and_returns_none(self, mock_query):
+    def test_missing_prompt_skips_conductor(self, mock_query):
         req_info = _req_info()
         req_info.token_ids = None
         req_info.engine_token_ids = None
+        req_info.req_data = {}
         assert SMetricGatedPolicy.score_endpoints([_instance(1, [_endpoint(10)])], req_info) is None
         mock_query.assert_not_called()
+
+    @patch("motor.coordinator.scheduler.policy.smetric_gated.SMetricTokenizer")
+    @patch("motor.coordinator.scheduler.policy.smetric_gated.ConductorApiClient.query_conductor")
+    def test_local_tokenizer_used_when_token_ids_missing(self, mock_query, mock_tok_cls):
+        inst = _instance(1, [_endpoint(10)])
+        req_info = _req_info()
+        req_info.token_ids = None
+        req_info.engine_token_ids = None
+        req_info.req_data = {"messages": [{"role": "user", "content": "hi"}]}
+        mock_tok_cls.return_value.apply_chat_template.return_value = list(range(8))
+        mock_query.return_value = _conductor_tenant(inst, dp={(1, 10): 0})
+
+        ranked = SMetricGatedPolicy.score_endpoints([inst], req_info)
+
+        mock_tok_cls.return_value.apply_chat_template.assert_called_once()
+        assert mock_query.call_args.args[1] == list(range(8))
+        assert ranked[0].prefill_cost == 8.0
 
     @patch("motor.coordinator.scheduler.policy.smetric_gated.ConductorApiClient.query_conductor")
     def test_prefers_engine_token_ids_over_token_ids(self, mock_query):

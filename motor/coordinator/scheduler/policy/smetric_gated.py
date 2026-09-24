@@ -38,20 +38,32 @@ when this policy is set on decode.
 
 from __future__ import annotations
 
+import json
+import os
+import threading
+import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from motor.common.logger import get_logger
 from motor.common.resources.endpoint import Endpoint
 from motor.common.resources.instance import Instance, PDRole
+from motor.common.utils.singleton import ThreadSafeSingleton
+from motor.config.coordinator import CoordinatorConfig, SchedulerConfig
 from motor.coordinator.api_client.conductor_api_client import (
     TENANT_ID,
     ConductorApiClient,
     conductor_instance_id,
 )
 from motor.coordinator.domain import InstanceProvider
-from motor.coordinator.models.constants import DEFAULT_REQUEST_ID
+from motor.coordinator.models.constants import DEFAULT_REQUEST_ID, OpenAIField
 from motor.coordinator.models.request import RequestInfo
 from motor.coordinator.scheduler.policy.base import BaseSchedulingPolicy
+from motor.coordinator.scheduler.policy.utils import (
+    preprocess_input,
+    preprocess_messages_for_dsv4,
+    preprocess_messages_for_standard,
+)
 
 logger = get_logger(__name__)
 
@@ -60,6 +72,7 @@ SMETRIC_GATED_ROLES = frozenset({PDRole.ROLE_P, PDRole.ROLE_U})
 
 # Gate threshold = candidate mean * factor; 1.0 is the plain average.
 DEFAULT_MEAN_FACTOR = 1.0
+_TOKENIZER_LOAD_RETRY_SECONDS = 30.0
 
 # SMetric discounts a cached prefix 1:1 against prompt length. Not configurable; not shared with
 # kv_cache_affinity's overlap_credit knob.
@@ -82,19 +95,227 @@ PICK_ACTIVE_GATE = "active_gate"
 PICK_MIN_LEDGER_PREFILL = "min_ledger_prefill"
 
 
-def _prompt_token_ids(req_info: RequestInfo) -> list[int]:
-    """Read token ids already cached on the request. Do not tokenize here.
+class SMetricTokenizer(ThreadSafeSingleton):
+    """Tokenizer owned by smetric_gated. Does not import other scheduling policies."""
 
-    Ingress / Render fills ``engine_token_ids`` or ``token_ids`` before scheduling.
-    This policy must not import another scheduling policy (e.g. TokenizerManager).
-    """
+    def __init__(self, config: CoordinatorConfig | None = None):
+        if hasattr(self, "_initialized"):
+            return
+        self._initialized = True
+        self.config_lock = threading.RLock()
+        if config is None:
+            config = CoordinatorConfig()
+
+        self.tokenizer = None
+        self._is_dsv4 = False
+        self._next_load_attempt_at = 0.0
+        scheduler_config = getattr(config, "scheduler_config", None)
+        kv_config = getattr(scheduler_config, "kv_conductor_config", None) if scheduler_config else None
+        if kv_config is None:
+            kv_config = getattr(config, "prefill_kv_event_config", None)
+        self.model_path = getattr(kv_config, "model_path", "") if kv_config else ""
+        self.engine_type = str(getattr(kv_config, "engine_type", "vllm") or "vllm").strip().lower()
+        self.openai_standard = os.environ.get("OPENAI_STANDARD", "STANDARD")
+        smetric_enabled = isinstance(scheduler_config, SchedulerConfig) and scheduler_config.uses_smetric_gated()
+        os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+        if smetric_enabled:
+            self.get_tokenizer()
+        logger.info(
+            "SMetricTokenizer init.(model_path:%s, is_dsv4:%s, lazy_load:%s)",
+            self.model_path,
+            self._is_dsv4,
+            not smetric_enabled,
+        )
+
+    def get_tokenizer(self):
+        """Load the local tokenizer lazily and retry transient failures after a cooldown."""
+        if self.tokenizer is not None:
+            return self.tokenizer
+        if time.monotonic() < self._next_load_attempt_at:
+            return None
+        with self.config_lock:
+            if self.tokenizer is not None:
+                return self.tokenizer
+            if time.monotonic() < self._next_load_attempt_at:
+                return None
+            if not getattr(self, "model_path", ""):
+                return None
+            try:
+                if self.engine_type == "vllm" and self._is_deepseek_v4_model(self.model_path):
+                    from vllm.tokenizers.deepseek_v4 import DeepseekV4Tokenizer  # pylint: disable=import-error,no-name-in-module
+
+                    self.tokenizer = DeepseekV4Tokenizer.from_pretrained(self.model_path, trust_remote_code=True)
+                    self._is_dsv4 = True
+                else:
+                    from transformers import AutoTokenizer
+
+                    self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
+            except Exception as exc:
+                self._next_load_attempt_at = time.monotonic() + _TOKENIZER_LOAD_RETRY_SECONDS
+                logger.warning(
+                    "SMetricTokenizer load failed; retrying in %.0fs: %s",
+                    _TOKENIZER_LOAD_RETRY_SECONDS,
+                    exc,
+                )
+                return None
+            self._next_load_attempt_at = 0.0
+            return self.tokenizer
+
+    def apply_chat_template(self, messages: list, tools: list | None = None, req_data: dict | None = None) -> list[int]:
+        if self.get_tokenizer() is None:
+            return []
+        try:
+            if self._is_dsv4:
+                return self._apply_chat_template_dsv4(messages, tools, req_data)
+            if self.openai_standard != "STANDARD":
+                return self._apply_chat_template_with_preprocess(messages, tools, req_data)
+            return self._apply_chat_template_standard(messages, tools, req_data)
+        except Exception as exc:
+            if self._is_dsv4:
+                logger.error("smetric_gated dsv4 tokenize failed; returning []: %s", exc)
+                return []
+            logger.warning("smetric_gated primary tokenize path failed: %s; trying fallback", exc)
+            return self._safe_fallback_encode(messages, tools, req_data)
+
+    def encode(self, prompt: str) -> list[int]:
+        tokenizer = self.get_tokenizer()
+        return [] if tokenizer is None else tokenizer.encode(prompt)
+
+    @staticmethod
+    def _read_model_config_dict(model_path: str) -> dict | None:
+        try:
+            with open(Path(model_path) / "config.json", encoding="utf-8") as file:
+                data = json.load(file)
+            return data if isinstance(data, dict) else None
+        except (OSError, ValueError) as exc:
+            logger.debug("Could not read config.json from %s: %s", model_path, exc)
+            return None
+
+    @staticmethod
+    def _is_deepseek_v4_model(model_path: str) -> bool:
+        config_dict = SMetricTokenizer._read_model_config_dict(model_path)
+        if not config_dict:
+            return False
+        return config_dict.get("model_type") == "deepseek_v4" or "DeepseekV4ForCausalLM" in (
+            config_dict.get("architectures") or []
+        )
+
+    @staticmethod
+    def _build_dsv4_chat_template_kwargs(req_data: dict | None) -> dict:
+        kwargs: dict = {"tokenize": True, "drop_thinking": True}
+        if not req_data:
+            return kwargs
+        reasoning_effort = req_data.get("reasoning_effort")
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
+        chat_template_kwargs = req_data.get("chat_template_kwargs") or {}
+        if isinstance(chat_template_kwargs, dict):
+            kwargs.update(chat_template_kwargs)
+        if reasoning_effort is not None and "enable_thinking" not in kwargs:
+            kwargs["enable_thinking"] = reasoning_effort != "none"
+        return kwargs
+
+    @staticmethod
+    def _build_standard_chat_template_kwargs(req_data: dict | None, *, tokenize: bool) -> dict:
+        kwargs: dict = {"add_generation_prompt": True, "tokenize": tokenize}
+        if tokenize:
+            kwargs["return_dict"] = False
+        if not req_data:
+            return kwargs
+        if isinstance(req_data.get("add_generation_prompt"), bool):
+            kwargs["add_generation_prompt"] = req_data["add_generation_prompt"]
+        if req_data.get("continue_final_message"):
+            kwargs["continue_final_message"] = True
+            kwargs["add_generation_prompt"] = False
+        if req_data.get("documents") is not None:
+            kwargs["documents"] = req_data["documents"]
+        template_kwargs = req_data.get("chat_template_kwargs") or {}
+        if isinstance(template_kwargs, dict):
+            reserved = {
+                "tokenize",
+                "return_dict",
+                "conversation",
+                "tools",
+                "add_generation_prompt",
+                "continue_final_message",
+            }
+            kwargs.update({key: value for key, value in template_kwargs.items() if key not in reserved})
+        reasoning_effort = req_data.get("reasoning_effort")
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
+            kwargs.setdefault("enable_thinking", reasoning_effort != "none")
+        thinking = req_data.get("thinking")
+        if isinstance(thinking, dict) and "enable_thinking" not in kwargs:
+            if thinking.get("type") == "enabled":
+                kwargs["enable_thinking"] = True
+            elif thinking.get("type") == "disabled":
+                kwargs["enable_thinking"] = False
+        return kwargs
+
+    def _apply_chat_template_dsv4(self, messages: list, tools: list | None, req_data: dict | None) -> list[int]:
+        messages, tools = preprocess_messages_for_dsv4(messages, tools)
+        result = self.tokenizer.apply_chat_template(
+            messages, tools=tools, **self._build_dsv4_chat_template_kwargs(req_data)
+        )
+        return result if isinstance(result, list) else self.tokenizer.encode(result, add_special_tokens=False)
+
+    def _apply_chat_template_standard(self, messages: list, tools: list | None, req_data: dict | None) -> list[int]:
+        return self.tokenizer.apply_chat_template(
+            conversation=preprocess_messages_for_standard(messages),
+            tools=tools,
+            **self._build_standard_chat_template_kwargs(req_data, tokenize=True),
+        )
+
+    def _apply_chat_template_with_preprocess(
+        self, messages: list, tools: list | None, req_data: dict | None
+    ) -> list[int]:
+        messages, tools = preprocess_input(messages, tools)
+        prompt = self.tokenizer.apply_chat_template(
+            conversation=messages,
+            tools=tools,
+            **self._build_standard_chat_template_kwargs(req_data, tokenize=False),
+        )
+        return self.tokenizer.encode(prompt)
+
+    def _safe_fallback_encode(self, messages: list, tools: list | None, req_data: dict | None) -> list[int]:
+        try:
+            if self.openai_standard == "STANDARD":
+                return self._apply_chat_template_with_preprocess(messages, tools, req_data)
+            return self._apply_chat_template_standard(messages, tools, req_data)
+        except Exception as exc:
+            logger.error("smetric_gated tokenize failed on both primary and fallback paths; returning []: %s", exc)
+            return []
+
+
+def _prompt_token_ids(req_info: RequestInfo) -> list[int]:
+    """Use cached token ids, otherwise tokenize with the local SMetricTokenizer."""
     engine_cached = getattr(req_info, "engine_token_ids", None)
     if isinstance(engine_cached, list) and engine_cached:
         return engine_cached
     cached = getattr(req_info, "token_ids", None)
     if isinstance(cached, list) and cached:
         return cached
-    return []
+    encoded_ids: list[int] = []
+    req_data = getattr(req_info, "req_data", None) or {}
+    messages = req_data.get(OpenAIField.MESSAGES, None)
+    tools = req_data.get(OpenAIField.TOOLS, None)
+    if messages is not None:
+        encoded_ids = SMetricTokenizer().apply_chat_template(messages, tools, req_data=req_data)
+    else:
+        prompt = req_data.get(OpenAIField.PROMPT, None)
+        if isinstance(prompt, str):
+            encoded_ids = SMetricTokenizer().encode(prompt)
+        elif (
+            isinstance(prompt, list)
+            and prompt
+            and all(isinstance(token_id, int) and not isinstance(token_id, bool) for token_id in prompt)
+        ):
+            encoded_ids = prompt.copy()
+    try:
+        req_info.token_ids = encoded_ids
+    except Exception as e:
+        logger.debug("Could not cache token_ids on req_info: %s", e)
+    return encoded_ids
 
 
 def _prefill_cost(isl: int, matched_tokens: int) -> float:

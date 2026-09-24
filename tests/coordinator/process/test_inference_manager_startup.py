@@ -17,3 +17,10 @@ def test_inference_worker_initializes_the_shared_kv_affinity_tokenizer():
     assert hasattr(inference_manager, "TokenizerManager")
     source = inspect.getsource(inference_manager.run_inference_worker_proc)
     assert "TokenizerManager(config)" in source
+
+
+def test_inference_worker_initializes_smetric_tokenizer_when_gated():
+    assert hasattr(inference_manager, "SMetricTokenizer")
+    source = inspect.getsource(inference_manager.run_inference_worker_proc)
+    assert "SMetricTokenizer(config)" in source
+    assert "uses_smetric_gated()" in source

@@ -181,8 +181,14 @@ class _SchedulerInstanceCache:
         endpoint_id: int,
         role: PDRole,
         active_tokens: float,
+        isl: float | None = None,
+        cpu_hit_blocks: float | None = None,
     ) -> None:
-        """Patch single endpoint workload from shared memory. Skip if not in cache."""
+        """Patch single endpoint workload from shared memory. Skip if not in cache.
+
+        Token-only patches (overlay args omitted) keep the worker overlay cache. Passing
+        ``isl`` / ``cpu_hit_blocks`` SETs those fields from SHM and syncs the overlay.
+        """
         role_map = self._instance_map.get(role) or {}
         cached_instance = role_map.get(instance_id)
         if not cached_instance:
@@ -192,14 +198,23 @@ class _SchedulerInstanceCache:
             return
         old_workload = cached_endpoint.workload or Workload()
         overlay = self._ledger_overlay.get((instance_id, endpoint_id), (0.0, 0.0))
+        next_isl = overlay[0] if isl is None else float(isl)
+        next_cpu = overlay[1] if cpu_hit_blocks is None else float(cpu_hit_blocks)
         cached_endpoint.workload = Workload(
             active_tokens=active_tokens,
-            isl=overlay[0],
-            cpu_hit_blocks=overlay[1],
+            isl=next_isl,
+            cpu_hit_blocks=next_cpu,
         )
         if cached_instance.gathered_workload is None:
             cached_instance.gathered_workload = Workload()
         cached_instance.gathered_workload.active_tokens += active_tokens - old_workload.active_tokens
+        if isl is not None or cpu_hit_blocks is not None:
+            cached_instance.gathered_workload.isl += next_isl - old_workload.isl
+            cached_instance.gathered_workload.cpu_hit_blocks += next_cpu - old_workload.cpu_hit_blocks
+            if next_isl == 0.0 and next_cpu == 0.0:
+                self._ledger_overlay.pop((instance_id, endpoint_id), None)
+            else:
+                self._ledger_overlay[(instance_id, endpoint_id)] = (next_isl, next_cpu)
 
     def _apply_role_under_lock(self, role: PDRole, instances: list[Instance]) -> None:
         """Update cache and maps for one role. Must be called with _lock held."""
@@ -293,7 +308,10 @@ class _SchedulerInstanceCache:
         isl_delta: float,
         cpu_hit_blocks_delta: float,
     ) -> None:
-        """Accumulate worker-local isl / cpu_hit_blocks overlay and stamp the endpoint."""
+        """Accumulate isl / cpu_hit_blocks after a successful SHM CAS and stamp the endpoint.
+
+        Scoring refresh later SETs the same fields from schema-5 SHM.
+        """
         key = (instance_id, endpoint_id)
         old_isl, old_cpu = self._ledger_overlay.get(key, (0.0, 0.0))
         new_isl = max(0.0, old_isl + float(isl_delta))
@@ -840,7 +858,7 @@ class AsyncSchedulerClient:
         self._dp_stats.emit_window(self._snapshot_dp_stats())
 
     def _snapshot_dp_stats(self) -> list[tuple[int, int, float]]:
-        """Read current per-DP ``active_tokens`` from schema-4 SHM."""
+        """Read current per-DP ``active_tokens`` from schema-5 SHM."""
         reader = self._workload_reader
         native = getattr(reader, "native", None) if reader is not None else None
         if native is None:
@@ -1029,7 +1047,7 @@ class AsyncSchedulerClient:
     ) -> Workload:
         """Same commit formula the former ALLOCATE_ONLY handler used (R4).
 
-        c2lb stamps overlay ``isl = max(0, request_isl)`` and cpu_blocks.
+        c2lb stamps schema-5 overlay ``isl = max(0, request_isl)`` and cpu_blocks.
         kv_cache_affinity commits SHM ``active_tokens`` as ``isl - matched`` and leaves
         overlay ``isl`` / ``cpu_hit_blocks`` at 0. RR/LB leave overlay fields at 0.
         """
@@ -1083,13 +1101,14 @@ class AsyncSchedulerClient:
         required_engine_type: str | None = None,
         required_dispatch_capability: str | None = None,
     ) -> tuple[Instance, Endpoint, Workload] | None:
-        """Select locally, then CAS-commit on schema-4 SHM (no ALLOCATE_ONLY ZMQ)."""
+        """Select locally, then CAS-commit on schema-5 SHM (no ALLOCATE_ONLY ZMQ)."""
         from motor.coordinator.scheduler.runtime.workload_shm.layout import FLAG_BLOCKED
         from motor.coordinator.scheduler.runtime.workload_shm.native import (
             STATUS_BLOCKED,
             STATUS_CHANGED,
             STATUS_OK,
             STATUS_SLOT_INVALID,
+            cas_status_name,
         )
 
         role_str = role.value if role is not None else (getattr(PDRole.ROLE_U, "value", "union"))
@@ -1265,10 +1284,27 @@ class AsyncSchedulerClient:
         ]
         proposed = (proposed_instance.id, proposed_endpoint.id)
         excluded: set[tuple[int, int]] = set()
-        use_authoritative = candidate_policy == CANDIDATE_POLICY_C2LB
+        # Same as LB/RR/affinity: first CAS validates the policy winner. CHANGED/BLOCKED
+        # refresh SHM and re-run allocate_arbitration (c2lb re-gates on that path).
+        use_authoritative = False
         native = self._workload_reader.native
         if native is None:
             return None
+        cas_counts = {
+            "none_meta": 0,
+            "blocked_flag": 0,
+            "changed": 0,
+            "blocked": 0,
+            "slot_invalid": 0,
+            "already_excluded": 0,
+            "other": 0,
+        }
+        last_iid: int | None = None
+        last_eid: int | None = None
+        last_reason = ""
+        last_expected: float | None = None
+        last_actual: float | None = None
+        last_slot: int | None = None
 
         for _attempt in range(_MAX_CAS_ALLOCATE_ATTEMPTS):
             # First attempt reuses the candidate-selection refresh above; later retries re-read.
@@ -1323,7 +1359,10 @@ class AsyncSchedulerClient:
                 return None
             out_instance, out_endpoint, selected_score = selected
             pair = (out_instance.id, out_endpoint.id)
+            last_iid, last_eid = pair
             if pair in excluded:
+                cas_counts["already_excluded"] += 1
+                last_reason = "already_excluded"
                 use_authoritative = True
                 continue
             committed = self._committed_workload_for(
@@ -1339,9 +1378,17 @@ class AsyncSchedulerClient:
             )
             meta = self._workload_reader.entry_meta(out_instance.id, out_endpoint.id)
             if meta is None or int(meta.get("flags", 0)) & FLAG_BLOCKED:
+                if meta is None:
+                    cas_counts["none_meta"] += 1
+                    last_reason = "none_meta"
+                else:
+                    cas_counts["blocked_flag"] += 1
+                    last_reason = "blocked_flag"
                 excluded.add(pair)
                 use_authoritative = True
                 continue
+            last_expected = float(meta["active_tokens"])
+            last_slot = meta.get("slot")
             status, actual = native.cas_add(
                 out_instance.id,
                 out_endpoint.id,
@@ -1349,7 +1396,11 @@ class AsyncSchedulerClient:
                 float(meta["active_tokens"]),
                 float(committed.active_tokens),
                 slot=meta.get("slot"),
+                isl=float(committed.isl),
+                cpu_hit_blocks=float(committed.cpu_hit_blocks),
             )
+            last_actual = actual
+            last_reason = cas_status_name(status)
             if status == STATUS_OK:
                 self._cache.patch_workload_from_shm(out_instance.id, out_endpoint.id, role, actual)
                 self._cache.apply_ledger_delta(
@@ -1395,23 +1446,60 @@ class AsyncSchedulerClient:
                 )
                 return (out_instance, out_endpoint, committed)
             if status == STATUS_CHANGED:
+                cas_counts["changed"] += 1
                 use_authoritative = True
                 continue
             if status in (STATUS_BLOCKED, STATUS_SLOT_INVALID):
+                if status == STATUS_BLOCKED:
+                    cas_counts["blocked"] += 1
+                else:
+                    cas_counts["slot_invalid"] += 1
                 excluded.add(pair)
                 use_authoritative = True
                 continue
+            cas_counts["other"] += 1
             logger.error(
-                "select_and_allocate unexpected cas status=%s role=%s req_id=%s",
+                "select_and_allocate unexpected cas status=%s name=%s role=%s req_id=%s "
+                "pair=%s-%s expected=%s actual=%s slot=%s",
                 status,
+                cas_status_name(status),
                 role_str,
                 req_info.req_id,
+                out_instance.id,
+                out_endpoint.id,
+                last_expected,
+                actual,
+                last_slot,
             )
             return None
+        shm_valid_pairs = len(getattr(self._workload_reader, "_meta", {}) or {})
+        pair_in_meta = (
+            last_iid is not None
+            and last_eid is not None
+            and self._workload_reader.entry_meta(last_iid, last_eid) is not None
+        )
         logger.warning(
-            "select_and_allocate exhausted CAS retries role=%s req_id=%s",
+            "select_and_allocate exhausted CAS retries role=%s req_id=%s "
+            "none_meta=%d blocked_flag=%d changed=%d blocked=%d slot_invalid=%d "
+            "already_excluded=%d other=%d last_pair=%s-%s last_reason=%s "
+            "expected=%s actual=%s slot=%s shm_valid_pairs=%d pair_in_meta=%s",
             role_str,
             req_info.req_id,
+            cas_counts["none_meta"],
+            cas_counts["blocked_flag"],
+            cas_counts["changed"],
+            cas_counts["blocked"],
+            cas_counts["slot_invalid"],
+            cas_counts["already_excluded"],
+            cas_counts["other"],
+            last_iid,
+            last_eid,
+            last_reason,
+            last_expected,
+            last_actual,
+            last_slot,
+            shm_valid_pairs,
+            pair_in_meta,
         )
         return None
 
@@ -1567,7 +1655,7 @@ class AsyncSchedulerClient:
         return False
 
     async def update_workload(self, params: UpdateWorkloadParams) -> bool:
-        """Release path: CAS-sub floor 0 on schema-4 SHM (no UPDATE_WORKLOAD ZMQ)."""
+        """Release path: CAS-sub floor 0 on schema-5 SHM (no UPDATE_WORKLOAD ZMQ)."""
         from motor.coordinator.scheduler.runtime.workload_shm.native import STATUS_OK
 
         role_str = params.role.value if hasattr(params.role, "value") else str(params.role)
@@ -1598,12 +1686,16 @@ class AsyncSchedulerClient:
             )
             return False
         delta = abs(float(params.workload_change.active_tokens))
+        isl_delta = abs(float(getattr(params.workload_change, "isl", 0) or 0))
+        cpu_delta = abs(float(getattr(params.workload_change, "cpu_hit_blocks", 0) or 0))
         status, actual = self._workload_reader.native.cas_sub_floor0(
             params.instance_id,
             params.endpoint_id,
             int(meta["generation"]),
             delta,
             slot=meta.get("slot"),
+            isl=isl_delta,
+            cpu_hit_blocks=cpu_delta,
         )
         if status != STATUS_OK:
             logger.warning(

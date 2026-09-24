@@ -44,6 +44,13 @@ def _archive_names(wheel_path: str) -> set[str]:
         return set(archive.namelist())
 
 
+def workload_shm_so_needs_rebuild(path: str) -> bool:
+    """True when ``path`` is missing or its ABI is below Python ``MIN_ABI_VERSION``."""
+    from motor.coordinator.scheduler.runtime.workload_shm.native import so_abi_is_current
+
+    return not so_abi_is_current(path)
+
+
 def list_missing_required_native_libs(wheel_path: str) -> list[str]:
     """Return required native archive members that ``wheel_path`` does not contain."""
     names = _archive_names(wheel_path)

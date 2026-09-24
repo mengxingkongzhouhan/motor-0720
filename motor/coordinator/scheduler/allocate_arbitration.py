@@ -310,7 +310,7 @@ def select_c2lb(
     req_id: str | None = None,
 ) -> tuple[Instance, Endpoint, float] | None:
     """
-    c2lb arbitration on the worker's fresh cache (SHM active_tokens + overlay).
+    c2lb arbitration on the worker's fresh cache (schema-5 SHM tokens + isl/cpu overlay).
 
     Resolve every scored endpoint that is still schedulable, sort by ledger ``isl``,
     prefer a high-NPU-hit DP that also passes the three scaled-mean gates, otherwise

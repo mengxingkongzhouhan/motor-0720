@@ -705,6 +705,22 @@ class TestClientDispatch:
         ep = client._cache._endpoint_map[(1, 10)]
         assert (ep.workload.active_tokens, ep.workload.isl, ep.workload.cpu_hit_blocks) == (12.0, 40.0, 9.0)
 
+    @pytest.mark.asyncio
+    async def test_patch_workload_from_shm_sets_overlay_from_shm(self):
+        """Scoring refresh SETs overlay from SHM so other workers' ledgers are visible."""
+        client = _client()
+        inst = _instance(1, [_endpoint(10)])
+        await client._cache.replace_all(PDRole.ROLE_P, [inst])
+        client._cache.apply_ledger_delta(1, 10, PDRole.ROLE_P, 12.0, 3.0)
+        client._cache.patch_workload_from_shm(1, 10, PDRole.ROLE_P, 4.0)
+        ep = client._cache._endpoint_map[(1, 10)]
+        assert (ep.workload.active_tokens, ep.workload.isl, ep.workload.cpu_hit_blocks) == (4.0, 12.0, 3.0)
+        client._cache.patch_workload_from_shm(1, 10, PDRole.ROLE_P, 8.0, 40.0, 9.0)
+        assert (ep.workload.active_tokens, ep.workload.isl, ep.workload.cpu_hit_blocks) == (8.0, 40.0, 9.0)
+        assert client._cache._ledger_overlay[(1, 10)] == (40.0, 9.0)
+        client._cache.patch_workload_from_shm(1, 10, PDRole.ROLE_P, 9.0)
+        assert (ep.workload.active_tokens, ep.workload.isl, ep.workload.cpu_hit_blocks) == (9.0, 40.0, 9.0)
+
 
 # ---------------------------------------------------------------------------
 # Authoritative arbitration (replaces ALLOCATE_ONLY ZMQ tests from PR #16)

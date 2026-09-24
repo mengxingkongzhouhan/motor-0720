@@ -27,8 +27,8 @@ The KV Conductor is queried once per request for this request's stamp values
 ``isl = max(0, request_isl)`` and ``cpu_hit_blocks``. RELEASE subtracts both again.
 
 On motor-0924 the authoritative re-pick lives in worker-local ``allocate_arbitration``
-(schema-4 SHM CAS). ``active_tokens`` is the cross-worker SHM ledger; ``isl`` and
-``cpu_hit_blocks`` are a worker-local overlay (schema-4 does not carry them).
+(schema-5 SHM CAS). ``active_tokens``, ``isl``, and ``cpu_hit_blocks`` are all
+cross-worker schema-5 SHM ledger fields.
 Prefill / encode / union use ``prefill_scheduler_type``; decode falls back to load_balance
 when this policy is set on decode.
 """
@@ -481,7 +481,7 @@ class C2LBPolicy(BaseSchedulingPolicy):
     otherwise the first DP under the two load averages.
 
     Workers run the conductor query (for the stamp values) and re-rank / re-gate against the
-    local cache (SHM ``active_tokens`` + worker-local overlay) before CAS-committing.
+    local cache (schema-5 SHM ``active_tokens`` / ``isl`` / ``cpu_hit_blocks``) before CAS-committing.
     """
 
     def __init__(self, instance_provider: InstanceProvider):

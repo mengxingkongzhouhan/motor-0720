@@ -27,7 +27,7 @@ logger = get_logger(__name__)
 class SchedulerRequestType(str, Enum):
     """
     Control-plane request types served by Mgmt (ROUTER). Data-plane allocate/release
-    is CAS on schema-4 SHM; there is no ALLOCATE / UPDATE / REFRESH RPC.
+    is CAS on schema-5 SHM; there is no ALLOCATE / UPDATE / REFRESH RPC.
     """
 
     GET_AVAILABLE_INSTANCES = "get_available_instances"  # Worker/Obs fetch instance list and workload shm name

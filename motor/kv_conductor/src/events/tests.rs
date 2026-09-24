@@ -82,7 +82,11 @@ fn test_flex_hash_integrated_in_zmq_event_map() {
         "event_type": "stored",
         "medium": "cpu",
         "seq_hashes": ["0xABCD", "12345"],
-        "block_hashes": [100, 200]
+        "block_hashes": [100, 200],
+        "object_keys": [
+            "wen25-7B@pcp0@dcp1@head_or_tp_rank:0@aaa",
+            "wen25-7B@pcp0@dcp1@head_or_tp_rank:0@bbb"
+        ]
     });
     let packed = rmp_serde::to_vec(&event).unwrap();
     let map: PoolEvent = from_slice(&packed).unwrap();
@@ -90,6 +94,16 @@ fn test_flex_hash_integrated_in_zmq_event_map() {
     assert_eq!(seq, vec![0xABCD, 12345]);
     let blk: Vec<u64> = map.block_hashes.unwrap().iter().map(|h| h.0).collect();
     assert_eq!(blk, vec![100, 200]);
+    assert_eq!(
+        map.object_keys.as_deref(),
+        Some(
+            [
+                "wen25-7B@pcp0@dcp1@head_or_tp_rank:0@aaa".to_string(),
+                "wen25-7B@pcp0@dcp1@head_or_tp_rank:0@bbb".to_string()
+            ]
+            .as_slice()
+        )
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -792,6 +806,7 @@ fn test_pool_backend_store_matches_cached_block() {
         dp_rank: Some(0),
         seq_hashes: Some(vec![FlexHash(0xBEEF)]),
         block_hashes: None,
+        object_keys: None,
     };
     apply_pool_event(
         &indexer,
@@ -843,6 +858,7 @@ fn test_pool_backend_store_ignores_unknown_hash() {
         dp_rank: Some(0),
         seq_hashes: Some(vec![FlexHash(0xDEAD)]),
         block_hashes: None,
+        object_keys: None,
     };
     let result = apply_pool_event(
         &indexer,
@@ -904,6 +920,12 @@ fn memcache_wire_batch(seq_hash: u64) -> rmpv::Value {
             rmpv::Value::from("seq_hashes"),
             rmpv::Value::Array(vec![rmpv::Value::from(seq_hash)]),
         ),
+        (
+            rmpv::Value::from("object_keys"),
+            rmpv::Value::Array(vec![rmpv::Value::from(
+                "wen25-7B@pcp0@dcp1@head_or_tp_rank:0@cache_role:kv@obj",
+            )]),
+        ),
         (rmpv::Value::from("base_block_idx"), rmpv::Value::Nil),
         (rmpv::Value::from("parent_hash"), rmpv::Value::Nil),
         (rmpv::Value::from("token_ids"), rmpv::Value::Nil),
@@ -949,6 +971,10 @@ fn test_memcache_batch_parse_and_apply_ip_only() {
         .map(|h| h.0)
         .collect();
     assert_eq!(hashes, vec![hash]);
+    assert_eq!(
+        event.object_keys.as_deref(),
+        Some(["wen25-7B@pcp0@dcp1@head_or_tp_rank:0@cache_role:kv@obj".to_string()].as_slice())
+    );
 
     // Apply under IpOnly: the event's backend_id (node IP) fans out to all
     // DPs registered on that IP.
@@ -978,6 +1004,11 @@ fn test_memcache_batch_parse_and_apply_ip_only() {
         assert!(
             state.pending_pool.contains_key(&hash),
             "memcache stored event should be queued in pending_pool at the node-IP worker (IpOnly)"
+        );
+        assert_eq!(
+            state.object_keys.get(&hash).map(String::as_str),
+            Some("wen25-7B@pcp0@dcp1@head_or_tp_rank:0@cache_role:kv@obj"),
+            "object_keys must be recorded even while the pool event is pending"
         );
     }
 }
@@ -1051,6 +1082,7 @@ fn test_ip_only_without_hbm_index_queues_at_pool_location() {
         dp_rank: Some(0),
         seq_hashes: Some(vec![FlexHash(0xFEED)]),
         block_hashes: None,
+        object_keys: None,
     };
     apply_pool_event(
         &indexer,
@@ -1083,7 +1115,7 @@ fn test_ip_only_without_hbm_index_queues_at_pool_location() {
 #[test]
 fn test_unmapped_decode_pool_is_visible_to_registered_prefill() {
     use crate::indexer::Indexer;
-    use crate::protocols::{HbmIpIndex, pool_location_instance_id};
+    use crate::protocols::{pool_location_instance_id, HbmIpIndex};
 
     let indexer = Indexer::new();
     let entry = indexer.get_or_create("qwen3", "default");
@@ -1134,6 +1166,7 @@ fn test_unmapped_decode_pool_is_visible_to_registered_prefill() {
         dp_rank: None,
         seq_hashes: Some(seq_hashes.iter().copied().map(FlexHash).collect()),
         block_hashes: None,
+        object_keys: None,
     };
     apply_pool_event(
         &indexer,
@@ -1242,6 +1275,7 @@ fn test_pool_backend_remove_evicts_cache() {
         dp_rank: Some(0),
         seq_hashes: Some(vec![FlexHash(0xAAA), FlexHash(0xBBB)]),
         block_hashes: None,
+        object_keys: None,
     };
     apply_pool_event(
         &indexer,
@@ -1269,6 +1303,7 @@ fn test_pool_backend_remove_evicts_cache() {
         dp_rank: Some(0),
         seq_hashes: Some(vec![FlexHash(0xAAA)]),
         block_hashes: None,
+        object_keys: None,
     };
     apply_pool_event(
         &indexer,
@@ -1341,6 +1376,7 @@ fn test_pool_arrives_before_offload() {
         dp_rank: Some(0),
         seq_hashes: Some(vec![FlexHash(0xBEEF)]),
         block_hashes: None,
+        object_keys: None,
     };
     apply_pool_event(
         &indexer,
@@ -1440,6 +1476,7 @@ fn test_pool_arrives_before_offload_multi_worker() {
             dp_rank: Some(dp),
             seq_hashes: Some(vec![FlexHash(0xCAFE)]),
             block_hashes: None,
+            object_keys: None,
         };
         apply_pool_event(
             &indexer,
@@ -1532,6 +1569,7 @@ fn test_pool_removal_cleans_pending() {
         dp_rank: Some(0),
         seq_hashes: Some(vec![FlexHash(0xD00D)]),
         block_hashes: None,
+        object_keys: None,
     };
     apply_pool_event(
         &indexer,
@@ -1565,6 +1603,7 @@ fn test_pool_removal_cleans_pending() {
         dp_rank: Some(0),
         seq_hashes: Some(vec![FlexHash(0xD00D)]),
         block_hashes: None,
+        object_keys: None,
     };
     apply_pool_event(
         &indexer,
@@ -1706,6 +1745,7 @@ fn test_removal_after_both_matched() {
         dp_rank: Some(0),
         seq_hashes: Some(vec![FlexHash(0xF00)]),
         block_hashes: None,
+        object_keys: None,
     };
     apply_pool_event(
         &indexer,
@@ -1757,6 +1797,7 @@ fn test_removal_after_both_matched() {
         dp_rank: Some(0),
         seq_hashes: Some(vec![FlexHash(0xF00)]),
         block_hashes: None,
+        object_keys: None,
     };
     apply_pool_event(
         &indexer,
@@ -1803,6 +1844,7 @@ fn test_vllm_removal_after_pool_queued() {
         dp_rank: Some(0),
         seq_hashes: Some(vec![FlexHash(0xB00)]),
         block_hashes: None,
+        object_keys: None,
     };
     apply_pool_event(
         &indexer,
@@ -1873,6 +1915,7 @@ fn test_duplicate_pool_stored_idempotent() {
         dp_rank: Some(0),
         seq_hashes: Some(vec![FlexHash(0xCCC)]),
         block_hashes: None,
+        object_keys: None,
     };
 
     // Deliver the same event twice.
@@ -1931,6 +1974,7 @@ fn test_pending_worker_cleanup() {
             dp_rank: Some(dp),
             seq_hashes: Some(vec![FlexHash(0xE00 + dp as u64)]),
             block_hashes: None,
+            object_keys: None,
         };
         apply_pool_event(
             &indexer,
@@ -1984,6 +2028,7 @@ fn test_cleared_cleans_pending() {
         dp_rank: Some(0),
         seq_hashes: Some(vec![FlexHash(0xABC)]),
         block_hashes: None,
+        object_keys: None,
     };
     apply_pool_event(
         &indexer,
@@ -2013,6 +2058,7 @@ fn test_cleared_cleans_pending() {
         dp_rank: Some(0),
         seq_hashes: None,
         block_hashes: None,
+        object_keys: None,
     };
     apply_pool_event(
         &indexer,
@@ -2055,6 +2101,7 @@ fn test_sweep_stale_caches() {
         dp_rank: Some(0),
         seq_hashes: Some(vec![FlexHash(0xBAD)]),
         block_hashes: None,
+        object_keys: None,
     };
     apply_pool_event(
         &indexer,

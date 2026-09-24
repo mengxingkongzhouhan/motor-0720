@@ -302,16 +302,17 @@ pub struct DpBlocks {
     pub cpu_blocks: u32,
     /// Exclusive Disk matched block count (beyond max(NPU, CPU) coverage).
     pub disk_blocks: u32,
-    /// Engine sequence hashes (`block_hash`) of the exclusive Disk matched
-    /// blocks, in prefix order.
+    /// Store identities of the exclusive Disk matched blocks, in prefix
+    /// order. Same slice as `disk_blocks`: after NPU > CPU > Disk
+    /// partitioning, only the blocks beyond `max(npu_end, cpu_end)`.
     ///
-    /// Same slice as `disk_blocks`: after NPU > CPU > Disk partitioning, only
-    /// the blocks beyond `max(npu_end, cpu_end)`. Invariant:
-    /// `disk_block_hashes.len() == disk_blocks`. Empty / omitted when there is
-    /// no exclusive Disk contribution, so no-SSD (and same-prefix-replica)
-    /// responses stay the legacy four-counter shape.
+    /// For MemCache this is the event's `object_keys` (the prefetch key),
+    /// not the numeric engine `seq_hashes` / `block_hash`. Blocks that
+    /// never carried `object_keys` fall back to the decimal engine hash
+    /// so the `len == disk_blocks` invariant still holds. Empty / omitted
+    /// when there is no exclusive Disk contribution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub disk_block_hashes: Vec<u64>,
+    pub disk_block_hashes: Vec<String>,
     /// How `cpu_blocks` splits by how far the block has to travel.
     ///
     /// A pool event fans out to every DP in the Pod that reported it, so "this DP
@@ -456,7 +457,7 @@ pub fn encode_query_response_msgpack(response: &QueryResponse, out: &mut Vec<u8>
                     )
                     .expect("write array len");
                     for hash in &blocks.disk_block_hashes {
-                        write_u64(out, *hash).expect("write disk_block_hash");
+                        write_str(out, hash).expect("write disk_block_hash");
                     }
                 }
                 if let Some(local) = blocks.cpu_local_blocks {
@@ -968,7 +969,7 @@ mod tests {
                 npu_blocks: 1,
                 cpu_blocks: 0,
                 disk_blocks: 2,
-                disk_block_hashes: vec![201, 202],
+                disk_block_hashes: vec!["201".into(), "202".into()],
                 ..Default::default()
             },
         );
@@ -977,7 +978,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             parsed["DP"]["0"]["disk_block_hashes"],
-            serde_json::json!([201, 202])
+            serde_json::json!(["201", "202"])
         );
         assert_eq!(parsed["DP"]["0"]["disk_blocks"], 2);
     }
@@ -1216,7 +1217,7 @@ mod tests {
                 // 2 of the 3 pooled blocks are on this DP's own machine.
                 cpu_local_blocks: Some(2),
                 cpu_remote_blocks: Some(1),
-                disk_block_hashes: vec![900, 901],
+                disk_block_hashes: vec!["900".into(), "901".into()],
             },
         );
         instances.insert(
@@ -1257,7 +1258,10 @@ mod tests {
         assert_eq!(dps["1"].as_object().unwrap().len(), 7);
         assert_eq!(dps["1"]["cpu_local_blocks"], 2);
         assert_eq!(dps["1"]["cpu_remote_blocks"], 1);
-        assert_eq!(dps["1"]["disk_block_hashes"], serde_json::json!([900, 901]));
+        assert_eq!(
+            dps["1"]["disk_block_hashes"],
+            serde_json::json!(["900", "901"])
+        );
     }
 
     #[test]

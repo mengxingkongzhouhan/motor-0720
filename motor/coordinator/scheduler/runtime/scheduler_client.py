@@ -1188,6 +1188,7 @@ class AsyncSchedulerClient:
                         "endpoint_id": ep_id,
                         "prefill_cost": rec[0],
                         "cpu_hit_blocks": rec[1],
+                        "npu_hit": rec[2] if len(rec) > 2 else 0.0,
                     }
                     for (ins_id, ep_id), rec in gated_debug.items()
                     if (not normalized_engine_type or ins_id in allowed_instance_ids)
@@ -1259,6 +1260,7 @@ class AsyncSchedulerClient:
                 int(item["endpoint_id"]),
                 float(item["prefill_cost"]),
                 float(item.get("cpu_hit_blocks") or 0.0),
+                float(item.get("npu_hit") or 0.0),
             )
             for item in candidate_endpoints
             if item.get("prefill_cost") is not None

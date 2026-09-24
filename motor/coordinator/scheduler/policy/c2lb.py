@@ -338,10 +338,11 @@ class GatedCandidate:
     One endpoint of the request's role.
 
     ``prefill_cost`` / ``cpu_hit_blocks`` / ``npu_hit`` are THIS request's conductor stamps
-    (remaining prefill, CPU blocks, NPU hit rate). Ordering and load gates read the endpoint
-    ledger via ``endpoint.workload`` (``isl`` / ``active_tokens`` / ``cpu_hit_blocks``).
-    High ``npu_hit`` only changes pick priority; the committed overlay still stamps
-    ``isl = max(0, request_isl)`` and ``cpu_hit_blocks``.
+    (remaining prefill, CPU blocks, NPU prefix hit rate ``npu_blocks * BLOCK_SIZE / isl``).
+    Ordering and load gates read the endpoint ledger via ``endpoint.workload``
+    (``isl`` / ``active_tokens`` / ``cpu_hit_blocks``). High ``npu_hit`` only changes pick
+    priority; the committed overlay still stamps ``isl = max(0, request_isl)`` and
+    ``cpu_hit_blocks``.
     """
 
     instance: Instance
@@ -375,6 +376,23 @@ def _cpu_hit_blocks(matched: object) -> float:
         return max(0.0, float(matched.get("cpu_blocks", 0) or 0))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _npu_hit_blocks(matched: object) -> float:
+    """NPU-tier matched blocks from a DpBlocks conductor entry; 0 for legacy integer matches."""
+    if not isinstance(matched, dict):
+        return 0.0
+    try:
+        return max(0.0, float(matched.get("npu_blocks", 0) or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _request_npu_hit(matched: object, isl: int) -> float:
+    """This request's NPU prefix hit rate: ``npu_blocks * BLOCK_SIZE / isl``."""
+    if isl <= 0:
+        return 0.0
+    return _npu_hit_blocks(matched) * BLOCK_SIZE / float(isl)
 
 
 def _ledger_value(endpoint: Endpoint, field: str) -> float:
@@ -494,7 +512,7 @@ class C2LBPolicy(BaseSchedulingPolicy):
 
         The conductor supplies per-endpoint stamp values (request cost, cpu_blocks).
         ``None`` means it had no data for our instances (caller falls back). Also caches
-        ``{(instance_id, endpoint_id): (prefill_cost, cpu_hit_blocks)}`` on
+        ``{(instance_id, endpoint_id): (prefill_cost, cpu_hit_blocks, npu_hit)}`` on
         ``req_info.c2lb_debug`` for the allocate stamp.
         """
         encoded_ids = _prompt_token_ids(req_info)
@@ -530,7 +548,7 @@ class C2LBPolicy(BaseSchedulingPolicy):
                         endpoint=ep,
                         prefill_cost=_prefill_cost(isl, _matched_tokens(matched)),
                         cpu_hit_blocks=_cpu_hit_blocks(matched),
-                        npu_hit =_npu_hit_blocks(matched) * BLOCK_SIZE / isl,
+                        npu_hit=_request_npu_hit(matched, isl),
                     )
                 )
         if not any_instance:
@@ -541,7 +559,7 @@ class C2LBPolicy(BaseSchedulingPolicy):
             return None
 
         ranked = sort_candidates(candidates)
-        req_info.c2lb_debug = {c.key: (c.prefill_cost, c.cpu_hit_blocks) for c in ranked}
+        req_info.c2lb_debug = {c.key: (c.prefill_cost, c.cpu_hit_blocks, c.npu_hit) for c in ranked}
         logger.info(
             "c2lb: req_id=%s isl=%s ranked[ins-ep:ledger_isl/active/cpu(+req_cost/+req_cpu)]=%s",
             req_id,

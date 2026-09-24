@@ -36,6 +36,8 @@ from motor.coordinator.scheduler.policy.c2lb import (
     C2LBPolicy,
     C2LBTokenizer,
     _cpu_hit_blocks,
+    _npu_hit_blocks,
+    _request_npu_hit,
     pick_gated,
     sort_candidates,
 )
@@ -88,10 +90,11 @@ def _cand(
     cpu: float = 0.0,
     req_cost: float = 0.0,
     req_cpu: float = 0.0,
+    npu_hit: float = 0.0,
 ) -> GatedCandidate:
-    """Standalone candidate: endpoint ledger (prefill, active, cpu) + this request's stamp values."""
+    """Standalone candidate: endpoint ledger (isl, active, cpu) + this request's stamp values."""
     inst = _instance(ep_id, [_endpoint(ep_id, active_tokens=active, cpu_hit_blocks=cpu, isl=ledger_prefill)])
-    return GatedCandidate(inst, inst.get_all_endpoints()[0], req_cost, req_cpu)
+    return GatedCandidate(inst, inst.get_all_endpoints()[0], req_cost, req_cpu, npu_hit)
 
 
 def _req_info(token_count: int = 100, req_id: str = "req-gated") -> SimpleNamespace:
@@ -200,6 +203,13 @@ class TestConductorParsing:
         assert _cpu_hit_blocks({"cpu_blocks": "x"}) == 0
         assert _cpu_hit_blocks({"cpu_blocks": -3}) == 0
 
+    def test_npu_blocks_and_hit_rate(self):
+        assert _npu_hit_blocks({"npu_blocks": 2, "cpu_blocks": 5, "matched_tokens": 64}) == 2
+        assert _npu_hit_blocks(40) == 0
+        assert _npu_hit_blocks({"npu_blocks": "x"}) == 0
+        assert _request_npu_hit({"npu_blocks": 1}, 100) == 1.28
+        assert _request_npu_hit({"npu_blocks": 1}, 0) == 0
+
 
 # ---------------------------------------------------------------------------
 # Ordering and gating
@@ -260,6 +270,28 @@ class TestPickGated:
         chosen, reason, active_threshold, cpu_threshold = pick_gated(ranked)
         assert chosen.endpoint.id == 1 and reason == PICK_BOTH_GATES
         assert (active_threshold, cpu_threshold) == (0.0, 0.0)
+
+    def test_high_npu_hit_passing_three_gates_wins_first(self):
+        ranked = sort_candidates(
+            [
+                _cand(1, ledger_prefill=10, active=5, cpu=5, npu_hit=0.0),
+                _cand(2, ledger_prefill=12, active=5, cpu=5, npu_hit=0.9),
+                _cand(3, ledger_prefill=40, active=5, cpu=5, npu_hit=0.0),
+            ]
+        )
+        chosen, reason, _a, _c = pick_gated(ranked)
+        assert chosen.endpoint.id == 2 and reason == PICK_BOTH_GATES
+
+    def test_high_npu_hit_ignored_when_load_gate_fails(self):
+        ranked = sort_candidates(
+            [
+                _cand(1, ledger_prefill=10, active=5, cpu=5, npu_hit=0.0),
+                _cand(2, ledger_prefill=12, active=90, cpu=5, npu_hit=0.95),
+                _cand(3, ledger_prefill=40, active=5, cpu=5, npu_hit=0.0),
+            ]
+        )
+        chosen, reason, _a, _c = pick_gated(ranked)
+        assert chosen.endpoint.id == 1 and reason == PICK_BOTH_GATES
 
     def test_fallback_min_ledger_when_cpu_gate_fails(self):
         ranked = sort_candidates(
@@ -369,12 +401,16 @@ class TestPolicy:
 
         ranked = C2LBPolicy.score_endpoints([inst_a, inst_b], req_info)
 
-        assert [(c.endpoint.id, c.ledger_isl, c.prefill_cost, c.cpu_hit_blocks) for c in ranked] == [
-            (11, 100.0, 100.0, 0.0),
-            (20, 200.0, 50.0, 0.0),
-            (10, 300.0, 10.0, 4.0),
+        assert [(c.endpoint.id, c.ledger_isl, c.prefill_cost, c.cpu_hit_blocks, c.npu_hit) for c in ranked] == [
+            (11, 100.0, 100.0, 0.0, 0.0),
+            (20, 200.0, 50.0, 0.0, 0.0),
+            (10, 300.0, 10.0, 4.0, 1.28),
         ]
-        assert req_info.c2lb_debug == {(1, 11): (100.0, 0.0), (2, 20): (50.0, 0.0), (1, 10): (10.0, 4.0)}
+        assert req_info.c2lb_debug == {
+            (1, 11): (100.0, 0.0, 0.0),
+            (2, 20): (50.0, 0.0, 0.0),
+            (1, 10): (10.0, 4.0, 1.28),
+        }
         assert allocated_prefill_cost(req_info, 1, 10) == 10.0
         assert allocated_cpu_hit_blocks(req_info, 1, 10) == 4.0
         assert allocated_cpu_hit_blocks(req_info, 9, 9) == 0.0

@@ -30,7 +30,7 @@ def allocated_prefill_cost(
     """
     Prefill cost stamped onto the committed endpoint's workload.
 
-    ``c2lb`` caches ``(prefill_cost, cpu_hit_blocks)`` per endpoint. KV affinity
+    ``c2lb`` caches ``(prefill_cost, cpu_hit_blocks, npu_hit)`` per endpoint. KV affinity
     stores a 4-tuple whose third field is the request prefill cost. Missing/invalid entries
     yield 0.
     """

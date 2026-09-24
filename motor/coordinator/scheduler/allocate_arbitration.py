@@ -329,7 +329,9 @@ def select_c2lb(
             ctx, worker_candidate, role, required_engine_type, required_dispatch_capability
         )
     candidates: list[GatedCandidate] = []
-    for instance_id, endpoint_id, prefill_cost, cpu_hits in gated_candidates:
+    for raw in gated_candidates:
+        instance_id, endpoint_id, prefill_cost, cpu_hits, *rest = raw
+        npu_hit = float(rest[0]) if rest else 0.0
         if excluded is not None and (instance_id, endpoint_id) in excluded:
             continue
         if ctx.is_instance_circuit_open(instance_id):
@@ -354,6 +356,7 @@ def select_c2lb(
                 endpoint=endpoint,
                 prefill_cost=prefill_cost,
                 cpu_hit_blocks=cpu_hits,
+                npu_hit=npu_hit,
             )
         )
     ranked = sort_candidates(candidates)

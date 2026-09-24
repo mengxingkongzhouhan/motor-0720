@@ -49,7 +49,7 @@ from motor.coordinator.api_client.conductor_api_client import (
     conductor_instance_id,
 )
 from motor.coordinator.domain import InstanceProvider
-from motor.coordinator.models.constants import DEFAULT_REQUEST_ID, OpenAIField
+from motor.coordinator.models.constants import DEFAULT_REQUEST_ID
 from motor.coordinator.models.request import RequestInfo
 from motor.coordinator.scheduler.policy.base import BaseSchedulingPolicy
 
@@ -83,27 +83,18 @@ PICK_MIN_LEDGER_PREFILL = "min_ledger_prefill"
 
 
 def _prompt_token_ids(req_info: RequestInfo) -> list[int]:
-    """Tokenize the prompt for the conductor query and isl. Independent of KV-affinity helpers."""
+    """Read token ids already cached on the request. Do not tokenize here.
+
+    Ingress / Render fills ``engine_token_ids`` or ``token_ids`` before scheduling.
+    This policy must not import another scheduling policy (e.g. TokenizerManager).
+    """
+    engine_cached = getattr(req_info, "engine_token_ids", None)
+    if isinstance(engine_cached, list) and engine_cached:
+        return engine_cached
     cached = getattr(req_info, "token_ids", None)
     if isinstance(cached, list) and cached:
         return cached
-    encoded_ids: list[int] = []
-    req_data = getattr(req_info, "req_data", None) or {}
-    messages = req_data.get(OpenAIField.MESSAGES, None)
-    tools = req_data.get(OpenAIField.TOOLS, None)
-    from motor.coordinator.scheduler.policy.kv_cache_affinity import TokenizerManager
-
-    if messages is not None:
-        encoded_ids = TokenizerManager().apply_chat_template(messages, tools, req_data=req_data)
-    else:
-        prompt = req_data.get(OpenAIField.PROMPT, None)
-        if prompt is not None:
-            encoded_ids = TokenizerManager().encode(prompt)
-    try:
-        req_info.token_ids = encoded_ids
-    except Exception as e:
-        logger.debug("Could not cache token_ids on req_info: %s", e)
-    return encoded_ids
+    return []
 
 
 def _prefill_cost(isl: int, matched_tokens: int) -> float:
@@ -253,6 +244,9 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
         ``req_info.smetric_gated_debug`` for the allocate stamp.
         """
         encoded_ids = _prompt_token_ids(req_info)
+        if not encoded_ids:
+            logger.warning("smetric_gated: no cached token_ids; falling back")
+            return None
         isl = len(encoded_ids)
         rsp = ConductorApiClient.query_conductor(instances, encoded_ids)
         req_id = getattr(req_info, "req_id", None) or DEFAULT_REQUEST_ID

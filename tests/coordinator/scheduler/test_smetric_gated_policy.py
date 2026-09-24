@@ -377,6 +377,25 @@ class TestPolicy:
         mock_query.return_value = {}
         assert SMetricGatedPolicy.score_endpoints([_instance(1, [_endpoint(10)])], _req_info()) is None
 
+    @patch("motor.coordinator.scheduler.policy.smetric_gated.ConductorApiClient.query_conductor")
+    def test_missing_token_ids_does_not_import_tokenizer_and_returns_none(self, mock_query):
+        req_info = _req_info()
+        req_info.token_ids = None
+        req_info.engine_token_ids = None
+        assert SMetricGatedPolicy.score_endpoints([_instance(1, [_endpoint(10)])], req_info) is None
+        mock_query.assert_not_called()
+
+    @patch("motor.coordinator.scheduler.policy.smetric_gated.ConductorApiClient.query_conductor")
+    def test_prefers_engine_token_ids_over_token_ids(self, mock_query):
+        inst = _instance(1, [_endpoint(10)])
+        req_info = _req_info(100)
+        req_info.engine_token_ids = list(range(40))
+        mock_query.return_value = _conductor_tenant(inst, dp={(1, 10): 10})
+        ranked = SMetricGatedPolicy.score_endpoints([inst], req_info)
+        mock_query.assert_called_once()
+        assert mock_query.call_args.args[1] == list(range(40))
+        assert ranked[0].prefill_cost == 30.0
+
     def test_decode_falls_back_to_load_balance(self):
         policy = SMetricGatedPolicy(MockInstanceProvider())
         inst = _instance(1, [_endpoint(10)], role=PDRole.ROLE_D)

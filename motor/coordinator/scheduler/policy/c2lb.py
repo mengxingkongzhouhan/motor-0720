@@ -348,6 +348,7 @@ class GatedCandidate:
     endpoint: Endpoint
     prefill_cost: float
     cpu_hit_blocks: float
+    npu_hit: float = 0.0
 
     @property
     def key(self) -> tuple[int, int]:
@@ -385,7 +386,19 @@ def _ledger_value(endpoint: Endpoint, field: str) -> float:
 
 def sort_candidates(candidates: list[GatedCandidate]) -> list[GatedCandidate]:
     """Lowest ledger ``workload.prefill_cost`` first, ties by (instance_id, endpoint_id)."""
-    return sorted(candidates, key=lambda c: (c.ledger_prefill_cost, c.instance.id, c.endpoint.id))
+    endpoint_count = max(1, len(candidates[0].instance.get_all_endpoints()))
+    return sorted(candidates, key=lambda c: (c.ledger_prefill_cost + 0.05 * (c.instance.gathered_workload.prefill_cost / endpoint_count)))
+
+
+def sort_candidates_by_npu_hit(
+    candidates: list[GatedCandidate],
+    threshold: float,
+) -> list[GatedCandidate]:
+    return sorted(
+        (c for c in candidates if c.npu_hit > threshold),
+        key=lambda c: c.npu_hit,
+        reverse=True,
+    )
 
 
 def pick_gated(
@@ -405,20 +418,37 @@ def pick_gated(
     """
     if not candidates:
         return None
+
     n = len(candidates)
-    active_threshold = (sum(c.ledger_active_tokens for c in candidates) / n) * _factor(active_tokens_mean_factor)
-    cpu_threshold = (sum(c.ledger_cpu_hit_blocks for c in candidates) / n) * _factor(cpu_hit_blocks_mean_factor)
+    active_avg = sum(c.ledger_active_tokens for c in candidates) / n
+    cpu_avg = sum(c.ledger_cpu_hit_blocks for c in candidates) / n
+    prefill_cost_avg = sum(c.ledger_prefill_cost for c in candidates) / n
+
+    active_threshold = active_avg * _factor(active_tokens_mean_factor)
+    cpu_threshold = cpu_avg * _factor(cpu_hit_blocks_mean_factor)
+    prefill_cost_threshold = prefill_cost_avg * _factor(active_tokens_mean_factor)
+
+    candidates_with_hight_npu_hit = sort_candidates_by_npu_hit(candidates, 0.8)
+    if candidates_with_hight_npu_hit:
+
+         for cand in candidates_with_hight_npu_hit:
+            under_active = cand.ledger_active_tokens <= active_threshold
+            under_cpu = cand.ledger_cpu_hit_blocks <= cpu_threshold
+            under_prefill_cost = cand.ledger_prefill_cost <= prefill_cost_threshold
+
+            if under_active and under_cpu and under_prefill_cost:
+                return (cand, PICK_BOTH_GATES, active_threshold, cpu_threshold)
+   
     active_only: GatedCandidate | None = None
     for cand in candidates:
-        # <= (not <): on an idle cluster every ledger equals the 0 mean and must still pass.
+
+        if cand.ledger_prefill_cost > prefill_cost_avg:
+            return (candidates[0], PICK_MIN_LEDGER_PREFILL, active_threshold, cpu_threshold)
         under_active = cand.ledger_active_tokens <= active_threshold
         under_cpu = cand.ledger_cpu_hit_blocks <= cpu_threshold
         if under_active and under_cpu:
             return (cand, PICK_BOTH_GATES, active_threshold, cpu_threshold)
-        if under_active and active_only is None:
-            active_only = cand
-    if active_only is not None:
-        return (active_only, PICK_ACTIVE_GATE, active_threshold, cpu_threshold)
+
     return (candidates[0], PICK_MIN_LEDGER_PREFILL, active_threshold, cpu_threshold)
 
 

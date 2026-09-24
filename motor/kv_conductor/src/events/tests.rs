@@ -98,8 +98,8 @@ fn test_flex_hash_integrated_in_zmq_event_map() {
         map.object_keys.as_deref(),
         Some(
             [
-                "wen25-7B@pcp0@dcp1@head_or_tp_rank:0@aaa",
-                "wen25-7B@pcp0@dcp1@head_or_tp_rank:0@bbb"
+                "wen25-7B@pcp0@dcp1@head_or_tp_rank:0@aaa".to_string(),
+                "wen25-7B@pcp0@dcp1@head_or_tp_rank:0@bbb".to_string()
             ]
             .as_slice()
         )
@@ -973,7 +973,7 @@ fn test_memcache_batch_parse_and_apply_ip_only() {
     assert_eq!(hashes, vec![hash]);
     assert_eq!(
         event.object_keys.as_deref(),
-        Some(["wen25-7B@pcp0@dcp1@head_or_tp_rank:0@cache_role:kv@obj"].as_slice())
+        Some(["wen25-7B@pcp0@dcp1@head_or_tp_rank:0@cache_role:kv@obj".to_string()].as_slice())
     );
 
     // Apply under IpOnly: the event's backend_id (node IP) fans out to all

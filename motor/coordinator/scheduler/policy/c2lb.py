@@ -385,6 +385,8 @@ def _ledger_value(endpoint: Endpoint, field: str) -> float:
 
 def sort_candidates(candidates: list[GatedCandidate]) -> list[GatedCandidate]:
     """Lowest ledger ``workload.isl`` first, ties by (instance_id, endpoint_id)."""
+    if not candidates:
+        return []
     endpoint_count = max(1, len(candidates[0].instance.get_all_endpoints()))
     return sorted(candidates, key=lambda c: (c.ledger_isl + 0.05 * (c.instance.gathered_workload.isl / endpoint_count)))
 

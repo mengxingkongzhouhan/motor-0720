@@ -30,7 +30,6 @@ from motor.coordinator.scheduler.policy.factory import create
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.common.utils.singleton import ThreadSafeSingleton
 from motor.coordinator.scheduler.policy.c2lb import (
-    PICK_ACTIVE_GATE,
     PICK_BOTH_GATES,
     PICK_MIN_LEDGER_PREFILL,
     GatedCandidate,
@@ -219,11 +218,13 @@ class TestPickGated:
         assert [c.endpoint.id for c in ranked] == [1, 2]
 
     def test_first_under_both_averages_wins(self):
+        # ledger isl of the gated pick must stay at or below the candidate mean;
+        # walking past that mean falls back to the lowest-ledger endpoint.
         ranked = sort_candidates(
             [
                 _cand(1, ledger_prefill=10, active=90, cpu=0),
                 _cand(2, ledger_prefill=20, active=10, cpu=90),
-                _cand(3, ledger_prefill=30, active=20, cpu=10),
+                _cand(3, ledger_prefill=22, active=20, cpu=10),
                 _cand(4, ledger_prefill=40, active=0, cpu=0),
             ]
         )
@@ -260,12 +261,12 @@ class TestPickGated:
         assert chosen.endpoint.id == 1 and reason == PICK_BOTH_GATES
         assert (active_threshold, cpu_threshold) == (0.0, 0.0)
 
-    def test_fallback_active_gate_only(self):
+    def test_fallback_min_ledger_when_cpu_gate_fails(self):
         ranked = sort_candidates(
             [_cand(1, ledger_prefill=5, active=10, cpu=30), _cand(2, ledger_prefill=6, active=30, cpu=10)]
         )
         chosen, reason, _a, _c = pick_gated(ranked)
-        assert chosen.endpoint.id == 1 and reason == PICK_ACTIVE_GATE
+        assert chosen.endpoint.id == 1 and reason == PICK_MIN_LEDGER_PREFILL
 
     def test_all_equal_load_passes_gates_and_takes_lowest_ledger_prefill(self):
         ranked = sort_candidates(
@@ -387,7 +388,7 @@ class TestPolicy:
 
         ranked = C2LBPolicy.select_endpoint_candidates_from_list([inst_a, inst_b], req_info, top_k=2)
 
-        assert [(ep.id, score) for _i, ep, score in ranked] == [(20, 80.0), (10, 10.0)]
+        assert [(ep.id, score) for _i, ep, score in ranked] == [(10, 10.0), (20, 80.0)]
 
     @patch("motor.coordinator.scheduler.policy.c2lb.ConductorApiClient.query_conductor")
     def test_no_tenant_returns_none(self, mock_query):
@@ -709,8 +710,8 @@ class TestArbitration:
 
         assert selected is not None
         instance, endpoint, score = selected
-        assert (instance.id, endpoint.id) == (2, 20)
-        assert score == 90.0
+        assert (instance.id, endpoint.id) == (1, 10)
+        assert score == 30.0
 
     @pytest.mark.asyncio
     async def test_order_follows_ledger_not_request_cost(self):
@@ -750,7 +751,7 @@ class TestArbitration:
             gated_candidates=_gated_quads((1, 10, 5.0, 0.0), (1, 11, 60.0, 0.0)),
         )
 
-        assert selected[1].id == 11
+        assert selected[1].id == 10
 
     @pytest.mark.asyncio
     async def test_mean_factors_change_the_pick(self):

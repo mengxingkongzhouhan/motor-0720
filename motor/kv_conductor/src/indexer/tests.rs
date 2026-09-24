@@ -391,7 +391,7 @@ fn test_disk_continuation_from_cpu_breakpoint() {
     assert_eq!(dp0.cpu_blocks, 1);
     assert_eq!(dp0.disk_blocks, 1);
     // Disk only holds the tail; the SSD-resident hash list is that tail.
-    assert_eq!(dp0.disk_block_hashes, vec![300]);
+    assert_eq!(dp0.disk_block_hashes, vec!["300".to_string()]);
     // Unweighted coverage = exclusive sum × block_size.
     assert_eq!(dp0.matched_tokens, 3 * 4);
 }
@@ -1238,7 +1238,7 @@ fn test_disk_continuation_from_hbm_when_cpu_miss() {
     assert_eq!(dp0.npu_blocks, 1);
     assert_eq!(dp0.cpu_blocks, 0);
     assert_eq!(dp0.disk_blocks, 1);
-    assert_eq!(dp0.disk_block_hashes, vec![300]);
+    assert_eq!(dp0.disk_block_hashes, vec!["300".to_string()]);
     // Unweighted coverage includes exclusive disk extension.
     assert_eq!(dp0.matched_tokens, 2 * 4);
 }
@@ -1432,7 +1432,7 @@ fn test_lower_tier_longer_replica_extends_coverage() {
     );
     assert_eq!(
         dp0.disk_block_hashes,
-        vec![201, 202],
+        vec!["201".to_string(), "202".to_string()],
         "SSD hash list is the exclusive Disk extension beyond NPU"
     );
     assert_eq!(dp0.disk_block_hashes.len() as u32, dp0.disk_blocks);
@@ -1590,7 +1590,7 @@ fn test_exclusive_sum_is_unweighted_matched_tokens() {
     assert_eq!(dp0.npu_blocks, 1);
     assert_eq!(dp0.cpu_blocks, 1);
     assert_eq!(dp0.disk_blocks, 1);
-    assert_eq!(dp0.disk_block_hashes, vec![300]);
+    assert_eq!(dp0.disk_block_hashes, vec!["300".to_string()]);
     assert_eq!(
         dp0.matched_tokens,
         (dp0.npu_blocks + dp0.cpu_blocks + dp0.disk_blocks) * 4
@@ -1630,7 +1630,7 @@ fn test_disk_only_coverage_matched_tokens() {
     assert_eq!(dp0.npu_blocks, 0);
     assert_eq!(dp0.cpu_blocks, 0);
     assert_eq!(dp0.disk_blocks, 1);
-    assert_eq!(dp0.disk_block_hashes, vec![100]);
+    assert_eq!(dp0.disk_block_hashes, vec!["100".to_string()]);
     assert_eq!(dp0.matched_tokens, 4);
 }
 
@@ -1683,7 +1683,49 @@ fn test_query_by_hash_returns_ssd_block_hashes() {
         .unwrap();
     let dp0 = &resp.tenants["t1"]["inst-1"].dp["0"];
     assert_eq!(dp0.disk_blocks, 1);
-    assert_eq!(dp0.disk_block_hashes, vec![300]);
+    assert_eq!(dp0.disk_block_hashes, vec!["300".to_string()]);
+}
+
+/// MemCache `object_keys` are what `/query` returns as `disk_block_hashes`.
+/// Matching still uses the numeric engine hash; the store key is a remap
+/// of the exclusive Disk slice.
+#[test]
+fn test_query_returns_memcache_object_keys_as_disk_block_hashes() {
+    let indexer = Indexer::new();
+    let entry = indexer.get_or_create("model-object-keys", "t1");
+    let tokens: Vec<i64> = (0..12).collect();
+    let hashes = compute_block_hash_for_seq(&tokens, 4);
+    assert_eq!(hashes.len(), 3);
+
+    store_chain(
+        &entry,
+        &worker_of("inst-1", 0, StorageMedium::Npu),
+        None,
+        &[(100, hashes[0].0)],
+    );
+    store_chain(
+        &entry,
+        &worker_of("inst-1", 0, StorageMedium::Disk),
+        None,
+        &[(200, hashes[0].0), (201, hashes[1].0), (202, hashes[2].0)],
+    );
+
+    let key_a = "wen25-7B@pcp0@dcp1@head_or_tp_rank:0@group:0@cache_role:kv@cache_family:default@layer_id:3@aaa".to_string();
+    let key_b = "wen25-7B@pcp0@dcp1@head_or_tp_rank:0@group:0@cache_role:kv@cache_family:default@layer_id:3@bbb".to_string();
+    let key_c = "wen25-7B@pcp0@dcp1@head_or_tp_rank:0@group:0@cache_role:kv@cache_family:default@layer_id:3@ccc".to_string();
+    entry.record_object_keys(&[200, 201, 202], &[key_a, key_b.clone(), key_c.clone()]);
+
+    let resp = indexer
+        .query("model-object-keys", "t1", &tokens, 4)
+        .unwrap();
+    let dp0 = &resp.tenants["t1"]["inst-1"].dp["0"];
+    assert_eq!(dp0.npu_blocks, 1);
+    assert_eq!(dp0.disk_blocks, 2);
+    assert_eq!(
+        dp0.disk_block_hashes,
+        vec![key_b, key_c],
+        "exclusive Disk slice remaps through object_keys, not seq_hashes"
+    );
 }
 
 /// Registration pod → DP table is the query target list. A store-only

@@ -97,9 +97,12 @@ struct MediumEnds {
     /// sits in this DP's own Pod — hence on its own machine. The remainder of
     /// `cpu - npu` is what has to come over the wire.
     cpu_local: u32,
-    /// Engine `block_hash` of the exclusive Disk slice, prefix order.
+    /// Store identities of the exclusive Disk slice, prefix order.
     /// Same range as `disk_blocks`: `[max(npu, cpu), disk)`.
-    disk_hashes: Vec<u64>,
+    ///
+    /// Prefer the MemCache `object_key` recorded from the pool event;
+    /// fall back to the decimal engine `block_hash` when no key was seen.
+    disk_hashes: Vec<String>,
 }
 
 /// The two accumulators a matching pass writes into.
@@ -214,6 +217,11 @@ pub(crate) struct OffloadPoolState {
     /// `block_hash → workers`: pool events waiting for offload `tokens_hash`.
     /// Values are `FxHashSet` to deduplicate repeated deliveries.
     pub(crate) pending_pool: FxHashMap<u64, FxHashSet<PendingPoolEvent>>,
+    /// Engine `block_hash` → MemCache `object_key`, filled from the pool
+    /// stored event's parallel `object_keys` array. `/query` remaps the
+    /// exclusive Disk slice through this table so prefetch gets the store
+    /// key, not the numeric seq_hash.
+    pub(crate) object_keys: FxHashMap<u64, String>,
 }
 
 /// Key identifying a unique indexer instance: (model_name, tenant_id).
@@ -616,11 +624,7 @@ impl IndexerEntry {
                 sink.medium_ends
                     .entry((instance_id.clone(), *dp_rank))
                     .or_default()
-                    .disk_hashes = reached
-                    .blocks_from(exclusive_from)
-                    .iter()
-                    .map(|h| h.0)
-                    .collect();
+                    .disk_hashes = self.resolve_disk_block_ids(reached.blocks_from(exclusive_from));
             }
             if let Some(local) = local {
                 Self::note_local_hits(sink.medium_ends, instance_id, *dp_rank, medium, local);
@@ -725,6 +729,46 @@ impl IndexerEntry {
             return Some((cached.content.parent_hash, cached.content.tokens_hash));
         }
         None
+    }
+
+    /// Record MemCache `object_keys` against the parallel engine hashes.
+    ///
+    /// Arrays are zipped; a shorter side is truncated. Empty keys are
+    /// ignored so a later event can still fill them. Last writer wins —
+    /// the store key is content-addressed, so repeats are the same string.
+    pub(crate) fn record_object_keys(&self, block_hashes: &[u64], object_keys: &[String]) {
+        if object_keys.is_empty() || block_hashes.is_empty() {
+            return;
+        }
+        let mut state = self.offload_pool_state.write();
+        for (hash, key) in block_hashes.iter().zip(object_keys.iter()) {
+            if !key.is_empty() {
+                state.object_keys.insert(*hash, key.clone());
+            }
+        }
+    }
+
+    /// Map exclusive Disk `block_hash`es to the identities `/query` returns.
+    ///
+    /// Prefers the MemCache `object_key` recorded from the pool event.
+    /// Blocks that never carried `object_keys` (engine-only Disk inserts,
+    /// Mooncake) fall back to the decimal engine hash so the
+    /// `len == disk_blocks` invariant still holds.
+    fn resolve_disk_block_ids(&self, hashes: &[SequenceBlockHash]) -> Vec<String> {
+        if hashes.is_empty() {
+            return Vec::new();
+        }
+        let state = self.offload_pool_state.read();
+        hashes
+            .iter()
+            .map(|h| {
+                state
+                    .object_keys
+                    .get(&h.0)
+                    .cloned()
+                    .unwrap_or_else(|| h.0.to_string())
+            })
+            .collect()
     }
 
     /// Ingest pool backend blocks from Mooncake / YuanRong stored events.

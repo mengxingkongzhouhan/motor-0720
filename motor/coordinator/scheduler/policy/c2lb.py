@@ -66,6 +66,8 @@ from motor.coordinator.scheduler.policy.utils import (
 
 logger = get_logger(__name__)
 
+BLOCK_SIZE = 128
+
 # Roles that do prefill, i.e. whose allocations have a conductor cost and CPU hit count.
 C2LB_ROLES = frozenset({PDRole.ROLE_P, PDRole.ROLE_U})
 
@@ -528,6 +530,7 @@ class C2LBPolicy(BaseSchedulingPolicy):
                         endpoint=ep,
                         prefill_cost=_prefill_cost(isl, _matched_tokens(matched)),
                         cpu_hit_blocks=_cpu_hit_blocks(matched),
+                        npu_hit =_npu_hit_blocks(matched) * BLOCK_SIZE / isl,
                     )
                 )
         if not any_instance:

@@ -26,7 +26,7 @@ class Workload(BaseModel):
     isl: float = Field(
         default=0,
         description="In-flight prompt length on this endpoint: sum of max(0, isl) over "
-        "requests currently running here (c2lb / kv_cache_affinity); 0 for RR/LB. "
+        "requests currently running here (c2lb only); 0 for kv_cache_affinity / RR / LB. "
         "Worker-local overlay on motor-0924 (not carried in schema-4 SHM).",
     )
     cpu_hit_blocks: float = Field(

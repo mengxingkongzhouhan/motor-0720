@@ -1030,9 +1030,8 @@ class AsyncSchedulerClient:
         """Same commit formula the former ALLOCATE_ONLY handler used (R4).
 
         c2lb stamps overlay ``isl = max(0, request_isl)`` and cpu_blocks.
-        kv_cache_affinity still commits SHM ``active_tokens`` as ``isl - matched``, and
-        additionally stamps overlay ``isl = max(0, request_isl)`` (cache hits do not
-        reduce the overlay). RR/LB leave overlay fields at 0.
+        kv_cache_affinity commits SHM ``active_tokens`` as ``isl - matched`` and leaves
+        overlay ``isl`` / ``cpu_hit_blocks`` at 0. RR/LB leave overlay fields at 0.
         """
         if candidate_policy == CANDIDATE_POLICY_C2LB and role in (PDRole.ROLE_P, PDRole.ROLE_U):
             active_tokens = demand.active_tokens

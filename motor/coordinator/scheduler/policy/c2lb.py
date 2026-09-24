@@ -7,26 +7,24 @@
 # See the Mulan PSL v2 for more details.
 
 """
-C2LB scheduling policy: rank endpoints by their ledger, gate on two ledger averages.
+C2LB scheduling policy: queue by ledger isl, then gate the other two ledger loads.
 
-1. Sort the endpoints of the request's role by the ledger ``workload.isl`` ascending,
-   i.e. the in-flight request length currently outstanding on each endpoint (sum over its
-   in-flight requests of ``max(0, isl)``).
-2. Walk that order and commit the first endpoint whose ledger is at or below BOTH scaled
-   averages over the ranked endpoints:
+1. Sort the endpoints of the request's role by ledger ``workload.isl`` ascending
+   (in-flight request length: sum of ``max(0, isl)`` over requests running there),
+   with a small share of the instance's gathered isl as a tie-break.
+2. Prefer a high-NPU-hit candidate (``npu_hit > 0.8``, highest first) that also
+   passes all three scaled-mean gates: ``isl``, ``active_tokens``, and ``cpu_hit_blocks``.
+3. Otherwise walk the isl-ordered list and take the first DP whose other two ledger
+   fields are at or below their scaled means:
    ``active_tokens <= mean(active_tokens) * active_tokens_mean_factor`` and
-   ``cpu_hit_blocks <= mean(cpu_hit_blocks) * cpu_hit_blocks_mean_factor``
-   (factors from ``SchedulerConfig.c2lb``, default 1.0). ``<=`` so that an idle
-   cluster (every ledger 0, mean 0) still passes the gates instead of relying on the fallback.
+   ``cpu_hit_blocks <= mean(cpu_hit_blocks) * cpu_hit_blocks_mean_factor``.
+   Walking stops once ``isl`` exceeds the candidate mean; the head of the list
+   (lowest ledger isl) is used then, and also when nobody passes the two load gates.
+   ``<=`` so an idle cluster (every ledger 0, mean 0) still passes.
 
-All three inputs are ledger fields, so the ranking itself needs no per-request affinity math.
-The KV Conductor is queried once per request only to know what to ADD to the committed
-endpoint's ledger: the request's own prompt length (``max(0, isl)``) and the CPU-tier KV
-blocks it would pull there (``cpu_blocks``). RELEASE subtracts both again, so ``isl`` /
-``cpu_hit_blocks`` track the in-flight prompt length and CPU->NPU KV transfer per endpoint.
-
-When no endpoint passes both gates the policy degrades in order: first endpoint passing the
-``active_tokens`` gate alone, then the head of the list (lowest ledger isl).
+The KV Conductor is queried once per request for this request's stamp values
+(``prefill_cost``, ``cpu_blocks``). The committed overlay stamps
+``isl = max(0, request_isl)`` and ``cpu_hit_blocks``. RELEASE subtracts both again.
 
 On motor-0924 the authoritative re-pick lives in worker-local ``allocate_arbitration``
 (schema-4 SHM CAS). ``active_tokens`` is the cross-worker SHM ledger; ``isl`` and
@@ -92,7 +90,6 @@ def _factor(value: float | None) -> float:
 
 # How the final endpoint was chosen (returned for logging / tests).
 PICK_BOTH_GATES = "both_gates"
-PICK_ACTIVE_GATE = "active_gate"
 PICK_MIN_LEDGER_PREFILL = "min_ledger_prefill"
 
 
@@ -340,9 +337,11 @@ class GatedCandidate:
     """
     One endpoint of the request's role.
 
-    ``prefill_cost`` / ``cpu_hit_blocks`` are what THIS request would add to the endpoint ledger
-    if committed there (conductor-derived); they are stamped on allocation and never used for
-    ordering. Ordering and gating read the endpoint's current ledger via ``endpoint.workload``.
+    ``prefill_cost`` / ``cpu_hit_blocks`` / ``npu_hit`` are THIS request's conductor stamps
+    (remaining prefill, CPU blocks, NPU hit rate). Ordering and load gates read the endpoint
+    ledger via ``endpoint.workload`` (``isl`` / ``active_tokens`` / ``cpu_hit_blocks``).
+    High ``npu_hit`` only changes pick priority; the committed overlay still stamps
+    ``isl = max(0, request_isl)`` and ``cpu_hit_blocks``.
     """
 
     instance: Instance
@@ -386,7 +385,7 @@ def _ledger_value(endpoint: Endpoint, field: str) -> float:
 
 
 def sort_candidates(candidates: list[GatedCandidate]) -> list[GatedCandidate]:
-    """Lowest ledger ``workload.isl`` first, ties by (instance_id, endpoint_id)."""
+    """Lowest ledger ``workload.isl`` first, plus a small share of instance gathered isl."""
     if not candidates:
         return []
     endpoint_count = max(1, len(candidates[0].instance.get_all_endpoints()))
@@ -397,6 +396,7 @@ def sort_candidates_by_npu_hit(
     candidates: list[GatedCandidate],
     threshold: float,
 ) -> list[GatedCandidate]:
+    """Candidates with ``npu_hit`` above ``threshold``, highest hit rate first."""
     return sorted(
         (c for c in candidates if c.npu_hit > threshold),
         key=lambda c: c.npu_hit,
@@ -410,14 +410,14 @@ def pick_gated(
     cpu_hit_blocks_mean_factor: float = DEFAULT_MEAN_FACTOR,
 ) -> tuple[GatedCandidate, str, float, float] | None:
     """
-    Walk ``candidates`` (already in ledger isl order) and return the first one whose
-    ledger is at or below both scaled averages, plus the pick reason and the two thresholds
-    actually used (``mean * factor``).
+    Pick from ``candidates`` (already in ledger isl order).
 
-    Averages are taken over the candidates' current ledgers (``endpoint.workload``), so the
-    caller decides which view is authoritative (worker SHM cache vs overlay).
-    Fallback order when nothing passes both gates: active_tokens gate only, then the head of the
-    list (lowest ledger isl).
+    High-NPU-hit candidates (``npu_hit > 0.8``, highest first) that pass all three
+    scaled-mean gates win immediately. Otherwise walk the isl queue and take the first
+    DP whose ``active_tokens`` and ``cpu_hit_blocks`` are at or below their scaled
+    averages; once ``isl`` exceeds the candidate mean, fall back to the lowest-isl head.
+    The two returned thresholds are ``mean(active_tokens) * factor`` and
+    ``mean(cpu_hit_blocks) * factor``.
     """
     if not candidates:
         return None
@@ -441,8 +441,7 @@ def pick_gated(
 
             if under_active and under_cpu and under_isl:
                 return (cand, PICK_BOTH_GATES, active_threshold, cpu_threshold)
-   
-    active_only: GatedCandidate | None = None
+
     for cand in candidates:
 
         if cand.ledger_isl > isl_avg:
@@ -456,7 +455,7 @@ def pick_gated(
 
 
 def format_candidates(candidates: list[GatedCandidate]) -> str:
-    """``ins-ep:ledger_prefill/active/cpu(+req_cost/+req_cpu)`` per candidate, for the selection log."""
+    """``ins-ep:ledger_isl/active/cpu(+req_cost/+req_cpu)`` per candidate, for the selection log."""
     return " ".join(
         f"{c.instance.id}-{c.endpoint.id}:{c.ledger_isl:.0f}/{c.ledger_active_tokens:.0f}/"
         f"{c.ledger_cpu_hit_blocks:.0f}(+{c.prefill_cost:.0f}/+{c.cpu_hit_blocks:.0f})"
@@ -466,7 +465,8 @@ def format_candidates(candidates: list[GatedCandidate]) -> str:
 
 class C2LBPolicy(BaseSchedulingPolicy):
     """
-    Rank by ledger isl, commit the first endpoint under both ledger load averages.
+    Rank by ledger isl, prefer a high-NPU-hit DP that passes all three gates,
+    otherwise the first DP under the two load averages.
 
     Workers run the conductor query (for the stamp values) and re-rank / re-gate against the
     local cache (SHM ``active_tokens`` + worker-local overlay) before CAS-committing.
@@ -492,7 +492,7 @@ class C2LBPolicy(BaseSchedulingPolicy):
         """
         Conductor lookup: every endpoint as a ``GatedCandidate``, sorted by its ledger isl.
 
-        The conductor only supplies the per-endpoint stamp values (request cost, cpu_blocks).
+        The conductor supplies per-endpoint stamp values (request cost, cpu_blocks).
         ``None`` means it had no data for our instances (caller falls back). Also caches
         ``{(instance_id, endpoint_id): (prefill_cost, cpu_hit_blocks)}`` on
         ``req_info.c2lb_debug`` for the allocate stamp.
@@ -543,7 +543,7 @@ class C2LBPolicy(BaseSchedulingPolicy):
         ranked = sort_candidates(candidates)
         req_info.c2lb_debug = {c.key: (c.prefill_cost, c.cpu_hit_blocks) for c in ranked}
         logger.info(
-            "c2lb: req_id=%s isl=%s ranked[ins-ep:ledger_prefill/active/cpu(+req_cost/+req_cpu)]=%s",
+            "c2lb: req_id=%s isl=%s ranked[ins-ep:ledger_isl/active/cpu(+req_cost/+req_cpu)]=%s",
             req_id,
             isl,
             format_candidates(ranked),
@@ -559,7 +559,8 @@ class C2LBPolicy(BaseSchedulingPolicy):
         cpu_hit_blocks_mean_factor: float = DEFAULT_MEAN_FACTOR,
     ) -> list[tuple[Instance, Endpoint, float]] | None:
         """
-        Worker-side proposal: the gated pick first, then the rest in ledger isl order.
+        Worker-side proposal: the gated pick first (high-NPU three-gate win, else
+        isl-queue + two load gates), then the rest in ledger isl order.
 
         ``allocate_arbitration`` re-ranks and re-gates on the cache after a SHM refresh.
         """

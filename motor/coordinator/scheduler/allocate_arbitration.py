@@ -312,9 +312,11 @@ def select_c2lb(
     """
     c2lb arbitration on the worker's fresh cache (SHM active_tokens + overlay).
 
-    Resolve every scored endpoint that is still schedulable, sort by the endpoint's ledger
-    ``isl`` and take the first one at or below both scaled ledger averages. The
-    worker-supplied per-endpoint cost / cpu_blocks are only the values stamped on commit.
+    Resolve every scored endpoint that is still schedulable, sort by ledger ``isl``,
+    prefer a high-NPU-hit DP that also passes the three scaled-mean gates, otherwise
+    take the first DP whose ``active_tokens`` and ``cpu_hit_blocks`` are under their
+    scaled averages (stop if ``isl`` exceeds the candidate mean). Worker-supplied
+    per-endpoint cost / cpu_blocks are only the values stamped on commit.
     The returned score is the committed endpoint's ledger isl.
     """
     if not gated_candidates:
@@ -361,7 +363,7 @@ def select_c2lb(
     chosen, reason, active_threshold, cpu_threshold = picked
     logger.info(
         "c2lb: req_id=%s pick=%s-%s reason=%s active_threshold=%.1f cpu_threshold=%.1f "
-        "factors=%.2f/%.2f ranked[ins-ep:ledger_prefill/active/cpu(+req_cost/+req_cpu)]=%s",
+        "factors=%.2f/%.2f ranked[ins-ep:ledger_isl/active/cpu(+req_cost/+req_cpu)]=%s",
         req_id,
         chosen.instance.id,
         chosen.endpoint.id,
@@ -396,7 +398,8 @@ def select_authoritative_allocate_candidate(
     Load-balance scans all endpoints. KV-cache affinity in unified mode re-ranks EVERY reported
     endpoint by ``prefill_load_scale*prefill_cost + load_weight*fresh_load``; older affinity callers
     without per-endpoint prefill_cost fall back to "least-loaded among the ranked alternates".
-    c2lb re-sorts by ledger isl and applies the two mean gates.
+    c2lb re-sorts by ledger isl, prefers a high-NPU-hit DP under all three gates,
+    otherwise applies the two load-mean gates.
     Other policies keep the proposed endpoint. ``excluded`` (pairs this CAS round already
     rejected) is forwarded to every branch that scans beyond ``candidates``.
     """

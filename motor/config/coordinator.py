@@ -197,8 +197,9 @@ class SchedulerType(Enum):
     LOAD_BALANCE = "load_balance"
     ROUND_ROBIN = "round_robin"
     KV_CACHE_AFFINITY = "kv_cache_affinity"
-    # C2LB ordering (ledger isl ascending), then the first endpoint at or below both
-    # ledger averages (active_tokens and cpu_hit_blocks) wins. Prefill / encode / union only.
+    # C2LB: queue by ledger isl, prefer high-NPU-hit under all three gates, else the
+    # first DP whose active_tokens and cpu_hit_blocks are under their scaled means.
+    # Prefill / encode / union only.
     C2LB = "c2lb"
 
     @classmethod
@@ -399,8 +400,10 @@ class KvAffinityConfig:
 class C2LBConfig:
     """Tunables for ``prefill_scheduler_type=c2lb``.
 
-    Nested under ``scheduler_config.c2lb`` in user JSON. Endpoints are walked in ledger
-    ``isl`` order and the first one passing both gates is committed:
+    Nested under ``scheduler_config.c2lb`` in user JSON. Endpoints are queued by
+    ledger ``isl``. A high-NPU-hit DP that also passes the three scaled-mean gates
+    (isl / active_tokens / cpu_hit_blocks) is preferred; otherwise the first DP
+    whose other two ledger fields pass is committed:
     ``active_tokens <= mean(active_tokens) * active_tokens_mean_factor`` and
     ``cpu_hit_blocks <= mean(cpu_hit_blocks) * cpu_hit_blocks_mean_factor``.
     """

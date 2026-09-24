@@ -8,7 +8,7 @@
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
 
-"""Tests for C2LBPolicy: ledger isl order, then first endpoint under both ledger averages."""
+"""Tests for C2LBPolicy: ledger isl queue, two load gates, high-NPU-hit three-gate preference."""
 
 import json
 from types import SimpleNamespace

@@ -1056,8 +1056,7 @@ class AsyncSchedulerClient:
                     matched_tokens=matched_tokens_map.get((instance.id, endpoint.id), 0.0),
                 ).active_tokens
             return Workload(
-                active_tokens=active_tokens,
-                isl=max(0.0, float(isl)),
+                active_tokens=active_tokens
             )
         return demand
 

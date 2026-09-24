@@ -22,6 +22,79 @@ from motor.common.utils.image_utils import get_mul_token
 logger = get_logger(__name__)
 
 
+def allocated_prefill_cost(
+    req_info: RequestInfo | None,
+    instance_id: int | None = None,
+    endpoint_id: int | None = None,
+) -> float:
+    """
+    Prefill cost stamped onto the committed endpoint's workload.
+
+    ``smetric_gated`` caches ``(prefill_cost, cpu_hit_blocks)`` per endpoint. KV affinity
+    stores a 4-tuple whose third field is the request prefill cost. Missing/invalid entries
+    yield 0.
+    """
+    if req_info is None or instance_id is None or endpoint_id is None:
+        return 0.0
+    gated = getattr(req_info, "smetric_gated_debug", None)
+    if isinstance(gated, dict):
+        rec = gated.get((instance_id, endpoint_id))
+        return _non_negative(rec[0] if isinstance(rec, (tuple, list)) and rec else None)
+    return affinity_prefill_cost(req_info, instance_id, endpoint_id)
+
+
+def allocated_cpu_hit_blocks(
+    req_info: RequestInfo | None,
+    instance_id: int | None = None,
+    endpoint_id: int | None = None,
+) -> float:
+    """
+    CPU-tier matched blocks stamped onto the committed endpoint's workload.
+
+    Only ``smetric_gated`` records these (``req_info.smetric_gated_debug``); other policies leave
+    the ledger field at 0.
+    """
+    if req_info is None or instance_id is None or endpoint_id is None:
+        return 0.0
+    gated = getattr(req_info, "smetric_gated_debug", None)
+    if not isinstance(gated, dict):
+        return 0.0
+    rec = gated.get((instance_id, endpoint_id))
+    return _non_negative(rec[1] if isinstance(rec, (tuple, list)) and len(rec) > 1 else None)
+
+
+def _non_negative(value) -> float:
+    if value is None:
+        return 0.0
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def affinity_prefill_cost(
+    req_info: RequestInfo | None,
+    instance_id: int | None = None,
+    endpoint_id: int | None = None,
+) -> float:
+    """KV-affinity prefill cost for one endpoint, or 0 when absent."""
+    if req_info is None or instance_id is None or endpoint_id is None:
+        return 0.0
+    debug = getattr(req_info, "kv_affinity_debug", None)
+    if not isinstance(debug, dict):
+        return 0.0
+    rec = debug.get((instance_id, endpoint_id))
+    if rec is None:
+        return 0.0
+    try:
+        cost = rec[2]
+    except (IndexError, TypeError, KeyError):
+        return 0.0
+    if cost is None:
+        return 0.0
+    return _non_negative(cost)
+
+
 def calculate_demand_workload(role: PDRole, req_info: RequestInfo) -> Workload:
     """
     Compute demand workload for non-affinity allocation paths.

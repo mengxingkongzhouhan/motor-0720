@@ -24,6 +24,7 @@ from motor.config.coordinator import SchedulerType
 from motor.coordinator.scheduler.policy.base import BaseSchedulingPolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
+from motor.coordinator.scheduler.policy.smetric_gated import SMetricGatedPolicy
 from tests.coordinator.scheduler.conftest import MockInstanceProvider
 
 
@@ -39,6 +40,11 @@ class TestPolicyFactory(unittest.TestCase):
         """create returns a LoadBalancePolicy for LOAD_BALANCE type."""
         policy = create(SchedulerType.LOAD_BALANCE, MockInstanceProvider())
         self.assertIsInstance(policy, LoadBalancePolicy)
+
+    def test_create_smetric_gated(self):
+        """create returns a SMetricGatedPolicy for SMETRIC_GATED type."""
+        policy = create(SchedulerType.SMETRIC_GATED, MockInstanceProvider())
+        self.assertIsInstance(policy, SMetricGatedPolicy)
 
     def test_create_unknown_type_raises(self):
         """create raises ValueError for unregistered type."""

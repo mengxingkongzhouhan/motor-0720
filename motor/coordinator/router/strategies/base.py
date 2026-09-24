@@ -301,7 +301,11 @@ class BaseRouter(ABC):
                 role=key[-1],
                 req_id=self.req_info.req_id,
                 workload_action=WorkloadAction.RELEASE_TOKENS,
-                workload_change=Workload(active_tokens=-workload.active_tokens),
+                workload_change=Workload(
+                    active_tokens=-workload.active_tokens,
+                    prefill_cost=-float(getattr(workload, "prefill_cost", 0) or 0),
+                    cpu_hit_blocks=-float(getattr(workload, "cpu_hit_blocks", 0) or 0),
+                ),
             )
             try:
                 ok = await self._scheduler.update_workload(params)
@@ -508,6 +512,8 @@ class BaseRouter(ABC):
         """Undo a scheduler allocation if local request workload bookkeeping fails."""
         rollback_workload = Workload(
             active_tokens=-allocate_workload.active_tokens,
+            prefill_cost=-float(getattr(allocate_workload, "prefill_cost", 0) or 0),
+            cpu_hit_blocks=-float(getattr(allocate_workload, "cpu_hit_blocks", 0) or 0),
         )
         params = UpdateWorkloadParams(
             instance_id=instance.id,

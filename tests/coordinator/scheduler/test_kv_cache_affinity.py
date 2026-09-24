@@ -25,6 +25,11 @@ from motor.config.coordinator import (
     CONTEXT_BUDGET_ON,
     SchedulerType,
 )
+from motor.coordinator.scheduler.runtime.scheduler_client import (
+    AsyncSchedulerClient,
+    SchedulerClientConfig,
+)
+from motor.coordinator.scheduler.runtime.zmq_protocol import CANDIDATE_POLICY_KV_CACHE_AFFINITY
 from motor.coordinator.scheduler.policy.kv_cache_affinity import (
     adapt_context_budget,
     KvCacheAffinityPolicy,
@@ -2349,3 +2354,63 @@ def test_context_budget_leaves_exhausted_prompt_to_engine_validation():
     adapt_context_budget(req_info, _context_budget_config())
 
     assert req_info.req_data["max_tokens"] == 8
+
+
+class TestKvAffinityLedgerStamp:
+    """kv_cache_affinity overlay: prefill_cost = max(0, isl); SHM tokens still isl - matched."""
+
+    def test_committed_prefill_cost_is_full_isl_not_cache_remainder(self):
+        client = AsyncSchedulerClient(SchedulerClientConfig(scheduler_type="kv_cache_affinity"))
+        inst = Mock()
+        inst.id = 1
+        ep = Mock()
+        ep.id = 10
+        committed = client._committed_workload_for(
+            PDRole.ROLE_P,
+            CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+            inst,
+            ep,
+            Workload(active_tokens=100.0),
+            {(1, 10): 90.0},
+            100.0,
+        )
+        assert committed.active_tokens == 10.0
+        assert committed.prefill_cost == 100.0
+        assert committed.cpu_hit_blocks == 0.0
+
+    def test_union_role_stamps_full_isl(self):
+        client = AsyncSchedulerClient(SchedulerClientConfig(scheduler_type="kv_cache_affinity"))
+        inst = Mock()
+        inst.id = 2
+        ep = Mock()
+        ep.id = 20
+        committed = client._committed_workload_for(
+            PDRole.ROLE_U,
+            CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+            inst,
+            ep,
+            Workload(active_tokens=50.0),
+            {(2, 20): 10.0},
+            80.0,
+        )
+        assert committed.active_tokens == 70.0
+        assert committed.prefill_cost == 80.0
+
+    def test_decode_does_not_stamp_overlay_prefill_cost(self):
+        client = AsyncSchedulerClient(SchedulerClientConfig(scheduler_type="kv_cache_affinity"))
+        inst = Mock()
+        inst.id = 1
+        ep = Mock()
+        ep.id = 10
+        demand = Workload(active_tokens=8.0)
+        committed = client._committed_workload_for(
+            PDRole.ROLE_D,
+            CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+            inst,
+            ep,
+            demand,
+            {(1, 10): 90.0},
+            100.0,
+        )
+        assert committed is demand
+        assert committed.prefill_cost == 0.0

@@ -121,6 +121,7 @@ def _arbitration_context(
     blocked: tuple[int, ...] = (),
     active_factor: float = 1.0,
     cpu_factor: float = 1.0,
+    isl_factor: float = 1.0,
 ) -> ArbitrationContext:
     blocked_set = set(blocked)
     return ArbitrationContext(
@@ -130,6 +131,7 @@ def _arbitration_context(
         is_load_balance_scheduler=False,
         c2lb_active_factor=active_factor,
         c2lb_cpu_factor=cpu_factor,
+        c2lb_isl_factor=isl_factor,
     )
 
 
@@ -367,6 +369,21 @@ class TestPickGated:
         assert plain.endpoint.id == 2 and reason_plain == PICK_BOTH_GATES
         assert loose.endpoint.id == 1 and reason_loose == PICK_BOTH_GATES
 
+    def test_isl_factor_only_affects_high_npu_isl_gate(self):
+        ranked = sort_candidates(
+            [
+                _cand(1, ledger_prefill=10, active=5, cpu=5, npu_hit=0.0),
+                _cand(2, ledger_prefill=30, active=5, cpu=5, npu_hit=0.9),
+                _cand(3, ledger_prefill=20, active=5, cpu=5, npu_hit=0.0),
+            ]
+        )
+        plain, reason_plain, _a, _c = pick_gated(ranked)
+        loose, reason_loose, _a2, _c2 = pick_gated(ranked, isl_mean_factor=2.0)
+        tight, reason_tight, _a3, _c3 = pick_gated(ranked, isl_mean_factor=0.4)
+        assert plain.endpoint.id == 1 and reason_plain == PICK_BOTH_GATES
+        assert loose.endpoint.id == 2 and reason_loose == PICK_BOTH_GATES
+        assert tight.endpoint.id == 1 and reason_tight == PICK_BOTH_GATES
+
     def test_negative_or_none_factor_normalized(self):
         ranked = sort_candidates(
             [_cand(1, ledger_prefill=1, active=10, cpu=10), _cand(2, ledger_prefill=2, active=30, cpu=30)]
@@ -488,10 +505,11 @@ class TestPolicy:
         config.scheduler_config.decode_scheduler_type = SchedulerType.LOAD_BALANCE
         config.scheduler_config.c2lb.active_tokens_mean_factor = 1.5
         config.scheduler_config.c2lb.cpu_hit_blocks_mean_factor = 0.5
+        config.scheduler_config.c2lb.isl_mean_factor = 2.0
         scheduler = Scheduler(instance_provider=MockInstanceProvider(), config=config)
         policy = scheduler.get_scheduling_policy(PDRole.ROLE_P)
         assert isinstance(policy, C2LBPolicy)
-        assert policy.mean_factors == (1.5, 0.5)
+        assert policy.mean_factors == (1.5, 0.5, 2.0)
         assert scheduler.get_scheduling_policy(PDRole.ROLE_D) is not policy
         assert not isinstance(scheduler.get_scheduling_policy(PDRole.ROLE_D), C2LBPolicy)
 
@@ -512,7 +530,11 @@ class TestPolicy:
                     "scheduler_config": {
                         "prefill_scheduler_type": "c2lb",
                         "decode_scheduler_type": "load_balance",
-                        "c2lb": {"active_tokens_mean_factor": 1.3, "cpu_hit_blocks_mean_factor": 0.8},
+                        "c2lb": {
+                            "active_tokens_mean_factor": 1.3,
+                            "cpu_hit_blocks_mean_factor": 0.8,
+                            "isl_mean_factor": 1.6,
+                        },
                     }
                 }
             ),
@@ -523,6 +545,7 @@ class TestPolicy:
         assert config.scheduler_config.decode_scheduler_type is SchedulerType.LOAD_BALANCE
         assert config.scheduler_config.c2lb.active_tokens_mean_factor == 1.3
         assert config.scheduler_config.c2lb.cpu_hit_blocks_mean_factor == 0.8
+        assert config.scheduler_config.c2lb.isl_mean_factor == 1.6
 
     def test_legacy_scheduler_type_json_sets_both_roles(self, tmp_path, caplog):
         cfg_path = tmp_path / "coordinator.json"
@@ -531,7 +554,11 @@ class TestPolicy:
                 {
                     "scheduler_config": {
                         "scheduler_type": "c2lb",
-                        "c2lb": {"active_tokens_mean_factor": 1.1, "cpu_hit_blocks_mean_factor": 0.9},
+                        "c2lb": {
+                            "active_tokens_mean_factor": 1.1,
+                            "cpu_hit_blocks_mean_factor": 0.9,
+                            "isl_mean_factor": 0.7,
+                        },
                     }
                 }
             ),
@@ -540,6 +567,7 @@ class TestPolicy:
         config = CoordinatorConfig.from_json(str(cfg_path))
         assert config.scheduler_config.prefill_scheduler_type is SchedulerType.C2LB
         assert config.scheduler_config.decode_scheduler_type is SchedulerType.C2LB
+        assert config.scheduler_config.c2lb.isl_mean_factor == 0.7
         assert "decode_scheduler_type=c2lb is ignored" in caplog.text
 
     def test_in_process_selection_uses_factors(self):
@@ -555,7 +583,7 @@ class TestPolicy:
         policy = C2LBPolicy(MockInstanceProvider())
         with patch.object(C2LBPolicy, "score_endpoints", side_effect=fake_score):
             plain = policy.select_instance_and_endpoint_from_list(instances, PDRole.ROLE_P, _req_info())
-            policy.set_mean_factors(1.2, 1.0)
+            policy.set_mean_factors(1.2, 1.0, 1.0)
             loose = policy.select_instance_and_endpoint_from_list(instances, PDRole.ROLE_P, _req_info())
         assert plain[1].id == 20
         assert loose[1].id == 10
@@ -587,13 +615,14 @@ class TestPolicy:
 # ---------------------------------------------------------------------------
 
 
-def _client(active_factor: float = 1.0, cpu_factor: float = 1.0) -> AsyncSchedulerClient:
+def _client(active_factor: float = 1.0, cpu_factor: float = 1.0, isl_factor: float = 1.0) -> AsyncSchedulerClient:
     return AsyncSchedulerClient(
         SchedulerClientConfig(
             scheduler_type="c2lb",
             c2lb=C2LBConfig(
                 active_tokens_mean_factor=active_factor,
                 cpu_hit_blocks_mean_factor=cpu_factor,
+                isl_mean_factor=isl_factor,
             ),
         )
     )
@@ -601,7 +630,7 @@ def _client(active_factor: float = 1.0, cpu_factor: float = 1.0) -> AsyncSchedul
 
 class TestClientDispatch:
     def test_factors_from_config_reach_the_policy(self):
-        client = _client(active_factor=1.7, cpu_factor=0.3)
+        client = _client(active_factor=1.7, cpu_factor=0.3, isl_factor=2.5)
         inst = _instance(1, [_endpoint(10)])
         with patch.object(
             C2LBPolicy,
@@ -612,10 +641,11 @@ class TestClientDispatch:
         kwargs = m.call_args.kwargs
         assert kwargs["active_tokens_mean_factor"] == 1.7
         assert kwargs["cpu_hit_blocks_mean_factor"] == 0.3
+        assert kwargs["isl_mean_factor"] == 2.5
 
     def test_default_factors_when_config_absent(self):
         client = AsyncSchedulerClient(SchedulerClientConfig(scheduler_type="c2lb"))
-        assert (client._c2lb_active_factor, client._c2lb_cpu_factor) == (1.0, 1.0)
+        assert (client._c2lb_active_factor, client._c2lb_cpu_factor, client._c2lb_isl_factor) == (1.0, 1.0, 1.0)
 
     def test_prefill_uses_gated_policy(self):
         client = _client()
@@ -856,6 +886,39 @@ class TestArbitration:
             gated_candidates=quads,
         )
         assert loose[1].id == 10
+
+    @pytest.mark.asyncio
+    async def test_isl_factor_on_arbitration(self):
+        inst = _instance(1, [_endpoint(10), _endpoint(11), _endpoint(12)])
+        im = await _pool([inst])
+        await im.update_instance_workload(1, 10, Workload(active_tokens=5, cpu_hit_blocks=5, isl=10))
+        await im.update_instance_workload(1, 11, Workload(active_tokens=5, cpu_hit_blocks=5, isl=30))
+        await im.update_instance_workload(1, 12, Workload(active_tokens=5, cpu_hit_blocks=5, isl=20))
+        quads = [
+            (1, 10, 10.0, 0.0, 0.0),
+            (1, 11, 11.0, 0.0, 0.9),
+            (1, 12, 12.0, 0.0, 0.0),
+        ]
+
+        plain = allocate_arbitration.select_authoritative_allocate_candidate(
+            _arbitration_context(im),
+            (1, 10),
+            [(1, 10), (1, 11), (1, 12)],
+            PDRole.ROLE_P,
+            CANDIDATE_POLICY_C2LB,
+            gated_candidates=quads,
+        )
+        assert plain[1].id == 10
+
+        loose = allocate_arbitration.select_authoritative_allocate_candidate(
+            _arbitration_context(im, isl_factor=2.0),
+            (1, 10),
+            [(1, 10), (1, 11), (1, 12)],
+            PDRole.ROLE_P,
+            CANDIDATE_POLICY_C2LB,
+            gated_candidates=quads,
+        )
+        assert loose[1].id == 11
 
     @pytest.mark.asyncio
     async def test_no_costs_validates_worker_candidate(self):

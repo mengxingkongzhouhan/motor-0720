@@ -55,6 +55,7 @@ class ArbitrationContext:
     is_load_balance_scheduler: bool = False
     c2lb_active_factor: float = 1.0
     c2lb_cpu_factor: float = 1.0
+    c2lb_isl_factor: float = 1.0
 
 
 def matches_engine_type(instance: Instance, required_engine_type: str | None) -> bool:
@@ -360,13 +361,13 @@ def select_c2lb(
             )
         )
     ranked = sort_candidates(candidates)
-    picked = pick_gated(ranked, ctx.c2lb_active_factor, ctx.c2lb_cpu_factor)
+    picked = pick_gated(ranked, ctx.c2lb_active_factor, ctx.c2lb_cpu_factor, ctx.c2lb_isl_factor)
     if picked is None:
         return None
     chosen, reason, active_threshold, cpu_threshold = picked
     logger.info(
         "c2lb: req_id=%s pick=%s-%s reason=%s active_threshold=%.1f cpu_threshold=%.1f "
-        "factors=%.2f/%.2f ranked[ins-ep:ledger_isl/active/cpu(+req_cost/+req_cpu)]=%s",
+        "factors=%.2f/%.2f/%.2f ranked[ins-ep:ledger_isl/active/cpu(+req_cost/+req_cpu)]=%s",
         req_id,
         chosen.instance.id,
         chosen.endpoint.id,
@@ -375,6 +376,7 @@ def select_c2lb(
         cpu_threshold,
         ctx.c2lb_active_factor,
         ctx.c2lb_cpu_factor,
+        ctx.c2lb_isl_factor,
         format_candidates(ranked),
     )
     return (chosen.instance, chosen.endpoint, chosen.ledger_isl)

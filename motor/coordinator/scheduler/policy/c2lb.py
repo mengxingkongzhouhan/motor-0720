@@ -18,6 +18,7 @@ C2LB scheduling policy: queue by ledger isl, then gate the other two ledger load
    fields are at or below their scaled means:
    ``active_tokens <= mean(active_tokens) * active_tokens_mean_factor`` and
    ``cpu_hit_blocks <= mean(cpu_hit_blocks) * cpu_hit_blocks_mean_factor``.
+   The high-NPU path also requires ``isl <= mean(isl) * isl_mean_factor``.
    Walking stops once ``isl`` exceeds the candidate mean; the head of the list
    (lowest ledger isl) is used then, and also when nobody passes the two load gates.
    ``<=`` so an idle cluster (every ledger 0, mean 0) still passes.
@@ -420,6 +421,7 @@ def pick_gated(
     candidates: list[GatedCandidate],
     active_tokens_mean_factor: float = DEFAULT_MEAN_FACTOR,
     cpu_hit_blocks_mean_factor: float = DEFAULT_MEAN_FACTOR,
+    isl_mean_factor: float = DEFAULT_MEAN_FACTOR,
 ) -> tuple[GatedCandidate, str, float, float] | None:
     """
     Pick from ``candidates`` (already in ledger isl order).
@@ -429,7 +431,8 @@ def pick_gated(
     DP whose ``active_tokens`` and ``cpu_hit_blocks`` are at or below their scaled
     averages; once ``isl`` exceeds the candidate mean, fall back to the lowest-isl head.
     The two returned thresholds are ``mean(active_tokens) * factor`` and
-    ``mean(cpu_hit_blocks) * factor``.
+    ``mean(cpu_hit_blocks) * factor``. The high-NPU ``isl`` gate uses
+    ``mean(isl) * isl_mean_factor``.
     """
     if not candidates:
         return None
@@ -441,7 +444,7 @@ def pick_gated(
 
     active_threshold = active_avg * _factor(active_tokens_mean_factor)
     cpu_threshold = cpu_avg * _factor(cpu_hit_blocks_mean_factor)
-    isl_threshold = isl_avg * _factor(active_tokens_mean_factor)
+    isl_threshold = isl_avg * _factor(isl_mean_factor)
 
     candidates_with_hight_npu_hit = sort_candidates_by_npu_hit(candidates, 0.8)
     if candidates_with_hight_npu_hit:
@@ -488,16 +491,23 @@ class C2LBPolicy(BaseSchedulingPolicy):
         super().__init__(instance_provider=instance_provider)
         self._active_tokens_mean_factor = DEFAULT_MEAN_FACTOR
         self._cpu_hit_blocks_mean_factor = DEFAULT_MEAN_FACTOR
+        self._isl_mean_factor = DEFAULT_MEAN_FACTOR
         logger.info("C2LBPolicy started.")
 
-    def set_mean_factors(self, active_tokens_mean_factor: float, cpu_hit_blocks_mean_factor: float) -> None:
-        """Set the multipliers applied to the two candidate averages used as gate thresholds."""
+    def set_mean_factors(
+        self,
+        active_tokens_mean_factor: float,
+        cpu_hit_blocks_mean_factor: float,
+        isl_mean_factor: float = DEFAULT_MEAN_FACTOR,
+    ) -> None:
+        """Set the multipliers applied to the candidate averages used as gate thresholds."""
         self._active_tokens_mean_factor = _factor(active_tokens_mean_factor)
         self._cpu_hit_blocks_mean_factor = _factor(cpu_hit_blocks_mean_factor)
+        self._isl_mean_factor = _factor(isl_mean_factor)
 
     @property
-    def mean_factors(self) -> tuple[float, float]:
-        return (self._active_tokens_mean_factor, self._cpu_hit_blocks_mean_factor)
+    def mean_factors(self) -> tuple[float, float, float]:
+        return (self._active_tokens_mean_factor, self._cpu_hit_blocks_mean_factor, self._isl_mean_factor)
 
     @staticmethod
     def score_endpoints(instances: list[Instance], req_info: RequestInfo) -> list[GatedCandidate] | None:
@@ -569,6 +579,7 @@ class C2LBPolicy(BaseSchedulingPolicy):
         top_k: int = 1,
         active_tokens_mean_factor: float = DEFAULT_MEAN_FACTOR,
         cpu_hit_blocks_mean_factor: float = DEFAULT_MEAN_FACTOR,
+        isl_mean_factor: float = DEFAULT_MEAN_FACTOR,
     ) -> list[tuple[Instance, Endpoint, float]] | None:
         """
         Worker-side proposal: the gated pick first (high-NPU three-gate win, else
@@ -579,7 +590,7 @@ class C2LBPolicy(BaseSchedulingPolicy):
         ranked = C2LBPolicy.score_endpoints(instances, req_info)
         if not ranked:
             return None
-        picked = pick_gated(ranked, active_tokens_mean_factor, cpu_hit_blocks_mean_factor)
+        picked = pick_gated(ranked, active_tokens_mean_factor, cpu_hit_blocks_mean_factor, isl_mean_factor)
         if picked is None:
             return None
         chosen, reason, active_threshold, cpu_threshold = picked
@@ -601,6 +612,7 @@ class C2LBPolicy(BaseSchedulingPolicy):
         req_info: RequestInfo,
         active_tokens_mean_factor: float = DEFAULT_MEAN_FACTOR,
         cpu_hit_blocks_mean_factor: float = DEFAULT_MEAN_FACTOR,
+        isl_mean_factor: float = DEFAULT_MEAN_FACTOR,
     ) -> tuple[Instance, Endpoint] | None:
         ranked = C2LBPolicy.select_endpoint_candidates_from_list(
             instances,
@@ -608,6 +620,7 @@ class C2LBPolicy(BaseSchedulingPolicy):
             top_k=1,
             active_tokens_mean_factor=active_tokens_mean_factor,
             cpu_hit_blocks_mean_factor=cpu_hit_blocks_mean_factor,
+            isl_mean_factor=isl_mean_factor,
         )
         if not ranked:
             return None
@@ -632,6 +645,7 @@ class C2LBPolicy(BaseSchedulingPolicy):
                 req_info,
                 active_tokens_mean_factor=self._active_tokens_mean_factor,
                 cpu_hit_blocks_mean_factor=self._cpu_hit_blocks_mean_factor,
+                isl_mean_factor=self._isl_mean_factor,
             )
             if selected is not None:
                 return selected

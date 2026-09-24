@@ -344,7 +344,8 @@ motor_coordinator_config字段配置样例如下所示：
     },
     "c2lb": {
       "active_tokens_mean_factor": 1.0,
-      "cpu_hit_blocks_mean_factor": 1.0
+      "cpu_hit_blocks_mean_factor": 1.0,
+      "isl_mean_factor": 1.0
     }
   },
   "inference_workers_config": {
@@ -552,6 +553,7 @@ motor_coordinator_config字段配置样例如下所示：
 | **c2lb 字段** |-|-|
 | active_tokens_mean_factor | float | `active_tokens` 门限 = 候选 endpoint 的 `active_tokens` 均值 × 该系数。大于 1 放宽（更多 endpoint 通过，账本 `isl` 排序起主导作用），小于 1 收紧。默认值：`1.0` |
 | cpu_hit_blocks_mean_factor | float | `cpu_hit_blocks` 门限 = 候选 endpoint 的 `cpu_hit_blocks` 均值 × 该系数，语义同上。默认值：`1.0` |
+| isl_mean_factor | float | 高 NPU 命中路径的 `isl` 门限 = 候选 endpoint 的账本 `isl` 均值 × 该系数。大于 1 放宽（更多高命中 DP 可通过三项门限直接入选），小于 1 收紧。沿 `isl` 队列行走时仍以原始均值截止。默认值：`1.0` |
 | **inference_workers_config字段** |-|-|
 | num_workers | int | Coordinator中业务面worker个数，默认值：4。 |
 | worker_metaserver_base_port | int | vLLM layerwise/trigger PD 时每个 Inference Worker 的 metaserver 起始端口。默认值：`12000`。Worker `i` 监听 `base+i`，仅暴露 `POST /v1/metaserver`。设为 `0` 关闭。须保证 `base+num_workers-1 <= 65535`。同一集群不可混部 handoff 与 trigger。监听地址优先 `POD_IP`，否则用 `coordinator_api_host`（不绑 loopback）。`coordinator_api_host=0.0.0.0`/`::` 仍可启动；走 Trigger 时须有 `POD_IP` 或可达的 `coordinator_api_host`，否则该请求返回 503。端口占用或 metaserver 启动失败时推理口继续服务，该 Worker 的 Trigger 请求返回 503。 |

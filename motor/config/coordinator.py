@@ -406,6 +406,7 @@ class C2LBConfig:
     whose other two ledger fields pass is committed:
     ``active_tokens <= mean(active_tokens) * active_tokens_mean_factor`` and
     ``cpu_hit_blocks <= mean(cpu_hit_blocks) * cpu_hit_blocks_mean_factor``.
+    The high-NPU ``isl`` gate uses ``mean(isl) * isl_mean_factor``.
     """
 
     # Multiplier on the candidates' mean active_tokens. >1 loosens the gate (more endpoints pass,
@@ -413,6 +414,8 @@ class C2LBConfig:
     active_tokens_mean_factor: float = 1.0
     # Multiplier on the candidates' mean cpu_hit_blocks, same semantics.
     cpu_hit_blocks_mean_factor: float = 1.0
+    # Multiplier on the candidates' mean isl. Used by the high-NPU three-gate path.
+    isl_mean_factor: float = 1.0
 
 
 @dataclass
@@ -1278,6 +1281,11 @@ class CoordinatorConfig:
             "c2lb.cpu_hit_blocks_mean_factor",
             allow_zero=True,
         )
+        self._validate_positive_number(
+            gated.isl_mean_factor,
+            "c2lb.isl_mean_factor",
+            allow_zero=True,
+        )
         if self.context_budget_mode not in CONTEXT_BUDGET_MODES:
             self._errors.append(
                 f"context_budget_mode must be one of {CONTEXT_BUDGET_MODES}, got {self.context_budget_mode!r}"
@@ -1512,6 +1520,8 @@ class CoordinatorConfig:
             f"{self.scheduler_config.c2lb.active_tokens_mean_factor}\n"
             f"    ├─ C2LB CPU Factor:    "
             f"{self.scheduler_config.c2lb.cpu_hit_blocks_mean_factor}\n"
+            f"    ├─ C2LB ISL Factor:    "
+            f"{self.scheduler_config.c2lb.isl_mean_factor}\n"
             f"    ├─ DP Stats Window:            {self.scheduler_config.dp_stats_window}s\n"
             f"    └─ Context Budget Mode:        {self.context_budget_mode}\n"
             "\n"

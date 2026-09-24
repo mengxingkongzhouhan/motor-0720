@@ -764,6 +764,7 @@ class AsyncSchedulerClient:
         gated = config.c2lb or C2LBConfig()
         self._c2lb_active_factor = max(0.0, float(gated.active_tokens_mean_factor))
         self._c2lb_cpu_factor = max(0.0, float(gated.cpu_hit_blocks_mean_factor))
+        self._c2lb_isl_factor = max(0.0, float(gated.isl_mean_factor))
 
         self._dp_stats = DpStatsLogger(window_sec=config.dp_stats_window)
         self._log_dp_stats = bool(config.log_dp_stats)
@@ -1031,6 +1032,7 @@ class AsyncSchedulerClient:
             is_load_balance_scheduler=self._scheduler_type_for_role(role) == "load_balance",
             c2lb_active_factor=self._c2lb_active_factor,
             c2lb_cpu_factor=self._c2lb_cpu_factor,
+            c2lb_isl_factor=self._c2lb_isl_factor,
         )
 
     def _committed_workload_for(
@@ -2054,6 +2056,7 @@ class AsyncSchedulerClient:
                     top_k=max(1, top_k),
                     active_tokens_mean_factor=self._c2lb_active_factor,
                     cpu_hit_blocks_mean_factor=self._c2lb_cpu_factor,
+                    isl_mean_factor=self._c2lb_isl_factor,
                 )
                 if ranked:
                     return ranked, CANDIDATE_POLICY_C2LB

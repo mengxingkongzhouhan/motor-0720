@@ -210,6 +210,7 @@ Located in `scheduler/policy/`, each policy implements `BaseSchedulingPolicy`:
 | `RoundRobinPolicy` | Simple atomic counter, mod endpoint count | Uniform workload, no KV cache locality |
 | `LoadBalancePolicy` | Reads workload SHM, picks endpoint with minimum active tokens | Heterogeneous workloads, varying request lengths |
 | `KvCacheAffinityPolicy` | Queries KV Conductor (via `ConductorApiClient`) for prefix match; prefers endpoints with cached blocks | High prefix reuse, PD disaggregation |
+| `C2LBPolicy` | Queue by ledger `isl`; prefer a high-NPU-hit DP that also passes the three scaled-mean gates (`isl` / `active_tokens` / `cpu_hit_blocks`); otherwise first DP under the two load gates | Prefill / encode / union when `prefill_scheduler_type=c2lb` |
 
 **Conductor `/query` wire encoding** (`ConductorApiClient.query_conductor`):
 `kv_conductor_config.query_encoding` (default `"msgpack"`) selects the wire
@@ -221,12 +222,14 @@ kv-conductor binaries.<br>
 
 **Factory registration** (`factory.py`): `SchedulingPolicyFactory` maps policy name → class. New policies register here.
 
-The policy is selected by `SchedulerType` (`config/coordinator.py`): `LOAD_BALANCE` (default) / `ROUND_ROBIN` / `KV_CACHE_AFFINITY`. For `scheduler_type=kv_cache_affinity`, a sub-mode is chosen by `kv_affinity.mode`:
+The policy is selected by `SchedulerType` (`config/coordinator.py`): `LOAD_BALANCE` (default) / `ROUND_ROBIN` / `KV_CACHE_AFFINITY` / `C2LB`. For `scheduler_type=kv_cache_affinity`, a sub-mode is chosen by `kv_affinity.mode`:
 
 - `unified` (default) — single score fusing affinity and live load; pick the minimum
 - `load_gated` — keep the N least-loaded endpoints, then pick the longest cached prefix
 
 Tunables live under `CoordinatorConfig.scheduler_config.kv_affinity`: `mode`, `load_weight`, `overlap_credit`, `prefill_load_scale`, `load_gate_topn`, `w_npu`, `w_cpu`, `w_disk`, `hit_rate_threshold`.
+
+For `prefill_scheduler_type=c2lb`, tunables live under `CoordinatorConfig.scheduler_config.c2lb`: `active_tokens_mean_factor`, `cpu_hit_blocks_mean_factor`, `isl_mean_factor` (all default `1.0`). High-NPU-hit (`npu_hit > 0.8`) picks require all three `mean * factor` gates; the walk path still stops at the raw `mean(isl)`.
 
 `hit_rate_threshold` (default `0`, range `[0, 1]`) is a pre-ranking gate: `0` keeps current affinity scoring. Values in `(0, 1]` require the best endpoint's weighted prefix hit rate `max(matched_tokens) / prompt_tokens` to be **strictly greater** than the threshold; otherwise `KvCacheAffinityPolicy` returns `[]` and the scheduler falls back to `load_balance` without treating it as a conductor failure.
 

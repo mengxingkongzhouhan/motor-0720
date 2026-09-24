@@ -70,6 +70,7 @@ class Scheduler:
                 policy.set_mean_factors(
                     gated.active_tokens_mean_factor,
                     gated.cpu_hit_blocks_mean_factor,
+                    gated.isl_mean_factor,
                 )
         logger.info(
             "Scheduler started. prefill=%s decode=%s",

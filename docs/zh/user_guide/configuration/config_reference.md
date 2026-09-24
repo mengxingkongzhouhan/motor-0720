@@ -341,6 +341,11 @@ motor_coordinator_config字段配置样例如下所示：
       "w_cpu": 1.0,
       "w_disk": 0.0,
       "hit_rate_threshold": 0.0
+    },
+    "c2lb": {
+      "active_tokens_mean_factor": 1.0,
+      "cpu_hit_blocks_mean_factor": 1.0,
+      "isl_mean_factor": 1.0
     }
   },
   "inference_workers_config": {
@@ -527,13 +532,14 @@ motor_coordinator_config字段配置样例如下所示：
 | base_timeout_s | float | 首次熔断时长（秒），也是熔断时长指数退避的基数；每次重新熔断/探活失败按 `2^(熔断次数-1)` 倍增长。默认值：`30.0`。 |
 | max_timeout_s | float | 熔断时长上限（秒）。默认值：`300.0`。 |
 | **scheduler_config字段** |-|-|
-| prefill_scheduler_type | string | Prefill / encode / union 实例的调度类型，默认值：load_balance<ul><li>load_balance：负载均衡；</li><li>round_robin：轮询；</li><li>kv_cache_affinity：KV Cache 亲和调度。</li></ul> |
-| decode_scheduler_type | string | Decode 实例的调度类型，默认值：load_balance。可选 `load_balance` / `round_robin`。枚举也接受 `kv_cache_affinity`（旧 `scheduler_type` 会写到该字段），但选 Decode 实例时不走亲和，仍按 load_balance，启动打 warning。 |
+| prefill_scheduler_type | string | Prefill / encode / union 实例的调度类型，默认值：load_balance<ul><li>load_balance：负载均衡；</li><li>round_robin：轮询；</li><li>kv_cache_affinity：KV Cache 亲和调度。选路分数仍为 `isl - overlap_credit × matched`；账本不记 `isl` / `cpu_hit_blocks`（schema-5 对应字段保持 0）。SHM `active_tokens` 仍为 `isl - matched`。</li><li>c2lb：按 endpoint 账本中当前在跑请求的请求长度（`isl`）从小到大排队。先看本请求 `npu_hit = npu_blocks × 128 / isl > 0.8` 的候选（命中率高者优先），其中同时满足账本 `isl` / `active_tokens` / `cpu_hit_blocks` 三项均值门限的直接入选；否则沿 `isl` 队列依次检查该 DP 另外两项是否 `<= 均值 × 对应系数`（`active_tokens`、`cpu_hit_blocks`），`isl` 超过候选均值则退化为账本 `isl` 最小者。取等号，保证全空闲集群也能通过门限。Conductor 用于本请求 stamp 与 NPU 命中判断；被选 endpoint 记账本请求的 `isl` 与 `cpu_blocks`。系数见 `c2lb` 字段。`active_tokens` / `isl` / `cpu_hit_blocks` 均走 schema-5 SHM（跨 Worker）。</li></ul> |
+| decode_scheduler_type | string | Decode 实例的调度类型，默认值：load_balance。可选 `load_balance` / `round_robin`。枚举也接受 `kv_cache_affinity` / `c2lb`（旧 `scheduler_type` 会写到该字段），但选 Decode 实例时不走亲和或 c2lb 门限，仍按 load_balance，启动打 warning。 |
 | scheduler_type | string | **已废弃**。存量配置仍可使用，读取时同时赋给 `prefill_scheduler_type` 与 `decode_scheduler_type` 并打 warning。新配置请分别填写上述两个字段。 |
 | enable_pd_separation_fallback_to_hybrid | bool | PD 分离场景下，当不存在兼容且未熔断的 P/D pair 时，是否允许降级使用混部路由，默认值为 `true`。候选优先级为 Union → Prefill → Decode；Decode 兜底仅适用于上报 `decode_colocation` capability 的 vLLM 实例，关闭后无兼容 pair 时返回 503。 |
 | endpoint_instance_score_weight | float | endpoint 优先负载均衡时实例平均负载权重。默认值：`0.05` |
 | dp_stats_window | int | worker 0 周期性打印 per-DP 成功提交请求数与 SHM `active_tokens` 的窗口（秒），同一行输出（`dp_stats` 日志）。独立于 KV 亲和命中统计，所有部署与调度类型下均生效；默认 `60`；`0` 禁用 |
 | kv_affinity | object | KV Cache 亲和性调度参数（见下表） |
+| c2lb | object | `prefill_scheduler_type=c2lb` 时的门限系数（见下表） |
 | **kv_affinity 字段** |-|-|
 | mode | string | 任一 role 使用 `kv_cache_affinity` 时的子策略：`unified`（默认）或 `load_gated` |
 | load_weight | float | unified 模式下 endpoint 实时负载权重。默认值：`1.0` |
@@ -544,6 +550,10 @@ motor_coordinator_config字段配置样例如下所示：
 | w_cpu | float | 互斥 CPU 命中块权重。默认值：`1.0` |
 | w_disk | float | 互斥 Disk 命中块权重。默认值：`0.0` |
 | hit_rate_threshold | float | 亲和性命中率门槛，取值 `[0, 1]`。默认 `0` 关闭（始终按亲和评分）。大于 0 时，最大加权前缀命中率必须 **大于** 该阈值才走亲和调度，否则回退 `load_balance` |
+| **c2lb 字段** |-|-|
+| active_tokens_mean_factor | float | `active_tokens` 门限 = 候选 endpoint 的 `active_tokens` 均值 × 该系数。大于 1 放宽（更多 endpoint 通过，账本 `isl` 排序起主导作用），小于 1 收紧。默认值：`1.0` |
+| cpu_hit_blocks_mean_factor | float | `cpu_hit_blocks` 门限 = 候选 endpoint 的 `cpu_hit_blocks` 均值 × 该系数，语义同上。默认值：`1.0` |
+| isl_mean_factor | float | 高 NPU 命中路径的 `isl` 门限 = 候选 endpoint 的账本 `isl` 均值 × 该系数。大于 1 放宽（更多高命中 DP 可通过三项门限直接入选），小于 1 收紧。沿 `isl` 队列行走时仍以原始均值截止。默认值：`1.0` |
 | **inference_workers_config字段** |-|-|
 | num_workers | int | Coordinator中业务面worker个数，默认值：4。 |
 | worker_metaserver_base_port | int | vLLM layerwise/trigger PD 时每个 Inference Worker 的 metaserver 起始端口。默认值：`12000`。Worker `i` 监听 `base+i`，仅暴露 `POST /v1/metaserver`。设为 `0` 关闭。须保证 `base+num_workers-1 <= 65535`。同一集群不可混部 handoff 与 trigger。监听地址优先 `POD_IP`，否则用 `coordinator_api_host`（不绑 loopback）。`coordinator_api_host=0.0.0.0`/`::` 仍可启动；走 Trigger 时须有 `POD_IP` 或可达的 `coordinator_api_host`，否则该请求返回 503。端口占用或 metaserver 启动失败时推理口继续服务，该 Worker 的 Trigger 请求返回 503。 |

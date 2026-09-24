@@ -24,6 +24,7 @@ from motor.config.coordinator import SchedulerType
 from motor.coordinator.scheduler.policy.base import BaseSchedulingPolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
+from motor.coordinator.scheduler.policy.c2lb import C2LBPolicy
 from tests.coordinator.scheduler.conftest import MockInstanceProvider
 
 
@@ -39,6 +40,11 @@ class TestPolicyFactory(unittest.TestCase):
         """create returns a LoadBalancePolicy for LOAD_BALANCE type."""
         policy = create(SchedulerType.LOAD_BALANCE, MockInstanceProvider())
         self.assertIsInstance(policy, LoadBalancePolicy)
+
+    def test_create_c2lb(self):
+        """create returns a C2LBPolicy for C2LB type."""
+        policy = create(SchedulerType.C2LB, MockInstanceProvider())
+        self.assertIsInstance(policy, C2LBPolicy)
 
     def test_create_unknown_type_raises(self):
         """create raises ValueError for unregistered type."""

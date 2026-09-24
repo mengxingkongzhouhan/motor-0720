@@ -78,6 +78,14 @@ class RequestInfo(BaseModel):
         "for the committed endpoint. Keyed by (instance_id, endpoint_id) tuples, so excluded "
         "from serialization.",
     )
+    c2lb_debug: dict | None = Field(
+        default=None,
+        exclude=True,
+        description="Per-endpoint (prefill_cost, cpu_hit_blocks, npu_hit) cached by the c2lb "
+        "policy at selection; the worker re-ranks by ledger isl, prefers high-NPU-hit DPs that "
+        "pass all three gates, otherwise gates the other two ledger loads, and stamps isl / "
+        "cpu_hit_blocks on the committed endpoint. Keyed by (instance_id, endpoint_id).",
+    )
     api: str = Field(..., description="API need to be forwarded")
     entry_api: str = Field(
         default="",

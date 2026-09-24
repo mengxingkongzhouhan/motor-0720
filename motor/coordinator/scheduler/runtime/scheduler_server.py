@@ -9,7 +9,7 @@
 # See the Mulan PSL v2 for more details.
 
 """
-Control-plane server owned by the Mgmt process: ZMQ ROUTER + PUB, schema-4 SHM,
+Control-plane server owned by the Mgmt process: ZMQ ROUTER + PUB, schema-5 SHM,
 circuit breaker, and precision sampling. Infer Workers CAS-commit on SHM; there
 is no per-request ALLOCATE / UPDATE RPC and no standalone Scheduler process.
 IPC paths remain scheduler_frontend / scheduler_instance_pub (bound by Mgmt).
@@ -664,7 +664,7 @@ class _SchedulerFrontendTransport:
 
 class AsyncSchedulerServer:
     """
-    Control plane (ZMQ ROUTER + PUB + schema-4 SHM). Owned by Mgmt; Infer Workers
+    Control plane (ZMQ ROUTER + PUB + schema-5 SHM). Owned by Mgmt; Infer Workers
     attach to the same IPC addresses and SHM name advertised via GET_AVAILABLE_INSTANCES.
     """
 
@@ -789,7 +789,7 @@ class AsyncSchedulerServer:
         logger.info("Control plane stopped")
 
     async def start_control_plane(self) -> None:
-        """Bind ROUTER+PUB, create schema-4 SHM, start heartbeat and dispatcher. Does not recv-loop."""
+        """Bind ROUTER+PUB, create schema-5 SHM, start heartbeat and dispatcher. Does not recv-loop."""
         self._stop_event = asyncio.Event()
 
         self.context = zmq.asyncio.Context()

@@ -10,9 +10,9 @@
 
 //! In-process POSIX shared-memory workload ledger for the MindIE-PyMotor coordinator.
 //!
-//! Schema 4: Mgmt is the sole membership writer (seqlock snapshot + heartbeat + BLOCKED flags).
-//! Infer Workers attach and CAS `active_tokens` on per-slot AtomicU64 (generation + flags).
-//! The C ABI is loaded from Python via ctypes (`native.py`).
+//! Schema 5: Mgmt is the sole membership writer (seqlock snapshot + heartbeat + BLOCKED flags).
+//! Infer Workers attach and CAS `active_tokens` / `isl` / `cpu_hit_blocks` on
+//! per-slot AtomicU64 (generation + flags). The C ABI is loaded from Python via ctypes (`native.py`).
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
@@ -27,12 +27,13 @@ use layout::{MAGIC, SCHEMA_VERSION};
 
 /// ABI version, independent of the on-wire SCHEMA_VERSION (the ABI may evolve without the layout).
 /// v2: `cas_add`/`cas_sub_floor0` take a slot hint; `load_entries` batches a snapshot read.
-pub const ABI_VERSION: u32 = 2;
+/// v3: `cas_add`/`cas_sub_floor0`/`load_entry`/`load_entries` carry isl and cpu_hit_blocks.
+pub const ABI_VERSION: u32 = 3;
 
 /// `slot_hint` sent by callers that do not yet know the slot (linear `find_slot` fallback).
 pub const SLOT_HINT_NONE: u32 = u32::MAX;
 
-/// Packed view copied out of SHM by `mindie_wl_load_entries` (24B, matches schema-4 entry).
+/// Packed view copied out of SHM by `mindie_wl_load_entries` (40B, matches schema-5 entry).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct LoadedEntry {
@@ -43,6 +44,8 @@ pub struct LoadedEntry {
     pub generation: u16,
     pub reserved: u32,
     pub active_tokens: f64,
+    pub isl: f64,
+    pub cpu_hit_blocks: f64,
 }
 
 const _: () = assert!(std::mem::size_of::<LoadedEntry>() == layout::ENTRY_SIZE);
@@ -167,7 +170,7 @@ impl Segment {
     }
 
     // ----------------------------------------------------------------------
-    // Schema 4: per-slot atomic CAS data plane
+    // Schema 5: per-slot atomic CAS data plane
     // ----------------------------------------------------------------------
 
     #[inline]
@@ -176,6 +179,50 @@ impl Segment {
             .base
             .add(layout::entry_offset(slot) + layout::ENTRY_V4_OFF_ACTIVE_TOKENS)
             as *const AtomicU64)
+    }
+
+    #[inline]
+    unsafe fn v5_isl(&self, slot: u32) -> &AtomicU64 {
+        &*(self
+            .base
+            .add(layout::entry_offset(slot) + layout::ENTRY_V5_OFF_ISL)
+            as *const AtomicU64)
+    }
+
+    #[inline]
+    unsafe fn v5_cpu_hits(&self, slot: u32) -> &AtomicU64 {
+        &*(self
+            .base
+            .add(layout::entry_offset(slot) + layout::ENTRY_V5_OFF_CPU_HIT_BLOCKS)
+            as *const AtomicU64)
+    }
+
+    unsafe fn add_atomic_f64(atom: &AtomicU64, delta: f64) {
+        if delta == 0.0 {
+            return;
+        }
+        loop {
+            let cur = atom.load(Ordering::Acquire);
+            let new_val = f64::from_bits(cur) + delta;
+            match atom.compare_exchange(cur, new_val.to_bits(), Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    unsafe fn sub_atomic_f64_floor0(atom: &AtomicU64, delta: f64) {
+        if delta == 0.0 {
+            return;
+        }
+        loop {
+            let cur = atom.load(Ordering::Acquire);
+            let new_val = (f64::from_bits(cur) - delta).max(0.0);
+            match atom.compare_exchange(cur, new_val.to_bits(), Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return,
+                Err(_) => continue,
+            }
+        }
     }
 
     #[inline]
@@ -216,12 +263,12 @@ impl Segment {
         }
     }
 
-    /// Snapshot-write one schema-4 entry (call between snapshot_begin/commit).
+    /// Snapshot-write one schema-5 entry (call between snapshot_begin/commit).
     ///
-    /// Tokens are Worker-owned. A live `(instance_id, endpoint_id)` must not be overwritten
-    /// with a caller-supplied (stale) value: same slot leaves tokens untouched; a moved pair
-    /// copies the current bits from the old slot. New pairs seed from `active_tokens`.
-    /// A hole is `(iid, eid, flags) == (0, 0, 0)` and only clears VALID.
+    /// Ledger fields are Worker-owned. A live `(instance_id, endpoint_id)` must not be overwritten
+    /// with a caller-supplied (stale) value: same slot leaves tokens/overlay untouched; a moved pair
+    /// copies the current bits from the old slot. New pairs seed tokens from `active_tokens` and
+    /// overlay fields at 0. A hole is `(iid, eid, flags) == (0, 0, 0)` and only clears VALID.
     #[allow(clippy::too_many_arguments)]
     fn write_entry_v4(
         &self,
@@ -243,16 +290,22 @@ impl Segment {
             return error::OK;
         }
         // Snapshot must not clobber in-flight CAS. Copy-at-write if the pair moved slots.
-        let token_bits = match self.find_slot(instance_id, endpoint_id) {
+        let preserved = match self.find_slot(instance_id, endpoint_id) {
             Some(old) if old == slot => None,
-            Some(old) => Some(unsafe { self.v4_tokens(old).load(Ordering::Acquire) }),
+            Some(old) => Some(unsafe {
+                (
+                    self.v4_tokens(old).load(Ordering::Acquire),
+                    self.v5_isl(old).load(Ordering::Acquire),
+                    self.v5_cpu_hits(old).load(Ordering::Acquire),
+                )
+            }),
             None => {
                 let seed = if finite_nonneg(active_tokens) {
                     active_tokens
                 } else {
                     0.0
                 };
-                Some(seed.to_bits())
+                Some((seed.to_bits(), 0.0f64.to_bits(), 0.0f64.to_bits()))
             }
         };
         let base_off = layout::entry_offset(slot);
@@ -267,8 +320,10 @@ impl Segment {
                 2,
             );
             std::ptr::write_bytes(p.add(layout::ENTRY_V4_OFF_RESERVED), 0, 4);
-            if let Some(bits) = token_bits {
-                self.v4_tokens(slot).store(bits, Ordering::Release);
+            if let Some((tok, prefill, cpu)) = preserved {
+                self.v4_tokens(slot).store(tok, Ordering::Release);
+                self.v5_isl(slot).store(prefill, Ordering::Release);
+                self.v5_cpu_hits(slot).store(cpu, Ordering::Release);
             }
             self.v4_flags(slot)
                 .store(flags | layout::FLAG_VALID, Ordering::Release);
@@ -320,14 +375,17 @@ impl Segment {
                     generation: self.v4_generation(s),
                     reserved: 0,
                     active_tokens: f64::from_bits(self.v4_tokens(s).load(Ordering::Acquire)),
+                    isl: f64::from_bits(self.v5_isl(s).load(Ordering::Acquire)),
+                    cpu_hit_blocks: f64::from_bits(self.v5_cpu_hits(s).load(Ordering::Acquire)),
                 };
             }
         }
         n as u32
     }
 
-    /// CAS-add `delta` iff the slot's tokens still equal `expected` and it is not BLOCKED.
-    /// Returns (status, actual_bits). See design §5.4 / §6.
+    /// CAS-add token/overlay deltas iff the slot's tokens still equal `expected` and it is not BLOCKED.
+    /// Overlay fields are fetch-added only after the token CAS succeeds.
+    /// Returns (status, actual_token_bits). See design §5.4 / §6.
     fn cas_add(
         &self,
         slot_hint: u32,
@@ -336,8 +394,10 @@ impl Segment {
         generation: u16,
         expected: f64,
         delta: f64,
+        isl_delta: f64,
+        cpu_delta: f64,
     ) -> (ShmStatus, u64) {
-        if !finite_nonneg(delta) {
+        if !finite_nonneg(delta) || !finite_nonneg(isl_delta) || !finite_nonneg(cpu_delta) {
             return (error::BAD_ARG, 0);
         }
         let slot = match self.slot_from_hint(slot_hint, instance_id, endpoint_id) {
@@ -367,14 +427,18 @@ impl Segment {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => (error::OK, new_bits),
+                Ok(_) => {
+                    Self::add_atomic_f64(self.v5_isl(slot), isl_delta);
+                    Self::add_atomic_f64(self.v5_cpu_hits(slot), cpu_delta);
+                    (error::OK, new_bits)
+                }
                 Err(actual) => (error::CHANGED, actual),
             }
         }
     }
 
-    /// CAS-subtract `delta`, flooring at 0 (release path). No `expected`: the slot value having
-    /// moved since allocate is normal. Returns (status, actual_bits).
+    /// CAS-subtract token/overlay deltas, flooring each at 0 (release path). No `expected`.
+    /// Returns (status, actual_token_bits).
     fn cas_sub_floor0(
         &self,
         slot_hint: u32,
@@ -382,8 +446,10 @@ impl Segment {
         endpoint_id: i32,
         generation: u16,
         delta: f64,
+        isl_delta: f64,
+        cpu_delta: f64,
     ) -> (ShmStatus, u64) {
-        if !finite_nonneg(delta) {
+        if !finite_nonneg(delta) || !finite_nonneg(isl_delta) || !finite_nonneg(cpu_delta) {
             return (error::BAD_ARG, 0);
         }
         let slot = match self.slot_from_hint(slot_hint, instance_id, endpoint_id) {
@@ -406,7 +472,11 @@ impl Segment {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
-                    Ok(_) => return (error::OK, new_val.to_bits()),
+                    Ok(_) => {
+                        Self::sub_atomic_f64_floor0(self.v5_isl(slot), isl_delta);
+                        Self::sub_atomic_f64_floor0(self.v5_cpu_hits(slot), cpu_delta);
+                        return (error::OK, new_val.to_bits());
+                    }
                     Err(_) => continue,
                 }
             }
@@ -531,7 +601,7 @@ pub extern "C" fn mindie_wl_schema_version() -> u32 {
     SCHEMA_VERSION as u32
 }
 
-/// Shared create implementation. Always writes SCHEMA_VERSION (4).
+/// Shared create implementation. Always writes SCHEMA_VERSION (5).
 ///
 /// Orphan recovery: unlink and recreate only when `shm_open(O_EXCL)` fails with `EEXIST`.
 /// Other errno values (EACCES, EMFILE, …) must not unlink a segment another process still holds.
@@ -598,7 +668,7 @@ unsafe fn create_segment(name: *const c_char, max_entries: u32, out_handle: *mut
     error::OK
 }
 
-/// Create (and own) a schema-4 (per-slot CAS) segment.
+/// Create (and own) a schema-5 (per-slot CAS) segment. C name `create_v4` is historical.
 ///
 /// # Safety
 /// `name` must be a valid NUL-terminated C string; `out_handle` a valid, writable pointer.
@@ -774,10 +844,10 @@ pub unsafe extern "C" fn mindie_wl_read_header(
 }
 
 // ---------------------------------------------------------------------------
-// C ABI: schema 4 per-slot CAS data plane
+// C ABI: schema 5 per-slot CAS data plane
 // ---------------------------------------------------------------------------
 
-/// Snapshot-write one schema-4 entry (call between snapshot_begin/commit); sets VALID.
+/// Snapshot-write one schema-5 entry (call between snapshot_begin/commit); sets VALID.
 ///
 /// # Safety
 /// `handle` must be a live handle from create_v4/attach.
@@ -822,6 +892,8 @@ pub unsafe extern "C" fn mindie_wl_cas_add(
     generation: u16,
     expected: f64,
     delta: f64,
+    isl_delta: f64,
+    cpu_delta: f64,
     out_actual: *mut f64,
 ) -> ShmStatus {
     let seg = match seg(handle) {
@@ -835,6 +907,8 @@ pub unsafe extern "C" fn mindie_wl_cas_add(
         generation,
         expected,
         delta,
+        isl_delta,
+        cpu_delta,
     );
     if !out_actual.is_null() {
         *out_actual = f64::from_bits(actual_bits);
@@ -855,6 +929,8 @@ pub unsafe extern "C" fn mindie_wl_cas_sub_floor0(
     endpoint_id: i32,
     generation: u16,
     delta: f64,
+    isl_delta: f64,
+    cpu_delta: f64,
     out_actual: *mut f64,
 ) -> ShmStatus {
     let seg = match seg(handle) {
@@ -862,7 +938,7 @@ pub unsafe extern "C" fn mindie_wl_cas_sub_floor0(
         None => return error::NOT_ATTACHED,
     };
     let (status, actual_bits) =
-        seg.cas_sub_floor0(slot_hint, instance_id, endpoint_id, generation, delta);
+        seg.cas_sub_floor0(slot_hint, instance_id, endpoint_id, generation, delta, isl_delta, cpu_delta);
     if !out_actual.is_null() {
         *out_actual = f64::from_bits(actual_bits);
     }
@@ -891,7 +967,7 @@ pub unsafe extern "C" fn mindie_wl_set_blocked(
     error::OK
 }
 
-/// Copy `entry_count` schema-4 slots into `out` (one FFI for a scoring refresh).
+/// Copy `entry_count` schema-5 slots into `out` (one FFI for a scoring refresh).
 ///
 /// Each slot uses atomic loads for flags/tokens. `cap` is the number of `LoadedEntry`s the
 /// caller allocated; `out_n` receives how many were written (`min(entry_count, cap)`).
@@ -925,7 +1001,7 @@ pub unsafe extern "C" fn mindie_wl_load_entries(
     error::OK
 }
 
-/// Read one schema-4 entry's fields. Any out-pointer may be null.
+/// Read one schema-5 entry's fields. Any out-pointer may be null.
 ///
 /// # Safety
 /// `handle` must be a live handle from create_v4/attach; non-null out-pointers must be writable.
@@ -940,6 +1016,8 @@ pub unsafe extern "C" fn mindie_wl_load_entry(
     out_flags: *mut u8,
     out_generation: *mut u16,
     out_active_tokens: *mut f64,
+    out_isl: *mut f64,
+    out_cpu_hit_blocks: *mut f64,
 ) -> ShmStatus {
     let seg = match seg(handle) {
         Some(seg) => seg,
@@ -965,6 +1043,12 @@ pub unsafe extern "C" fn mindie_wl_load_entry(
     }
     if !out_active_tokens.is_null() {
         *out_active_tokens = f64::from_bits(seg.v4_tokens(slot).load(Ordering::Acquire));
+    }
+    if !out_isl.is_null() {
+        *out_isl = f64::from_bits(seg.v5_isl(slot).load(Ordering::Acquire));
+    }
+    if !out_cpu_hit_blocks.is_null() {
+        *out_cpu_hit_blocks = f64::from_bits(seg.v5_cpu_hits(slot).load(Ordering::Acquire));
     }
     error::OK
 }
@@ -1049,8 +1133,9 @@ mod tests {
                     &mut role,
                     &mut flags,
                     &mut gen,
-                    &mut tokens
-                ),
+                    &mut tokens,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()),
                 error::OK
             );
             assert_eq!(iid, 1);
@@ -1100,7 +1185,7 @@ mod tests {
         }
     }
 
-    // --- schema 4 CAS ---
+    // --- schema 5 CAS ---
 
     unsafe fn v4_single_entry(tag: &str) -> (u64, CString) {
         let cn = CString::new(unique_name(tag)).unwrap();
@@ -1123,13 +1208,13 @@ mod tests {
             let mut actual = -1.0f64;
             // expected matches current (0.0) -> Ok, tokens become 3.0
             assert_eq!(
-                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, 3.0, &mut actual),
+                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, 3.0, 0.0, 0.0, &mut actual),
                 error::OK
             );
             assert_eq!(actual, 3.0);
             // stale expected (0.0 != 3.0) -> Changed, returns current 3.0, no add
             assert_eq!(
-                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, 100.0, &mut actual),
+                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, 100.0, 0.0, 0.0, &mut actual),
                 error::CHANGED
             );
             assert_eq!(actual, 3.0);
@@ -1143,12 +1228,12 @@ mod tests {
             let (h, _cn) = v4_single_entry("floor0");
             let mut actual = -1.0f64;
             assert_eq!(
-                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, 5.0, &mut actual),
+                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, 5.0, 0.0, 0.0, &mut actual),
                 error::OK
             );
             // subtract more than present -> floors at 0
             assert_eq!(
-                mindie_wl_cas_sub_floor0(h, SLOT_HINT_NONE, 1, 10, 0, 9.0, &mut actual),
+                mindie_wl_cas_sub_floor0(h, SLOT_HINT_NONE, 1, 10, 0, 9.0, 0.0, 0.0, &mut actual),
                 error::OK
             );
             assert_eq!(actual, 0.0);
@@ -1165,14 +1250,14 @@ mod tests {
             assert_eq!(touched, 1);
             let mut actual = -1.0f64;
             assert_eq!(
-                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, 1.0, &mut actual),
+                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, 1.0, 0.0, 0.0, &mut actual),
                 error::BLOCKED
             );
             assert_eq!(actual, 0.0); // unchanged
                                      // clearing the flag re-enables allocation
             assert_eq!(mindie_wl_set_blocked(h, 1, 0, &mut touched), error::OK);
             assert_eq!(
-                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, 1.0, &mut actual),
+                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, 1.0, 0.0, 0.0, &mut actual),
                 error::OK
             );
             assert_eq!(actual, 1.0);
@@ -1187,7 +1272,7 @@ mod tests {
             let mut actual = -1.0f64;
             // slot generation is 0; caller remembers 1 -> SlotInvalid (ABA guard)
             assert_eq!(
-                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 1, 0.0, 1.0, &mut actual),
+                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 1, 0.0, 1.0, 0.0, 0.0, &mut actual),
                 error::SLOT_INVALID
             );
             assert_eq!(mindie_wl_close(h, 1), error::OK);
@@ -1200,7 +1285,7 @@ mod tests {
             let (h, _cn) = v4_single_entry("missing");
             let mut actual = -1.0f64;
             assert_eq!(
-                mindie_wl_cas_add(h, SLOT_HINT_NONE, 999, 999, 0, 0.0, 1.0, &mut actual),
+                mindie_wl_cas_add(h, SLOT_HINT_NONE, 999, 999, 0, 0.0, 1.0, 0.0, 0.0, &mut actual),
                 error::SLOT_INVALID
             );
             assert_eq!(mindie_wl_close(h, 1), error::OK);
@@ -1250,10 +1335,13 @@ mod tests {
                                         std::ptr::null_mut(),
                                         std::ptr::null_mut(),
                                         &mut cur,
-                                    );
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut());
                                     cur
                                 },
                                 1.0,
+                                0.0,
+                                0.0,
                                 &mut actual,
                             );
                             if status == error::OK {
@@ -1277,11 +1365,69 @@ mod tests {
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut total
-                ),
+                    &mut total,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()),
                 error::OK
             );
             assert_eq!(total, (n_threads * per_thread) as f64);
+            assert_eq!(mindie_wl_close(h, 1), error::OK);
+        }
+    }
+
+    #[test]
+    fn cas_add_and_sub_overlay_fields() {
+        unsafe {
+            let (h, _cn) = v4_single_entry("overlay");
+            let mut actual = -1.0f64;
+            assert_eq!(
+                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, 4.0, 12.0, 3.0, &mut actual),
+                error::OK
+            );
+            assert_eq!(actual, 4.0);
+            let mut tokens = 0.0f64;
+            let mut prefill = 0.0f64;
+            let mut cpu = 0.0f64;
+            assert_eq!(
+                mindie_wl_load_entry(
+                    h,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut tokens,
+                    &mut prefill,
+                    &mut cpu
+                ),
+                error::OK
+            );
+            assert_eq!(tokens, 4.0);
+            assert_eq!(prefill, 12.0);
+            assert_eq!(cpu, 3.0);
+            assert_eq!(
+                mindie_wl_cas_sub_floor0(h, SLOT_HINT_NONE, 1, 10, 0, 4.0, 20.0, 3.0, &mut actual),
+                error::OK
+            );
+            assert_eq!(
+                mindie_wl_load_entry(
+                    h,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut tokens,
+                    &mut prefill,
+                    &mut cpu
+                ),
+                error::OK
+            );
+            assert_eq!(tokens, 0.0);
+            assert_eq!(prefill, 0.0);
+            assert_eq!(cpu, 0.0);
             assert_eq!(mindie_wl_close(h, 1), error::OK);
         }
     }
@@ -1292,15 +1438,23 @@ mod tests {
             let (h, _cn) = v4_single_entry("bad_add");
             let mut actual = -1.0f64;
             assert_eq!(
-                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, f64::NAN, &mut actual),
+                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, f64::NAN, 0.0, 0.0, &mut actual),
                 error::BAD_ARG
             );
             assert_eq!(
-                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, -1.0, &mut actual),
+                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, -1.0, 0.0, 0.0, &mut actual),
                 error::BAD_ARG
             );
             assert_eq!(
-                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, f64::INFINITY, &mut actual),
+                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, f64::INFINITY, 0.0, 0.0, &mut actual),
+                error::BAD_ARG
+            );
+            assert_eq!(
+                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, 1.0, f64::NAN, 0.0, &mut actual),
+                error::BAD_ARG
+            );
+            assert_eq!(
+                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, 1.0, 0.0, -1.0, &mut actual),
                 error::BAD_ARG
             );
             let mut tokens = -1.0f64;
@@ -1313,8 +1467,9 @@ mod tests {
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut tokens
-                ),
+                    &mut tokens,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()),
                 error::OK
             );
             assert_eq!(tokens, 0.0);
@@ -1328,15 +1483,15 @@ mod tests {
             let (h, _cn) = v4_single_entry("bad_sub");
             let mut actual = -1.0f64;
             assert_eq!(
-                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, 5.0, &mut actual),
+                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, 5.0, 0.0, 0.0, &mut actual),
                 error::OK
             );
             assert_eq!(
-                mindie_wl_cas_sub_floor0(h, SLOT_HINT_NONE, 1, 10, 0, f64::NAN, &mut actual),
+                mindie_wl_cas_sub_floor0(h, SLOT_HINT_NONE, 1, 10, 0, f64::NAN, 0.0, 0.0, &mut actual),
                 error::BAD_ARG
             );
             assert_eq!(
-                mindie_wl_cas_sub_floor0(h, SLOT_HINT_NONE, 1, 10, 0, -1.0, &mut actual),
+                mindie_wl_cas_sub_floor0(h, SLOT_HINT_NONE, 1, 10, 0, -1.0, 0.0, 0.0, &mut actual),
                 error::BAD_ARG
             );
             let mut tokens = -1.0f64;
@@ -1349,8 +1504,9 @@ mod tests {
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut tokens
-                ),
+                    &mut tokens,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()),
                 error::OK
             );
             assert_eq!(tokens, 5.0);
@@ -1364,7 +1520,7 @@ mod tests {
             let (h, _cn) = v4_single_entry("noclobber");
             let mut actual = -1.0f64;
             assert_eq!(
-                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, 11.0, &mut actual),
+                mindie_wl_cas_add(h, SLOT_HINT_NONE, 1, 10, 0, 0.0, 11.0, 0.0, 0.0, &mut actual),
                 error::OK
             );
             assert_eq!(mindie_wl_snapshot_begin(h), error::OK);
@@ -1393,8 +1549,9 @@ mod tests {
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut tokens
-                ),
+                    &mut tokens,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()),
                 error::OK
             );
             assert_eq!(tokens, 11.0);
@@ -1420,7 +1577,7 @@ mod tests {
             assert_eq!(mindie_wl_snapshot_commit(h, 2, 1), error::OK);
             let mut actual = -1.0f64;
             assert_eq!(
-                mindie_wl_cas_add(h, SLOT_HINT_NONE, 2, 20, 0, 0.0, 7.0, &mut actual),
+                mindie_wl_cas_add(h, SLOT_HINT_NONE, 2, 20, 0, 0.0, 7.0, 0.0, 0.0, &mut actual),
                 error::OK
             );
             // Compact: pair (2,20) moves from slot 1 to slot 0 with stale tokens=0.
@@ -1450,8 +1607,9 @@ mod tests {
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut tokens
-                ),
+                    &mut tokens,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()),
                 error::OK
             );
             assert_eq!(iid, 2);
@@ -1472,6 +1630,8 @@ mod tests {
                 generation: 0,
                 reserved: 0,
                 active_tokens: 0.0,
+                isl: 0.0,
+                cpu_hit_blocks: 0.0,
             }; 4];
             let mut n = 0u32;
             assert_eq!(
@@ -1483,12 +1643,12 @@ mod tests {
             assert_eq!(buf[0].endpoint_id, 10);
             let mut actual = -1.0f64;
             assert_eq!(
-                mindie_wl_cas_add(h, 0, 1, 10, 0, 0.0, 3.0, &mut actual),
+                mindie_wl_cas_add(h, 0, 1, 10, 0, 0.0, 3.0, 0.0, 0.0, &mut actual),
                 error::OK
             );
             assert_eq!(actual, 3.0);
             assert_eq!(
-                mindie_wl_cas_add(h, 3, 1, 10, 0, 3.0, 1.0, &mut actual),
+                mindie_wl_cas_add(h, 3, 1, 10, 0, 3.0, 1.0, 0.0, 0.0, &mut actual),
                 error::SLOT_INVALID
             );
             assert_eq!(mindie_wl_close(h, 1), error::OK);

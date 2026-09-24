@@ -65,6 +65,13 @@ class Scheduler:
         for policy in (self._prefill_policy, self._decode_policy):
             if self._config and hasattr(policy, "set_endpoint_instance_score_weight"):
                 policy.set_endpoint_instance_score_weight(self._config.scheduler_config.endpoint_instance_score_weight)
+            if self._config and hasattr(policy, "set_mean_factors"):
+                gated = self._config.scheduler_config.c2lb
+                policy.set_mean_factors(
+                    gated.active_tokens_mean_factor,
+                    gated.cpu_hit_blocks_mean_factor,
+                    gated.isl_mean_factor,
+                )
         logger.info(
             "Scheduler started. prefill=%s decode=%s",
             getattr(self._prefill_policy_type, "value", self._prefill_policy_type),

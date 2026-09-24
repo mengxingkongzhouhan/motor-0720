@@ -9,10 +9,10 @@
 # See the Mulan PSL v2 for more details.
 
 """
-WorkloadSharedMemoryOwner: Mgmt-side schema-4 membership snapshot via the Rust .so.
+WorkloadSharedMemoryOwner: Mgmt-side schema-5 membership snapshot via the Rust .so.
 
-Token allocate/release is done by Infer Workers with per-slot CAS; this owner only
-creates the segment, snapshots membership (preserving in-flight tokens), heartbeats,
+Token/overlay allocate/release is done by Infer Workers with per-slot CAS; this owner only
+creates the segment, snapshots membership (preserving in-flight tokens and overlay), heartbeats,
 and sets BLOCKED flags for the circuit breaker.
 """
 
@@ -83,7 +83,7 @@ def _lowest_free_slot(used: set[int], max_entries: int) -> int | None:
 
 
 class WorkloadSharedMemoryOwner:
-    """Mgmt-side schema-4 SHM owner. Membership snapshot + heartbeat + BLOCKED flags."""
+    """Mgmt-side schema-5 SHM owner. Membership snapshot + heartbeat + BLOCKED flags."""
 
     def __init__(
         self,
@@ -109,7 +109,7 @@ class WorkloadSharedMemoryOwner:
 
     @property
     def native(self) -> WorkloadShm:
-        """Underlying schema-4 native handle (CAS / set_blocked)."""
+        """Underlying schema-5 native handle (CAS / set_blocked)."""
         return self._native
 
     @property

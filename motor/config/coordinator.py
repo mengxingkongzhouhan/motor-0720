@@ -197,7 +197,7 @@ class SchedulerType(Enum):
     LOAD_BALANCE = "load_balance"
     ROUND_ROBIN = "round_robin"
     KV_CACHE_AFFINITY = "kv_cache_affinity"
-    # C2LB ordering (ledger prefill_cost ascending), then the first endpoint at or below both
+    # C2LB ordering (ledger isl ascending), then the first endpoint at or below both
     # ledger averages (active_tokens and cpu_hit_blocks) wins. Prefill / encode / union only.
     C2LB = "c2lb"
 
@@ -400,13 +400,13 @@ class C2LBConfig:
     """Tunables for ``prefill_scheduler_type=c2lb``.
 
     Nested under ``scheduler_config.c2lb`` in user JSON. Endpoints are walked in ledger
-    ``prefill_cost`` order and the first one passing both gates is committed:
+    ``isl`` order and the first one passing both gates is committed:
     ``active_tokens <= mean(active_tokens) * active_tokens_mean_factor`` and
     ``cpu_hit_blocks <= mean(cpu_hit_blocks) * cpu_hit_blocks_mean_factor``.
     """
 
     # Multiplier on the candidates' mean active_tokens. >1 loosens the gate (more endpoints pass,
-    # ordering by ledger prefill dominates), <1 tightens it (only clearly idle endpoints pass).
+    # ordering by ledger isl dominates), <1 tightens it (only clearly idle endpoints pass).
     active_tokens_mean_factor: float = 1.0
     # Multiplier on the candidates' mean cpu_hit_blocks, same semantics.
     cpu_hit_blocks_mean_factor: float = 1.0

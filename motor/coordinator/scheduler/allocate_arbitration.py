@@ -313,9 +313,9 @@ def select_c2lb(
     c2lb arbitration on the worker's fresh cache (SHM active_tokens + overlay).
 
     Resolve every scored endpoint that is still schedulable, sort by the endpoint's ledger
-    ``prefill_cost`` and take the first one at or below both scaled ledger averages. The
+    ``isl`` and take the first one at or below both scaled ledger averages. The
     worker-supplied per-endpoint cost / cpu_blocks are only the values stamped on commit.
-    The returned score is the committed endpoint's ledger prefill_cost.
+    The returned score is the committed endpoint's ledger isl.
     """
     if not gated_candidates:
         logger.warning(
@@ -372,7 +372,7 @@ def select_c2lb(
         ctx.c2lb_cpu_factor,
         format_candidates(ranked),
     )
-    return (chosen.instance, chosen.endpoint, chosen.ledger_prefill_cost)
+    return (chosen.instance, chosen.endpoint, chosen.ledger_isl)
 
 
 def select_authoritative_allocate_candidate(
@@ -396,7 +396,7 @@ def select_authoritative_allocate_candidate(
     Load-balance scans all endpoints. KV-cache affinity in unified mode re-ranks EVERY reported
     endpoint by ``prefill_load_scale*prefill_cost + load_weight*fresh_load``; older affinity callers
     without per-endpoint prefill_cost fall back to "least-loaded among the ranked alternates".
-    c2lb re-sorts by ledger prefill_cost and applies the two mean gates.
+    c2lb re-sorts by ledger isl and applies the two mean gates.
     Other policies keep the proposed endpoint. ``excluded`` (pairs this CAS round already
     rejected) is forwarded to every branch that scans beyond ``candidates``.
     """

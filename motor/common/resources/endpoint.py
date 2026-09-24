@@ -23,10 +23,10 @@ class Workload(BaseModel):
     """Workload information for load balancing (compute-load ledger)."""
 
     active_tokens: float = Field(default=0, description="Active compute load in token units")
-    prefill_cost: float = Field(
+    isl: float = Field(
         default=0,
-        description="c2lb: outstanding remaining prefill (isl - matched); "
-        "kv_cache_affinity: in-flight prompt length max(0, isl); 0 for RR/LB. "
+        description="In-flight prompt length on this endpoint: sum of max(0, isl) over "
+        "requests currently running here (c2lb / kv_cache_affinity); 0 for RR/LB. "
         "Worker-local overlay on motor-0924 (not carried in schema-4 SHM).",
     )
     cpu_hit_blocks: float = Field(
@@ -40,7 +40,7 @@ class Workload(BaseModel):
             raise TypeError(f"Unsupported operand type(s) for +=: 'Workload' and {type(other).__name__}")
 
         self.active_tokens += other.active_tokens
-        self.prefill_cost += other.prefill_cost
+        self.isl += other.isl
         self.cpu_hit_blocks += other.cpu_hit_blocks
 
         return self

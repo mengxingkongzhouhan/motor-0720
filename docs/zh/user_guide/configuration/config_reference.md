@@ -531,7 +531,7 @@ motor_coordinator_config字段配置样例如下所示：
 | base_timeout_s | float | 首次熔断时长（秒），也是熔断时长指数退避的基数；每次重新熔断/探活失败按 `2^(熔断次数-1)` 倍增长。默认值：`30.0`。 |
 | max_timeout_s | float | 熔断时长上限（秒）。默认值：`300.0`。 |
 | **scheduler_config字段** |-|-|
-| prefill_scheduler_type | string | Prefill / encode / union 实例的调度类型，默认值：load_balance<ul><li>load_balance：负载均衡；</li><li>round_robin：轮询；</li><li>kv_cache_affinity：KV Cache 亲和调度。选路分数仍为 `isl - overlap_credit × matched`；Worker 本地账本 `prefill_cost` 按 `max(0, isl)` 记账（不扣命中），`cpu_hit_blocks` 不记。SHM `active_tokens` 仍为 `isl - matched`。</li><li>c2lb：按 endpoint 账本中当前未完成的剩余 prefill（`prefill_cost`）从小到大排序，依序选出第一个同时满足账本 `active_tokens <= 均值 × active_tokens_mean_factor` 且 `cpu_hit_blocks`（在跑请求命中的 CPU 侧 KV 块数）`<= 均值 × cpu_hit_blocks_mean_factor` 的 endpoint（取等号，保证全空闲集群也能通过门限）；都不满足时退化为只看 `active_tokens` 门限、再退化为账本 `prefill_cost` 最小者。Conductor 仅用于给被选 endpoint 记账（本请求的 `isl - 命中 token` 与 `cpu_blocks`）。系数见 `c2lb` 字段。`active_tokens` 走 schema-4 SHM（跨 Worker），`prefill_cost` / `cpu_hit_blocks` 为 Worker 本地账本叠加层。</li></ul> |
+| prefill_scheduler_type | string | Prefill / encode / union 实例的调度类型，默认值：load_balance<ul><li>load_balance：负载均衡；</li><li>round_robin：轮询；</li><li>kv_cache_affinity：KV Cache 亲和调度。选路分数仍为 `isl - overlap_credit × matched`；Worker 本地账本 `isl` 按 `max(0, isl)` 记账（不扣命中），`cpu_hit_blocks` 不记。SHM `active_tokens` 仍为 `isl - matched`。</li><li>c2lb：按 endpoint 账本中当前在跑请求的请求长度（`isl`）从小到大排序，依序选出第一个同时满足账本 `active_tokens <= 均值 × active_tokens_mean_factor` 且 `cpu_hit_blocks`（在跑请求命中的 CPU 侧 KV 块数）`<= 均值 × cpu_hit_blocks_mean_factor` 的 endpoint（取等号，保证全空闲集群也能通过门限）；都不满足时退化为只看 `active_tokens` 门限、再退化为账本 `isl` 最小者。Conductor 仅用于给被选 endpoint 记账（本请求的 `isl` 与 `cpu_blocks`）。系数见 `c2lb` 字段。`active_tokens` 走 schema-4 SHM（跨 Worker），`isl` / `cpu_hit_blocks` 为 Worker 本地账本叠加层。</li></ul> |
 | decode_scheduler_type | string | Decode 实例的调度类型，默认值：load_balance。可选 `load_balance` / `round_robin`。枚举也接受 `kv_cache_affinity` / `c2lb`（旧 `scheduler_type` 会写到该字段），但选 Decode 实例时不走亲和或 c2lb 门限，仍按 load_balance，启动打 warning。 |
 | scheduler_type | string | **已废弃**。存量配置仍可使用，读取时同时赋给 `prefill_scheduler_type` 与 `decode_scheduler_type` 并打 warning。新配置请分别填写上述两个字段。 |
 | enable_pd_separation_fallback_to_hybrid | bool | PD 分离场景下，当不存在兼容且未熔断的 P/D pair 时，是否允许降级使用混部路由，默认值为 `true`。候选优先级为 Union → Prefill → Decode；Decode 兜底仅适用于上报 `decode_colocation` capability 的 vLLM 实例，关闭后无兼容 pair 时返回 503。 |
@@ -550,7 +550,7 @@ motor_coordinator_config字段配置样例如下所示：
 | w_disk | float | 互斥 Disk 命中块权重。默认值：`0.0` |
 | hit_rate_threshold | float | 亲和性命中率门槛，取值 `[0, 1]`。默认 `0` 关闭（始终按亲和评分）。大于 0 时，最大加权前缀命中率必须 **大于** 该阈值才走亲和调度，否则回退 `load_balance` |
 | **c2lb 字段** |-|-|
-| active_tokens_mean_factor | float | `active_tokens` 门限 = 候选 endpoint 的 `active_tokens` 均值 × 该系数。大于 1 放宽（更多 endpoint 通过，账本 `prefill_cost` 排序起主导作用），小于 1 收紧。默认值：`1.0` |
+| active_tokens_mean_factor | float | `active_tokens` 门限 = 候选 endpoint 的 `active_tokens` 均值 × 该系数。大于 1 放宽（更多 endpoint 通过，账本 `isl` 排序起主导作用），小于 1 收紧。默认值：`1.0` |
 | cpu_hit_blocks_mean_factor | float | `cpu_hit_blocks` 门限 = 候选 endpoint 的 `cpu_hit_blocks` 均值 × 该系数，语义同上。默认值：`1.0` |
 | **inference_workers_config字段** |-|-|
 | num_workers | int | Coordinator中业务面worker个数，默认值：4。 |

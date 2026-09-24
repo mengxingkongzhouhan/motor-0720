@@ -194,7 +194,7 @@ class _SchedulerInstanceCache:
         overlay = self._ledger_overlay.get((instance_id, endpoint_id), (0.0, 0.0))
         cached_endpoint.workload = Workload(
             active_tokens=active_tokens,
-            prefill_cost=overlay[0],
+            isl=overlay[0],
             cpu_hit_blocks=overlay[1],
         )
         if cached_instance.gathered_workload is None:
@@ -290,26 +290,26 @@ class _SchedulerInstanceCache:
         instance_id: int,
         endpoint_id: int,
         role: PDRole,
-        prefill_cost_delta: float,
+        isl_delta: float,
         cpu_hit_blocks_delta: float,
     ) -> None:
-        """Accumulate worker-local prefill_cost / cpu_hit_blocks overlay and stamp the endpoint."""
+        """Accumulate worker-local isl / cpu_hit_blocks overlay and stamp the endpoint."""
         key = (instance_id, endpoint_id)
-        old_prefill, old_cpu = self._ledger_overlay.get(key, (0.0, 0.0))
-        new_prefill = max(0.0, old_prefill + float(prefill_cost_delta))
+        old_isl, old_cpu = self._ledger_overlay.get(key, (0.0, 0.0))
+        new_isl = max(0.0, old_isl + float(isl_delta))
         new_cpu = max(0.0, old_cpu + float(cpu_hit_blocks_delta))
-        if new_prefill == 0.0 and new_cpu == 0.0:
+        if new_isl == 0.0 and new_cpu == 0.0:
             self._ledger_overlay.pop(key, None)
         else:
-            self._ledger_overlay[key] = (new_prefill, new_cpu)
-        self._stamp_ledger_overlay(instance_id, endpoint_id, role, new_prefill, new_cpu)
+            self._ledger_overlay[key] = (new_isl, new_cpu)
+        self._stamp_ledger_overlay(instance_id, endpoint_id, role, new_isl, new_cpu)
 
     def _stamp_ledger_overlay(
         self,
         instance_id: int,
         endpoint_id: int,
         role: PDRole,
-        prefill_cost: float,
+        isl: float,
         cpu_hit_blocks: float,
     ) -> None:
         cached_endpoint = self._endpoint_map.get((instance_id, endpoint_id))
@@ -318,7 +318,7 @@ class _SchedulerInstanceCache:
         old = cached_endpoint.workload or Workload()
         cached_endpoint.workload = Workload(
             active_tokens=old.active_tokens,
-            prefill_cost=prefill_cost,
+            isl=isl,
             cpu_hit_blocks=cpu_hit_blocks,
         )
         role_map = self._instance_map.get(role) or {}
@@ -327,19 +327,19 @@ class _SchedulerInstanceCache:
             return
         if cached_instance.gathered_workload is None:
             cached_instance.gathered_workload = Workload()
-        cached_instance.gathered_workload.prefill_cost += prefill_cost - old.prefill_cost
+        cached_instance.gathered_workload.isl += isl - old.isl
         cached_instance.gathered_workload.cpu_hit_blocks += cpu_hit_blocks - old.cpu_hit_blocks
 
     def _reapply_ledger_overlay(self) -> None:
         """Re-stamp overlay onto newly replaced instance objects (membership refresh)."""
-        for (instance_id, endpoint_id), (prefill_cost, cpu_hit_blocks) in self._ledger_overlay.items():
+        for (instance_id, endpoint_id), (isl, cpu_hit_blocks) in self._ledger_overlay.items():
             cached_endpoint = self._endpoint_map.get((instance_id, endpoint_id))
             if cached_endpoint is None:
                 continue
             old = cached_endpoint.workload or Workload()
             cached_endpoint.workload = Workload(
                 active_tokens=old.active_tokens,
-                prefill_cost=prefill_cost,
+                isl=isl,
                 cpu_hit_blocks=cpu_hit_blocks,
             )
 
@@ -1029,12 +1029,13 @@ class AsyncSchedulerClient:
     ) -> Workload:
         """Same commit formula the former ALLOCATE_ONLY handler used (R4).
 
-        c2lb stamps conductor-derived remaining prefill and cpu_blocks.
+        c2lb stamps overlay ``isl = max(0, request_isl)`` and cpu_blocks.
         kv_cache_affinity still commits SHM ``active_tokens`` as ``isl - matched``, and
-        additionally stamps overlay ``prefill_cost = max(0, isl)`` (cache hits do not
+        additionally stamps overlay ``isl = max(0, request_isl)`` (cache hits do not
         reduce the overlay). RR/LB leave overlay fields at 0.
         """
         if candidate_policy == CANDIDATE_POLICY_C2LB and role in (PDRole.ROLE_P, PDRole.ROLE_U):
+            active_tokens = demand.active_tokens
             if isl > 0:
                 active_tokens = calculate_committed_workload(
                     role,
@@ -1043,7 +1044,7 @@ class AsyncSchedulerClient:
                 ).active_tokens
             return Workload(
                 active_tokens=active_tokens,
-                prefill_cost=max(0.0, float(isl)),
+                isl=max(0.0, float(isl)),
                 cpu_hit_blocks=(cpu_hit_map or {}).get((instance.id, endpoint.id), 0.0),
             )
         if candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY and role in (PDRole.ROLE_P, PDRole.ROLE_U):
@@ -1056,7 +1057,7 @@ class AsyncSchedulerClient:
                 ).active_tokens
             return Workload(
                 active_tokens=active_tokens,
-                prefill_cost=max(0.0, float(isl)),
+                isl=max(0.0, float(isl)),
             )
         return demand
 
@@ -1355,7 +1356,7 @@ class AsyncSchedulerClient:
                     out_instance.id,
                     out_endpoint.id,
                     role,
-                    committed.prefill_cost,
+                    committed.isl,
                     committed.cpu_hit_blocks,
                 )
                 meta["active_tokens"] = actual
@@ -1627,7 +1628,7 @@ class AsyncSchedulerClient:
                 params.instance_id,
                 params.endpoint_id,
                 role,
-                float(getattr(params.workload_change, "prefill_cost", 0) or 0),
+                float(getattr(params.workload_change, "isl", 0) or 0),
                 float(getattr(params.workload_change, "cpu_hit_blocks", 0) or 0),
             )
         except Exception as e:

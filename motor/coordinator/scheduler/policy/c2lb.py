@@ -9,9 +9,9 @@
 """
 C2LB scheduling policy: rank endpoints by their ledger, gate on two ledger averages.
 
-1. Sort the endpoints of the request's role by the ledger ``workload.prefill_cost`` ascending,
-   i.e. the remaining prefill currently outstanding on each endpoint (sum over its in-flight
-   requests of ``isl - matched_tokens``).
+1. Sort the endpoints of the request's role by the ledger ``workload.isl`` ascending,
+   i.e. the in-flight request length currently outstanding on each endpoint (sum over its
+   in-flight requests of ``max(0, isl)``).
 2. Walk that order and commit the first endpoint whose ledger is at or below BOTH scaled
    averages over the ranked endpoints:
    ``active_tokens <= mean(active_tokens) * active_tokens_mean_factor`` and
@@ -21,16 +21,15 @@ C2LB scheduling policy: rank endpoints by their ledger, gate on two ledger avera
 
 All three inputs are ledger fields, so the ranking itself needs no per-request affinity math.
 The KV Conductor is queried once per request only to know what to ADD to the committed
-endpoint's ledger: the request's own remaining prefill (C2LB cost model,
-``max(0, isl - matched_tokens)``) and the CPU-tier KV blocks it would pull there
-(``cpu_blocks``). RELEASE subtracts both again, so ``prefill_cost`` / ``cpu_hit_blocks`` track
-the prefill compute and CPU->NPU KV transfer currently in flight per endpoint.
+endpoint's ledger: the request's own prompt length (``max(0, isl)``) and the CPU-tier KV
+blocks it would pull there (``cpu_blocks``). RELEASE subtracts both again, so ``isl`` /
+``cpu_hit_blocks`` track the in-flight prompt length and CPU->NPU KV transfer per endpoint.
 
 When no endpoint passes both gates the policy degrades in order: first endpoint passing the
-``active_tokens`` gate alone, then the head of the list (lowest ledger prefill_cost).
+``active_tokens`` gate alone, then the head of the list (lowest ledger isl).
 
 On motor-0924 the authoritative re-pick lives in worker-local ``allocate_arbitration``
-(schema-4 SHM CAS). ``active_tokens`` is the cross-worker SHM ledger; ``prefill_cost`` and
+(schema-4 SHM CAS). ``active_tokens`` is the cross-worker SHM ledger; ``isl`` and
 ``cpu_hit_blocks`` are a worker-local overlay (schema-4 does not carry them).
 Prefill / encode / union use ``prefill_scheduler_type``; decode falls back to load_balance
 when this policy is set on decode.
@@ -355,8 +354,8 @@ class GatedCandidate:
         return (self.instance.id, self.endpoint.id)
 
     @property
-    def ledger_prefill_cost(self) -> float:
-        return _ledger_value(self.endpoint, "prefill_cost")
+    def ledger_isl(self) -> float:
+        return _ledger_value(self.endpoint, "isl")
 
     @property
     def ledger_active_tokens(self) -> float:
@@ -385,9 +384,9 @@ def _ledger_value(endpoint: Endpoint, field: str) -> float:
 
 
 def sort_candidates(candidates: list[GatedCandidate]) -> list[GatedCandidate]:
-    """Lowest ledger ``workload.prefill_cost`` first, ties by (instance_id, endpoint_id)."""
+    """Lowest ledger ``workload.isl`` first, ties by (instance_id, endpoint_id)."""
     endpoint_count = max(1, len(candidates[0].instance.get_all_endpoints()))
-    return sorted(candidates, key=lambda c: (c.ledger_prefill_cost + 0.05 * (c.instance.gathered_workload.prefill_cost / endpoint_count)))
+    return sorted(candidates, key=lambda c: (c.ledger_isl + 0.05 * (c.instance.gathered_workload.isl / endpoint_count)))
 
 
 def sort_candidates_by_npu_hit(
@@ -407,14 +406,14 @@ def pick_gated(
     cpu_hit_blocks_mean_factor: float = DEFAULT_MEAN_FACTOR,
 ) -> tuple[GatedCandidate, str, float, float] | None:
     """
-    Walk ``candidates`` (already in ledger prefill_cost order) and return the first one whose
+    Walk ``candidates`` (already in ledger isl order) and return the first one whose
     ledger is at or below both scaled averages, plus the pick reason and the two thresholds
     actually used (``mean * factor``).
 
     Averages are taken over the candidates' current ledgers (``endpoint.workload``), so the
     caller decides which view is authoritative (worker SHM cache vs overlay).
     Fallback order when nothing passes both gates: active_tokens gate only, then the head of the
-    list (lowest ledger prefill_cost).
+    list (lowest ledger isl).
     """
     if not candidates:
         return None
@@ -422,11 +421,11 @@ def pick_gated(
     n = len(candidates)
     active_avg = sum(c.ledger_active_tokens for c in candidates) / n
     cpu_avg = sum(c.ledger_cpu_hit_blocks for c in candidates) / n
-    prefill_cost_avg = sum(c.ledger_prefill_cost for c in candidates) / n
+    isl_avg = sum(c.ledger_isl for c in candidates) / n
 
     active_threshold = active_avg * _factor(active_tokens_mean_factor)
     cpu_threshold = cpu_avg * _factor(cpu_hit_blocks_mean_factor)
-    prefill_cost_threshold = prefill_cost_avg * _factor(active_tokens_mean_factor)
+    isl_threshold = isl_avg * _factor(active_tokens_mean_factor)
 
     candidates_with_hight_npu_hit = sort_candidates_by_npu_hit(candidates, 0.8)
     if candidates_with_hight_npu_hit:
@@ -434,15 +433,15 @@ def pick_gated(
          for cand in candidates_with_hight_npu_hit:
             under_active = cand.ledger_active_tokens <= active_threshold
             under_cpu = cand.ledger_cpu_hit_blocks <= cpu_threshold
-            under_prefill_cost = cand.ledger_prefill_cost <= prefill_cost_threshold
+            under_isl = cand.ledger_isl <= isl_threshold
 
-            if under_active and under_cpu and under_prefill_cost:
+            if under_active and under_cpu and under_isl:
                 return (cand, PICK_BOTH_GATES, active_threshold, cpu_threshold)
    
     active_only: GatedCandidate | None = None
     for cand in candidates:
 
-        if cand.ledger_prefill_cost > prefill_cost_avg:
+        if cand.ledger_isl > isl_avg:
             return (candidates[0], PICK_MIN_LEDGER_PREFILL, active_threshold, cpu_threshold)
         under_active = cand.ledger_active_tokens <= active_threshold
         under_cpu = cand.ledger_cpu_hit_blocks <= cpu_threshold
@@ -455,7 +454,7 @@ def pick_gated(
 def format_candidates(candidates: list[GatedCandidate]) -> str:
     """``ins-ep:ledger_prefill/active/cpu(+req_cost/+req_cpu)`` per candidate, for the selection log."""
     return " ".join(
-        f"{c.instance.id}-{c.endpoint.id}:{c.ledger_prefill_cost:.0f}/{c.ledger_active_tokens:.0f}/"
+        f"{c.instance.id}-{c.endpoint.id}:{c.ledger_isl:.0f}/{c.ledger_active_tokens:.0f}/"
         f"{c.ledger_cpu_hit_blocks:.0f}(+{c.prefill_cost:.0f}/+{c.cpu_hit_blocks:.0f})"
         for c in candidates
     )
@@ -463,7 +462,7 @@ def format_candidates(candidates: list[GatedCandidate]) -> str:
 
 class C2LBPolicy(BaseSchedulingPolicy):
     """
-    Rank by ledger prefill_cost, commit the first endpoint under both ledger load averages.
+    Rank by ledger isl, commit the first endpoint under both ledger load averages.
 
     Workers run the conductor query (for the stamp values) and re-rank / re-gate against the
     local cache (SHM ``active_tokens`` + worker-local overlay) before CAS-committing.
@@ -487,7 +486,7 @@ class C2LBPolicy(BaseSchedulingPolicy):
     @staticmethod
     def score_endpoints(instances: list[Instance], req_info: RequestInfo) -> list[GatedCandidate] | None:
         """
-        Conductor lookup: every endpoint as a ``GatedCandidate``, sorted by its ledger prefill_cost.
+        Conductor lookup: every endpoint as a ``GatedCandidate``, sorted by its ledger isl.
 
         The conductor only supplies the per-endpoint stamp values (request cost, cpu_blocks).
         ``None`` means it had no data for our instances (caller falls back). Also caches
@@ -555,7 +554,7 @@ class C2LBPolicy(BaseSchedulingPolicy):
         cpu_hit_blocks_mean_factor: float = DEFAULT_MEAN_FACTOR,
     ) -> list[tuple[Instance, Endpoint, float]] | None:
         """
-        Worker-side proposal: the gated pick first, then the rest in ledger prefill_cost order.
+        Worker-side proposal: the gated pick first, then the rest in ledger isl order.
 
         ``allocate_arbitration`` re-ranks and re-gates on the cache after a SHM refresh.
         """
@@ -576,7 +575,7 @@ class C2LBPolicy(BaseSchedulingPolicy):
             cpu_threshold,
         )
         ordered = [chosen] + [c for c in ranked if c is not chosen]
-        return [(c.instance, c.endpoint, c.ledger_prefill_cost) for c in ordered[: max(1, top_k)]]
+        return [(c.instance, c.endpoint, c.ledger_isl) for c in ordered[: max(1, top_k)]]
 
     @staticmethod
     def select_endpoint_from_list(

@@ -8,7 +8,7 @@
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
 
-"""Tests for C2LBPolicy: prefill_cost order, then first endpoint under both ledger averages."""
+"""Tests for C2LBPolicy: ledger isl order, then first endpoint under both ledger averages."""
 
 import json
 from types import SimpleNamespace
@@ -58,14 +58,14 @@ def _endpoint(
     ep_id: int,
     active_tokens: float = 0.0,
     cpu_hit_blocks: float = 0.0,
-    prefill_cost: float = 0.0,
+    isl: float = 0.0,
 ) -> Endpoint:
     return Endpoint(
         id=ep_id,
         ip="10.0.0.1",
         business_port=f"80{ep_id}",
         status=EndpointStatus.NORMAL,
-        workload=Workload(active_tokens=active_tokens, cpu_hit_blocks=cpu_hit_blocks, prefill_cost=prefill_cost),
+        workload=Workload(active_tokens=active_tokens, cpu_hit_blocks=cpu_hit_blocks, isl=isl),
     )
 
 
@@ -91,7 +91,7 @@ def _cand(
     req_cpu: float = 0.0,
 ) -> GatedCandidate:
     """Standalone candidate: endpoint ledger (prefill, active, cpu) + this request's stamp values."""
-    inst = _instance(ep_id, [_endpoint(ep_id, active_tokens=active, cpu_hit_blocks=cpu, prefill_cost=ledger_prefill)])
+    inst = _instance(ep_id, [_endpoint(ep_id, active_tokens=active, cpu_hit_blocks=cpu, isl=ledger_prefill)])
     return GatedCandidate(inst, inst.get_all_endpoints()[0], req_cost, req_cpu)
 
 
@@ -140,13 +140,13 @@ def _arbitration_context(
 
 class TestCpuHitLedger:
     def test_workload_iadd_accumulates_cpu_hits(self):
-        w = Workload(active_tokens=1, prefill_cost=2, cpu_hit_blocks=3)
-        w += Workload(active_tokens=1, prefill_cost=1, cpu_hit_blocks=4)
-        assert (w.active_tokens, w.prefill_cost, w.cpu_hit_blocks) == (2, 3, 7)
+        w = Workload(active_tokens=1, isl=2, cpu_hit_blocks=3)
+        w += Workload(active_tokens=1, isl=1, cpu_hit_blocks=4)
+        assert (w.active_tokens, w.isl, w.cpu_hit_blocks) == (2, 3, 7)
 
     def test_default_is_zero(self):
         assert Workload().cpu_hit_blocks == 0
-        assert Workload().prefill_cost == 0
+        assert Workload().isl == 0
 
     @pytest.mark.asyncio
     async def test_instance_manager_floors_negative_cpu_hits(self):
@@ -163,14 +163,14 @@ class TestCpuHitLedger:
     async def test_router_release_negates_cpu_hits(self):
         request_mgr = Mock()
         request_mgr.get_req_workload = AsyncMock(
-            return_value=Workload(active_tokens=10, prefill_cost=4, cpu_hit_blocks=3)
+            return_value=Workload(active_tokens=10, isl=4, cpu_hit_blocks=3)
         )
         handler = WorkloadActionHandler(request_mgr)
         inst = _instance(1, [_endpoint(10)])
         resource = ScheduledResource(instance=inst, endpoint=inst.get_all_endpoints()[0])
         change, role = await handler.compute_and_update(resource, "req", WorkloadAction.RELEASE_TOKENS, _req_info())
         assert role == PDRole.ROLE_P
-        assert (change.active_tokens, change.prefill_cost, change.cpu_hit_blocks) == (-10, -4, -3)
+        assert (change.active_tokens, change.isl, change.cpu_hit_blocks) == (-10, -4, -3)
 
 
 class TestC2LBTokenizer:
@@ -353,8 +353,8 @@ class TestPickGated:
 class TestPolicy:
     @patch("motor.coordinator.scheduler.policy.c2lb.ConductorApiClient.query_conductor")
     def test_score_endpoints_reads_cost_and_cpu_hits_and_orders_by_ledger(self, mock_query):
-        inst_a = _instance(1, [_endpoint(10, prefill_cost=300), _endpoint(11, prefill_cost=100)])
-        inst_b = _instance(2, [_endpoint(20, prefill_cost=200)])
+        inst_a = _instance(1, [_endpoint(10, isl=300), _endpoint(11, isl=100)])
+        inst_b = _instance(2, [_endpoint(20, isl=200)])
         req_info = _req_info(100)
         mock_query.return_value = _conductor_tenant(
             inst_a,
@@ -368,7 +368,7 @@ class TestPolicy:
 
         ranked = C2LBPolicy.score_endpoints([inst_a, inst_b], req_info)
 
-        assert [(c.endpoint.id, c.ledger_prefill_cost, c.prefill_cost, c.cpu_hit_blocks) for c in ranked] == [
+        assert [(c.endpoint.id, c.ledger_isl, c.prefill_cost, c.cpu_hit_blocks) for c in ranked] == [
             (11, 100.0, 100.0, 0.0),
             (20, 200.0, 50.0, 0.0),
             (10, 300.0, 10.0, 4.0),
@@ -380,8 +380,8 @@ class TestPolicy:
 
     @patch("motor.coordinator.scheduler.policy.c2lb.ConductorApiClient.query_conductor")
     def test_worker_proposal_puts_gated_pick_first(self, mock_query):
-        inst_a = _instance(1, [_endpoint(10, active_tokens=500, prefill_cost=10)])
-        inst_b = _instance(2, [_endpoint(20, active_tokens=10, prefill_cost=80)])
+        inst_a = _instance(1, [_endpoint(10, active_tokens=500, isl=10)])
+        inst_b = _instance(2, [_endpoint(20, active_tokens=10, isl=80)])
         req_info = _req_info(100)
         mock_query.return_value = _conductor_tenant(inst_a, inst_b, dp={(1, 10): 90, (2, 20): 20})
 
@@ -511,9 +511,9 @@ class TestPolicy:
         assert "decode_scheduler_type=c2lb is ignored" in caplog.text
 
     def test_in_process_selection_uses_factors(self):
-        inst_a = _instance(1, [_endpoint(10, active_tokens=22, prefill_cost=1)])
-        inst_b = _instance(2, [_endpoint(20, active_tokens=8, prefill_cost=2)])
-        inst_c = _instance(3, [_endpoint(30, active_tokens=30, prefill_cost=3)])
+        inst_a = _instance(1, [_endpoint(10, active_tokens=22, isl=1)])
+        inst_b = _instance(2, [_endpoint(20, active_tokens=8, isl=2)])
+        inst_c = _instance(3, [_endpoint(30, active_tokens=30, isl=3)])
         instances = [inst_a, inst_b, inst_c]
 
         def fake_score(insts, info):
@@ -544,10 +544,10 @@ class TestPolicy:
         inst = _instance(1, [_endpoint(10)])
         await im.refresh_instances(EventType.ADD, [inst])
         await im.update_instance_workload(
-            1, 10, Workload(active_tokens=100.0, prefill_cost=60.0, cpu_hit_blocks=3.0)
+            1, 10, Workload(active_tokens=100.0, isl=60.0, cpu_hit_blocks=3.0)
         )
         _, ledger = await im.get_endpoint_workload(1, 10)
-        assert (ledger.active_tokens, ledger.prefill_cost, ledger.cpu_hit_blocks) == (100.0, 60.0, 3.0)
+        assert (ledger.active_tokens, ledger.isl, ledger.cpu_hit_blocks) == (100.0, 60.0, 3.0)
 
 
 # ---------------------------------------------------------------------------
@@ -657,7 +657,7 @@ class TestClientDispatch:
             prefill_cost_map={(1, 10): 60.0},
             cpu_hit_map={(1, 10): 3.0},
         )
-        assert (committed.active_tokens, committed.prefill_cost, committed.cpu_hit_blocks) == (100.0, 60.0, 3.0)
+        assert (committed.active_tokens, committed.isl, committed.cpu_hit_blocks) == (100.0, 100.0, 3.0)
 
     @pytest.mark.asyncio
     async def test_overlay_survives_shm_token_patch(self):
@@ -667,7 +667,7 @@ class TestClientDispatch:
         client._cache.apply_ledger_delta(1, 10, PDRole.ROLE_P, 40.0, 9.0)
         client._cache.patch_workload_from_shm(1, 10, PDRole.ROLE_P, 12.0)
         ep = client._cache._endpoint_map[(1, 10)]
-        assert (ep.workload.active_tokens, ep.workload.prefill_cost, ep.workload.cpu_hit_blocks) == (12.0, 40.0, 9.0)
+        assert (ep.workload.active_tokens, ep.workload.isl, ep.workload.cpu_hit_blocks) == (12.0, 40.0, 9.0)
 
 
 # ---------------------------------------------------------------------------
@@ -693,9 +693,9 @@ class TestArbitration:
         inst_a = _instance(1, [_endpoint(10), _endpoint(11)])
         inst_b = _instance(2, [_endpoint(20)])
         im = await _pool([inst_a, inst_b])
-        await im.update_instance_workload(1, 10, Workload(active_tokens=900, prefill_cost=30))
-        await im.update_instance_workload(1, 11, Workload(cpu_hit_blocks=90, prefill_cost=60))
-        await im.update_instance_workload(2, 20, Workload(active_tokens=100, cpu_hit_blocks=5, prefill_cost=90))
+        await im.update_instance_workload(1, 10, Workload(active_tokens=900, isl=30))
+        await im.update_instance_workload(1, 11, Workload(cpu_hit_blocks=90, isl=60))
+        await im.update_instance_workload(2, 20, Workload(active_tokens=100, cpu_hit_blocks=5, isl=90))
         ctx = _arbitration_context(im)
 
         selected = allocate_arbitration.select_authoritative_allocate_candidate(
@@ -716,8 +716,8 @@ class TestArbitration:
     async def test_order_follows_ledger_not_request_cost(self):
         inst = _instance(1, [_endpoint(10), _endpoint(11)])
         im = await _pool([inst])
-        await im.update_instance_workload(1, 10, Workload(prefill_cost=50))
-        await im.update_instance_workload(1, 11, Workload(prefill_cost=5))
+        await im.update_instance_workload(1, 10, Workload(isl=50))
+        await im.update_instance_workload(1, 11, Workload(isl=5))
         ctx = _arbitration_context(im)
 
         selected = allocate_arbitration.select_authoritative_allocate_candidate(
@@ -737,8 +737,8 @@ class TestArbitration:
     async def test_equal_active_lets_cpu_gate_decide(self):
         inst = _instance(1, [_endpoint(10), _endpoint(11)])
         im = await _pool([inst])
-        await im.update_instance_workload(1, 10, Workload(active_tokens=10, cpu_hit_blocks=50, prefill_cost=5))
-        await im.update_instance_workload(1, 11, Workload(active_tokens=10, cpu_hit_blocks=0, prefill_cost=60))
+        await im.update_instance_workload(1, 10, Workload(active_tokens=10, cpu_hit_blocks=50, isl=5))
+        await im.update_instance_workload(1, 11, Workload(active_tokens=10, cpu_hit_blocks=0, isl=60))
         ctx = _arbitration_context(im)
 
         selected = allocate_arbitration.select_authoritative_allocate_candidate(
@@ -757,7 +757,7 @@ class TestArbitration:
         inst = _instance(1, [_endpoint(10), _endpoint(11), _endpoint(12)])
         im = await _pool([inst])
         for ep, active in {10: 22, 11: 8, 12: 30}.items():
-            await im.update_instance_workload(1, ep, Workload(active_tokens=active, prefill_cost=ep))
+            await im.update_instance_workload(1, ep, Workload(active_tokens=active, isl=ep))
         quads = _gated_quads((1, 10, 10.0, 0.0), (1, 11, 11.0, 0.0), (1, 12, 12.0, 0.0))
 
         strict = allocate_arbitration.select_authoritative_allocate_candidate(
@@ -786,7 +786,7 @@ class TestArbitration:
         im = await _pool([inst])
         for ep, (active, cpu) in {10: (5, 15), 11: (5, 5), 12: (50, 10)}.items():
             await im.update_instance_workload(
-                1, ep, Workload(active_tokens=active, cpu_hit_blocks=cpu, prefill_cost=ep)
+                1, ep, Workload(active_tokens=active, cpu_hit_blocks=cpu, isl=ep)
             )
         quads = _gated_quads((1, 10, 10.0, 0.0), (1, 11, 11.0, 0.0), (1, 12, 12.0, 0.0))
 

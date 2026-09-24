@@ -303,7 +303,7 @@ class BaseRouter(ABC):
                 workload_action=WorkloadAction.RELEASE_TOKENS,
                 workload_change=Workload(
                     active_tokens=-workload.active_tokens,
-                    prefill_cost=-float(getattr(workload, "prefill_cost", 0) or 0),
+                    isl=-float(getattr(workload, "isl", 0) or 0),
                     cpu_hit_blocks=-float(getattr(workload, "cpu_hit_blocks", 0) or 0),
                 ),
             )
@@ -512,7 +512,7 @@ class BaseRouter(ABC):
         """Undo a scheduler allocation if local request workload bookkeeping fails."""
         rollback_workload = Workload(
             active_tokens=-allocate_workload.active_tokens,
-            prefill_cost=-float(getattr(allocate_workload, "prefill_cost", 0) or 0),
+            isl=-float(getattr(allocate_workload, "isl", 0) or 0),
             cpu_hit_blocks=-float(getattr(allocate_workload, "cpu_hit_blocks", 0) or 0),
         )
         params = UpdateWorkloadParams(

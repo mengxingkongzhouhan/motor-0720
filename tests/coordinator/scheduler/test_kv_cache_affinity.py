@@ -2357,9 +2357,9 @@ def test_context_budget_leaves_exhausted_prompt_to_engine_validation():
 
 
 class TestKvAffinityLedgerStamp:
-    """kv_cache_affinity overlay: prefill_cost = max(0, isl); SHM tokens still isl - matched."""
+    """kv_cache_affinity overlay: Workload.isl = max(0, isl); SHM tokens still isl - matched."""
 
-    def test_committed_prefill_cost_is_full_isl_not_cache_remainder(self):
+    def test_committed_isl_is_full_isl_not_cache_remainder(self):
         client = AsyncSchedulerClient(SchedulerClientConfig(scheduler_type="kv_cache_affinity"))
         inst = Mock()
         inst.id = 1
@@ -2375,7 +2375,7 @@ class TestKvAffinityLedgerStamp:
             100.0,
         )
         assert committed.active_tokens == 10.0
-        assert committed.prefill_cost == 100.0
+        assert committed.isl == 100.0
         assert committed.cpu_hit_blocks == 0.0
 
     def test_union_role_stamps_full_isl(self):
@@ -2394,9 +2394,9 @@ class TestKvAffinityLedgerStamp:
             80.0,
         )
         assert committed.active_tokens == 70.0
-        assert committed.prefill_cost == 80.0
+        assert committed.isl == 80.0
 
-    def test_decode_does_not_stamp_overlay_prefill_cost(self):
+    def test_decode_does_not_stamp_overlay_isl(self):
         client = AsyncSchedulerClient(SchedulerClientConfig(scheduler_type="kv_cache_affinity"))
         inst = Mock()
         inst.id = 1
@@ -2413,4 +2413,4 @@ class TestKvAffinityLedgerStamp:
             100.0,
         )
         assert committed is demand
-        assert committed.prefill_cost == 0.0
+        assert committed.isl == 0.0

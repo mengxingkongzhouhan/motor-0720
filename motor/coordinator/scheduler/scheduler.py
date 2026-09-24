@@ -66,7 +66,7 @@ class Scheduler:
             if self._config and hasattr(policy, "set_endpoint_instance_score_weight"):
                 policy.set_endpoint_instance_score_weight(self._config.scheduler_config.endpoint_instance_score_weight)
             if self._config and hasattr(policy, "set_mean_factors"):
-                gated = self._config.scheduler_config.smetric_gated
+                gated = self._config.scheduler_config.c2lb
                 policy.set_mean_factors(
                     gated.active_tokens_mean_factor,
                     gated.cpu_hit_blocks_mean_factor,

@@ -78,10 +78,10 @@ class RequestInfo(BaseModel):
         "for the committed endpoint. Keyed by (instance_id, endpoint_id) tuples, so excluded "
         "from serialization.",
     )
-    smetric_gated_debug: dict | None = Field(
+    c2lb_debug: dict | None = Field(
         default=None,
         exclude=True,
-        description="Per-endpoint (prefill_cost, cpu_hit_blocks) cached by the smetric_gated policy at "
+        description="Per-endpoint (prefill_cost, cpu_hit_blocks) cached by the c2lb policy at "
         "selection; the worker re-ranks by ledger prefill_cost, gates on ledger averages and stamps "
         "both values on the committed endpoint. Keyed by (instance_id, endpoint_id).",
     )

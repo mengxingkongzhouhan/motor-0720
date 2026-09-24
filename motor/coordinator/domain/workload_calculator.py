@@ -30,13 +30,13 @@ def allocated_prefill_cost(
     """
     Prefill cost stamped onto the committed endpoint's workload.
 
-    ``smetric_gated`` caches ``(prefill_cost, cpu_hit_blocks)`` per endpoint. KV affinity
+    ``c2lb`` caches ``(prefill_cost, cpu_hit_blocks)`` per endpoint. KV affinity
     stores a 4-tuple whose third field is the request prefill cost. Missing/invalid entries
     yield 0.
     """
     if req_info is None or instance_id is None or endpoint_id is None:
         return 0.0
-    gated = getattr(req_info, "smetric_gated_debug", None)
+    gated = getattr(req_info, "c2lb_debug", None)
     if isinstance(gated, dict):
         rec = gated.get((instance_id, endpoint_id))
         return _non_negative(rec[0] if isinstance(rec, (tuple, list)) and rec else None)
@@ -51,12 +51,12 @@ def allocated_cpu_hit_blocks(
     """
     CPU-tier matched blocks stamped onto the committed endpoint's workload.
 
-    Only ``smetric_gated`` records these (``req_info.smetric_gated_debug``); other policies leave
+    Only ``c2lb`` records these (``req_info.c2lb_debug``); other policies leave
     the ledger field at 0.
     """
     if req_info is None or instance_id is None or endpoint_id is None:
         return 0.0
-    gated = getattr(req_info, "smetric_gated_debug", None)
+    gated = getattr(req_info, "c2lb_debug", None)
     if not isinstance(gated, dict):
         return 0.0
     rec = gated.get((instance_id, endpoint_id))

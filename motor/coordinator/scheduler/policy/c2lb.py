@@ -7,7 +7,7 @@
 # See the Mulan PSL v2 for more details.
 
 """
-SMetric-gated scheduling policy: rank endpoints by their ledger, gate on two ledger averages.
+C2LB scheduling policy: rank endpoints by their ledger, gate on two ledger averages.
 
 1. Sort the endpoints of the request's role by the ledger ``workload.prefill_cost`` ascending,
    i.e. the remaining prefill currently outstanding on each endpoint (sum over its in-flight
@@ -16,12 +16,12 @@ SMetric-gated scheduling policy: rank endpoints by their ledger, gate on two led
    averages over the ranked endpoints:
    ``active_tokens <= mean(active_tokens) * active_tokens_mean_factor`` and
    ``cpu_hit_blocks <= mean(cpu_hit_blocks) * cpu_hit_blocks_mean_factor``
-   (factors from ``SchedulerConfig.smetric_gated``, default 1.0). ``<=`` so that an idle
+   (factors from ``SchedulerConfig.c2lb``, default 1.0). ``<=`` so that an idle
    cluster (every ledger 0, mean 0) still passes the gates instead of relying on the fallback.
 
 All three inputs are ledger fields, so the ranking itself needs no per-request affinity math.
 The KV Conductor is queried once per request only to know what to ADD to the committed
-endpoint's ledger: the request's own remaining prefill (SMetric cost model,
+endpoint's ledger: the request's own remaining prefill (C2LB cost model,
 ``max(0, isl - matched_tokens)``) and the CPU-tier KV blocks it would pull there
 (``cpu_blocks``). RELEASE subtracts both again, so ``prefill_cost`` / ``cpu_hit_blocks`` track
 the prefill compute and CPU->NPU KV transfer currently in flight per endpoint.
@@ -68,15 +68,15 @@ from motor.coordinator.scheduler.policy.utils import (
 logger = get_logger(__name__)
 
 # Roles that do prefill, i.e. whose allocations have a conductor cost and CPU hit count.
-SMETRIC_GATED_ROLES = frozenset({PDRole.ROLE_P, PDRole.ROLE_U})
+C2LB_ROLES = frozenset({PDRole.ROLE_P, PDRole.ROLE_U})
 
 # Gate threshold = candidate mean * factor; 1.0 is the plain average.
 DEFAULT_MEAN_FACTOR = 1.0
 _TOKENIZER_LOAD_RETRY_SECONDS = 30.0
 
-# SMetric discounts a cached prefix 1:1 against prompt length. Not configurable; not shared with
+# C2LB discounts a cached prefix 1:1 against prompt length. Not configurable; not shared with
 # kv_cache_affinity's overlap_credit knob.
-_SMETRIC_OVERLAP_CREDIT = 1
+_C2LB_OVERLAP_CREDIT = 1
 
 
 def _factor(value: float | None) -> float:
@@ -95,8 +95,8 @@ PICK_ACTIVE_GATE = "active_gate"
 PICK_MIN_LEDGER_PREFILL = "min_ledger_prefill"
 
 
-class SMetricTokenizer(ThreadSafeSingleton):
-    """Tokenizer owned by smetric_gated. Does not import other scheduling policies."""
+class C2LBTokenizer(ThreadSafeSingleton):
+    """Tokenizer owned by c2lb. Does not import other scheduling policies."""
 
     def __init__(self, config: CoordinatorConfig | None = None):
         if hasattr(self, "_initialized"):
@@ -116,15 +116,15 @@ class SMetricTokenizer(ThreadSafeSingleton):
         self.model_path = getattr(kv_config, "model_path", "") if kv_config else ""
         self.engine_type = str(getattr(kv_config, "engine_type", "vllm") or "vllm").strip().lower()
         self.openai_standard = os.environ.get("OPENAI_STANDARD", "STANDARD")
-        smetric_enabled = isinstance(scheduler_config, SchedulerConfig) and scheduler_config.uses_smetric_gated()
+        c2lb_enabled = isinstance(scheduler_config, SchedulerConfig) and scheduler_config.uses_c2lb()
         os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
-        if smetric_enabled:
+        if c2lb_enabled:
             self.get_tokenizer()
         logger.info(
-            "SMetricTokenizer init.(model_path:%s, is_dsv4:%s, lazy_load:%s)",
+            "C2LBTokenizer init.(model_path:%s, is_dsv4:%s, lazy_load:%s)",
             self.model_path,
             self._is_dsv4,
-            not smetric_enabled,
+            not c2lb_enabled,
         )
 
     def get_tokenizer(self):
@@ -153,7 +153,7 @@ class SMetricTokenizer(ThreadSafeSingleton):
             except Exception as exc:
                 self._next_load_attempt_at = time.monotonic() + _TOKENIZER_LOAD_RETRY_SECONDS
                 logger.warning(
-                    "SMetricTokenizer load failed; retrying in %.0fs: %s",
+                    "C2LBTokenizer load failed; retrying in %.0fs: %s",
                     _TOKENIZER_LOAD_RETRY_SECONDS,
                     exc,
                 )
@@ -172,9 +172,9 @@ class SMetricTokenizer(ThreadSafeSingleton):
             return self._apply_chat_template_standard(messages, tools, req_data)
         except Exception as exc:
             if self._is_dsv4:
-                logger.error("smetric_gated dsv4 tokenize failed; returning []: %s", exc)
+                logger.error("c2lb dsv4 tokenize failed; returning []: %s", exc)
                 return []
-            logger.warning("smetric_gated primary tokenize path failed: %s; trying fallback", exc)
+            logger.warning("c2lb primary tokenize path failed: %s; trying fallback", exc)
             return self._safe_fallback_encode(messages, tools, req_data)
 
     def encode(self, prompt: str) -> list[int]:
@@ -193,7 +193,7 @@ class SMetricTokenizer(ThreadSafeSingleton):
 
     @staticmethod
     def _is_deepseek_v4_model(model_path: str) -> bool:
-        config_dict = SMetricTokenizer._read_model_config_dict(model_path)
+        config_dict = C2LBTokenizer._read_model_config_dict(model_path)
         if not config_dict:
             return False
         return config_dict.get("model_type") == "deepseek_v4" or "DeepseekV4ForCausalLM" in (
@@ -283,12 +283,12 @@ class SMetricTokenizer(ThreadSafeSingleton):
                 return self._apply_chat_template_with_preprocess(messages, tools, req_data)
             return self._apply_chat_template_standard(messages, tools, req_data)
         except Exception as exc:
-            logger.error("smetric_gated tokenize failed on both primary and fallback paths; returning []: %s", exc)
+            logger.error("c2lb tokenize failed on both primary and fallback paths; returning []: %s", exc)
             return []
 
 
 def _prompt_token_ids(req_info: RequestInfo) -> list[int]:
-    """Use cached token ids, otherwise tokenize with the local SMetricTokenizer."""
+    """Use cached token ids, otherwise tokenize with the local C2LBTokenizer."""
     engine_cached = getattr(req_info, "engine_token_ids", None)
     if isinstance(engine_cached, list) and engine_cached:
         return engine_cached
@@ -300,11 +300,11 @@ def _prompt_token_ids(req_info: RequestInfo) -> list[int]:
     messages = req_data.get(OpenAIField.MESSAGES, None)
     tools = req_data.get(OpenAIField.TOOLS, None)
     if messages is not None:
-        encoded_ids = SMetricTokenizer().apply_chat_template(messages, tools, req_data=req_data)
+        encoded_ids = C2LBTokenizer().apply_chat_template(messages, tools, req_data=req_data)
     else:
         prompt = req_data.get(OpenAIField.PROMPT, None)
         if isinstance(prompt, str):
-            encoded_ids = SMetricTokenizer().encode(prompt)
+            encoded_ids = C2LBTokenizer().encode(prompt)
         elif (
             isinstance(prompt, list)
             and prompt
@@ -321,7 +321,7 @@ def _prompt_token_ids(req_info: RequestInfo) -> list[int]:
 def _prefill_cost(isl: int, matched_tokens: int) -> float:
     """Remaining prefill tokens with overlap_credit fixed at 1: max(0, isl - matched)."""
     matched = max(0, min(matched_tokens, isl)) if isl > 0 else 0
-    return float(max(0, isl - _SMETRIC_OVERLAP_CREDIT * matched))
+    return float(max(0, isl - _C2LB_OVERLAP_CREDIT * matched))
 
 
 def _matched_tokens(matched: object) -> int:
@@ -431,7 +431,7 @@ def format_candidates(candidates: list[GatedCandidate]) -> str:
     )
 
 
-class SMetricGatedPolicy(BaseSchedulingPolicy):
+class C2LBPolicy(BaseSchedulingPolicy):
     """
     Rank by ledger prefill_cost, commit the first endpoint under both ledger load averages.
 
@@ -443,7 +443,7 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
         super().__init__(instance_provider=instance_provider)
         self._active_tokens_mean_factor = DEFAULT_MEAN_FACTOR
         self._cpu_hit_blocks_mean_factor = DEFAULT_MEAN_FACTOR
-        logger.info("SMetricGatedPolicy started.")
+        logger.info("C2LBPolicy started.")
 
     def set_mean_factors(self, active_tokens_mean_factor: float, cpu_hit_blocks_mean_factor: float) -> None:
         """Set the multipliers applied to the two candidate averages used as gate thresholds."""
@@ -462,20 +462,20 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
         The conductor only supplies the per-endpoint stamp values (request cost, cpu_blocks).
         ``None`` means it had no data for our instances (caller falls back). Also caches
         ``{(instance_id, endpoint_id): (prefill_cost, cpu_hit_blocks)}`` on
-        ``req_info.smetric_gated_debug`` for the allocate stamp.
+        ``req_info.c2lb_debug`` for the allocate stamp.
         """
         encoded_ids = _prompt_token_ids(req_info)
         if not encoded_ids:
-            logger.warning("smetric_gated: no cached token_ids; falling back")
+            logger.warning("c2lb: no cached token_ids; falling back")
             return None
         isl = len(encoded_ids)
         rsp = ConductorApiClient.query_conductor(instances, encoded_ids)
         req_id = getattr(req_info, "req_id", None) or DEFAULT_REQUEST_ID
-        logger.debug("smetric_gated: req_id=%s conductor_rsp=%s", req_id, rsp)
+        logger.debug("c2lb: req_id=%s conductor_rsp=%s", req_id, rsp)
         tenant = rsp.get(TENANT_ID, None) if isinstance(rsp, dict) else None
         if tenant is None:
             logger.warning(
-                "smetric_gated: conductor query returned no tenant data (tenant_id=%s, instances=%d)",
+                "c2lb: conductor query returned no tenant data (tenant_id=%s, instances=%d)",
                 TENANT_ID,
                 len(instances),
             )
@@ -500,16 +500,16 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
                     )
                 )
         if not any_instance:
-            logger.warning("smetric_gated: no instance data")
+            logger.warning("c2lb: no instance data")
             return None
         if not candidates:
-            logger.warning("smetric_gated: no endpoint scored")
+            logger.warning("c2lb: no endpoint scored")
             return None
 
         ranked = sort_candidates(candidates)
-        req_info.smetric_gated_debug = {c.key: (c.prefill_cost, c.cpu_hit_blocks) for c in ranked}
+        req_info.c2lb_debug = {c.key: (c.prefill_cost, c.cpu_hit_blocks) for c in ranked}
         logger.info(
-            "smetric_gated: req_id=%s isl=%s ranked[ins-ep:ledger_prefill/active/cpu(+req_cost/+req_cpu)]=%s",
+            "c2lb: req_id=%s isl=%s ranked[ins-ep:ledger_prefill/active/cpu(+req_cost/+req_cpu)]=%s",
             req_id,
             isl,
             format_candidates(ranked),
@@ -529,7 +529,7 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
 
         ``allocate_arbitration`` re-ranks and re-gates on the cache after a SHM refresh.
         """
-        ranked = SMetricGatedPolicy.score_endpoints(instances, req_info)
+        ranked = C2LBPolicy.score_endpoints(instances, req_info)
         if not ranked:
             return None
         picked = pick_gated(ranked, active_tokens_mean_factor, cpu_hit_blocks_mean_factor)
@@ -537,7 +537,7 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
             return None
         chosen, reason, active_threshold, cpu_threshold = picked
         logger.debug(
-            "smetric_gated(worker): req_id=%s pick=%s-%s reason=%s active_threshold=%.1f cpu_threshold=%.1f",
+            "c2lb(worker): req_id=%s pick=%s-%s reason=%s active_threshold=%.1f cpu_threshold=%.1f",
             getattr(req_info, "req_id", None) or DEFAULT_REQUEST_ID,
             chosen.instance.id,
             chosen.endpoint.id,
@@ -555,7 +555,7 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
         active_tokens_mean_factor: float = DEFAULT_MEAN_FACTOR,
         cpu_hit_blocks_mean_factor: float = DEFAULT_MEAN_FACTOR,
     ) -> tuple[Instance, Endpoint] | None:
-        ranked = SMetricGatedPolicy.select_endpoint_candidates_from_list(
+        ranked = C2LBPolicy.select_endpoint_candidates_from_list(
             instances,
             req_info,
             top_k=1,
@@ -579,8 +579,8 @@ class SMetricGatedPolicy(BaseSchedulingPolicy):
         role: PDRole | None = None,
         req_info: RequestInfo | None = None,
     ):
-        if role in SMETRIC_GATED_ROLES and req_info is not None:
-            selected = SMetricGatedPolicy.select_endpoint_from_list(
+        if role in C2LB_ROLES and req_info is not None:
+            selected = C2LBPolicy.select_endpoint_from_list(
                 instances,
                 req_info,
                 active_tokens_mean_factor=self._active_tokens_mean_factor,

@@ -37,7 +37,7 @@ from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_LOAD_BALANCE,
     CANDIDATE_POLICY_ROUND_ROBIN,
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
-    CANDIDATE_POLICY_SMETRIC_GATED,
+    CANDIDATE_POLICY_C2LB,
     pack_send_frames,
     unpack_recv_payload,
     ZMQMessageSerializer,
@@ -48,7 +48,7 @@ from motor.config.coordinator import (
     KV_AFFINITY_MODE_UNIFIED,
     KV_AFFINITY_MODES,
     KvAffinityConfig,
-    SMetricGatedConfig,
+    C2LBConfig,
 )
 from motor.coordinator.fault_tolerance.precision.streak_result import (
     PrecisionStreakResult,
@@ -56,7 +56,7 @@ from motor.coordinator.fault_tolerance.precision.streak_result import (
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.kv_cache_affinity import KvCacheAffinityPolicy
-from motor.coordinator.scheduler.policy.smetric_gated import SMETRIC_GATED_ROLES, SMetricGatedPolicy
+from motor.coordinator.scheduler.policy.c2lb import C2LB_ROLES, C2LBPolicy
 from motor.coordinator.domain.workload_calculator import (
     calculate_committed_workload,
     calculate_demand_workload,
@@ -695,8 +695,8 @@ class SchedulerClientConfig:
     endpoint_instance_score_weight: float = 0.05
     # kv_cache_affinity tunables (see SchedulerConfig.kv_affinity).
     kv_affinity: KvAffinityConfig | None = None
-    # smetric_gated tunables (see SchedulerConfig.smetric_gated).
-    smetric_gated: SMetricGatedConfig | None = None
+    # c2lb tunables (see SchedulerConfig.c2lb).
+    c2lb: C2LBConfig | None = None
     dp_stats_window: int = 60
     # Worker 0 dumps dp_stats every dp_stats_window seconds.
     # Inference worker_index==0 sets this; Obs/standby (worker_index is None) leave it off.
@@ -743,9 +743,9 @@ class AsyncSchedulerClient:
         self._kv_affinity_w_cpu = max(0.0, float(affinity.w_cpu))
         self._kv_affinity_w_disk = max(0.0, float(affinity.w_disk))
         self._kv_affinity_hit_rate_threshold = min(1.0, max(0.0, float(affinity.hit_rate_threshold)))
-        gated = config.smetric_gated or SMetricGatedConfig()
-        self._smetric_gated_active_factor = max(0.0, float(gated.active_tokens_mean_factor))
-        self._smetric_gated_cpu_factor = max(0.0, float(gated.cpu_hit_blocks_mean_factor))
+        gated = config.c2lb or C2LBConfig()
+        self._c2lb_active_factor = max(0.0, float(gated.active_tokens_mean_factor))
+        self._c2lb_cpu_factor = max(0.0, float(gated.cpu_hit_blocks_mean_factor))
 
         self._dp_stats = DpStatsLogger(window_sec=config.dp_stats_window)
         self._log_dp_stats = bool(config.log_dp_stats)
@@ -1011,8 +1011,8 @@ class AsyncSchedulerClient:
             is_instance_circuit_open=self.is_instance_blocked,
             endpoint_instance_score_weight=self._endpoint_instance_score_weight,
             is_load_balance_scheduler=self._scheduler_type_for_role(role) == "load_balance",
-            smetric_gated_active_factor=self._smetric_gated_active_factor,
-            smetric_gated_cpu_factor=self._smetric_gated_cpu_factor,
+            c2lb_active_factor=self._c2lb_active_factor,
+            c2lb_cpu_factor=self._c2lb_cpu_factor,
         )
 
     def _committed_workload_for(
@@ -1029,12 +1029,12 @@ class AsyncSchedulerClient:
     ) -> Workload:
         """Same commit formula the former ALLOCATE_ONLY handler used (R4).
 
-        smetric_gated stamps conductor-derived remaining prefill and cpu_blocks.
+        c2lb stamps conductor-derived remaining prefill and cpu_blocks.
         kv_cache_affinity still commits SHM ``active_tokens`` as ``isl - matched``, and
         additionally stamps overlay ``prefill_cost = max(0, isl)`` (cache hits do not
         reduce the overlay). RR/LB leave overlay fields at 0.
         """
-        if candidate_policy == CANDIDATE_POLICY_SMETRIC_GATED:
+        if candidate_policy == CANDIDATE_POLICY_C2LB:
             pair = (instance.id, endpoint.id)
             return Workload(
                 active_tokens=demand.active_tokens,
@@ -1161,13 +1161,13 @@ class AsyncSchedulerClient:
                 return None
             proposed_instance, proposed_endpoint, _ = candidates[0]
             affinity_debug = getattr(req_info, "kv_affinity_debug", None)
-            gated_debug = getattr(req_info, "smetric_gated_debug", None)
+            gated_debug = getattr(req_info, "c2lb_debug", None)
             global_affinity = (
                 candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY
                 and isinstance(affinity_debug, dict)
                 and any(rec[2] is not None for rec in affinity_debug.values())
             )
-            if candidate_policy == CANDIDATE_POLICY_SMETRIC_GATED and isinstance(gated_debug, dict):
+            if candidate_policy == CANDIDATE_POLICY_C2LB and isinstance(gated_debug, dict):
                 allowed_instance_ids = {
                     candidate.id
                     for candidate in self._filter_instances(
@@ -1259,7 +1259,7 @@ class AsyncSchedulerClient:
         ]
         proposed = (proposed_instance.id, proposed_endpoint.id)
         excluded: set[tuple[int, int]] = set()
-        use_authoritative = candidate_policy == CANDIDATE_POLICY_SMETRIC_GATED
+        use_authoritative = candidate_policy == CANDIDATE_POLICY_C2LB
         native = self._workload_reader.native
         if native is None:
             return None
@@ -1285,7 +1285,7 @@ class AsyncSchedulerClient:
                     normalized_engine_type or None,
                     excluded=excluded,
                     required_dispatch_capability=normalized_dispatch_capability or None,
-                    gated_candidates=gated_quads if candidate_policy == CANDIDATE_POLICY_SMETRIC_GATED else None,
+                    gated_candidates=gated_quads if candidate_policy == CANDIDATE_POLICY_C2LB else None,
                     req_id=req_info.req_id,
                 )
             else:
@@ -1309,7 +1309,7 @@ class AsyncSchedulerClient:
                         normalized_engine_type or None,
                         excluded=excluded,
                         required_dispatch_capability=normalized_dispatch_capability or None,
-                        gated_candidates=gated_quads if candidate_policy == CANDIDATE_POLICY_SMETRIC_GATED else None,
+                        gated_candidates=gated_quads if candidate_policy == CANDIDATE_POLICY_C2LB else None,
                         req_id=req_info.req_id,
                     )
                     use_authoritative = True
@@ -1955,18 +1955,18 @@ class AsyncSchedulerClient:
             if candidates:
                 return candidates, CANDIDATE_POLICY_LOAD_BALANCE
             logger.warning("load_balance failed, falling back to round-robin")
-        elif st == "smetric_gated":
-            if role in SMETRIC_GATED_ROLES:
-                ranked = SMetricGatedPolicy.select_endpoint_candidates_from_list(
+        elif st == "c2lb":
+            if role in C2LB_ROLES:
+                ranked = C2LBPolicy.select_endpoint_candidates_from_list(
                     instances,
                     req_info,
                     top_k=max(1, top_k),
-                    active_tokens_mean_factor=self._smetric_gated_active_factor,
-                    cpu_hit_blocks_mean_factor=self._smetric_gated_cpu_factor,
+                    active_tokens_mean_factor=self._c2lb_active_factor,
+                    cpu_hit_blocks_mean_factor=self._c2lb_cpu_factor,
                 )
                 if ranked:
-                    return ranked, CANDIDATE_POLICY_SMETRIC_GATED
-                logger.warning("smetric_gated did not select an endpoint, falling back to load_balance")
+                    return ranked, CANDIDATE_POLICY_C2LB
+                logger.warning("c2lb did not select an endpoint, falling back to load_balance")
             candidates = self._select_endpoint_candidates_by_load_balance(instances, role, top_k)
             if candidates:
                 return candidates, CANDIDATE_POLICY_LOAD_BALANCE
@@ -2026,7 +2026,7 @@ class AsyncSchedulerClient:
         if not all_endpoints:
             return None
         st = self._scheduler_type_for_role(role)
-        if st in ("load_balance", "kv_cache_affinity", "smetric_gated"):
+        if st in ("load_balance", "kv_cache_affinity", "c2lb"):
             ep = LoadBalancePolicy.select_endpoint_from_instance(instance)
             if ep:
                 return (instance, ep)

@@ -27,10 +27,10 @@ from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
     CANDIDATE_POLICY_LOAD_BALANCE,
-    CANDIDATE_POLICY_SMETRIC_GATED,
+    CANDIDATE_POLICY_C2LB,
     KNOWN_CANDIDATE_POLICIES,
 )
-from motor.coordinator.scheduler.policy.smetric_gated import (
+from motor.coordinator.scheduler.policy.c2lb import (
     GatedCandidate,
     format_candidates,
     pick_gated,
@@ -53,8 +53,8 @@ class ArbitrationContext:
     is_instance_circuit_open: Callable[[int], bool]
     endpoint_instance_score_weight: float = 0.05
     is_load_balance_scheduler: bool = False
-    smetric_gated_active_factor: float = 1.0
-    smetric_gated_cpu_factor: float = 1.0
+    c2lb_active_factor: float = 1.0
+    c2lb_cpu_factor: float = 1.0
 
 
 def matches_engine_type(instance: Instance, required_engine_type: str | None) -> bool:
@@ -299,7 +299,7 @@ def should_scan_global_load_balance(ctx: ArbitrationContext, candidate_policy: s
     return ctx.is_load_balance_scheduler
 
 
-def select_smetric_gated(
+def select_c2lb(
     ctx: ArbitrationContext,
     worker_candidate: tuple[int, int],
     gated_candidates: list[tuple[int, int, float, float]] | None,
@@ -310,7 +310,7 @@ def select_smetric_gated(
     req_id: str | None = None,
 ) -> tuple[Instance, Endpoint, float] | None:
     """
-    smetric_gated arbitration on the worker's fresh cache (SHM active_tokens + overlay).
+    c2lb arbitration on the worker's fresh cache (SHM active_tokens + overlay).
 
     Resolve every scored endpoint that is still schedulable, sort by the endpoint's ledger
     ``prefill_cost`` and take the first one at or below both scaled ledger averages. The
@@ -319,7 +319,7 @@ def select_smetric_gated(
     """
     if not gated_candidates:
         logger.warning(
-            "smetric_gated: no endpoint costs; validating worker candidate %s req_id=%s",
+            "c2lb: no endpoint costs; validating worker candidate %s req_id=%s",
             worker_candidate,
             req_id,
         )
@@ -355,12 +355,12 @@ def select_smetric_gated(
             )
         )
     ranked = sort_candidates(candidates)
-    picked = pick_gated(ranked, ctx.smetric_gated_active_factor, ctx.smetric_gated_cpu_factor)
+    picked = pick_gated(ranked, ctx.c2lb_active_factor, ctx.c2lb_cpu_factor)
     if picked is None:
         return None
     chosen, reason, active_threshold, cpu_threshold = picked
     logger.info(
-        "smetric_gated: req_id=%s pick=%s-%s reason=%s active_threshold=%.1f cpu_threshold=%.1f "
+        "c2lb: req_id=%s pick=%s-%s reason=%s active_threshold=%.1f cpu_threshold=%.1f "
         "factors=%.2f/%.2f ranked[ins-ep:ledger_prefill/active/cpu(+req_cost/+req_cpu)]=%s",
         req_id,
         chosen.instance.id,
@@ -368,8 +368,8 @@ def select_smetric_gated(
         reason,
         active_threshold,
         cpu_threshold,
-        ctx.smetric_gated_active_factor,
-        ctx.smetric_gated_cpu_factor,
+        ctx.c2lb_active_factor,
+        ctx.c2lb_cpu_factor,
         format_candidates(ranked),
     )
     return (chosen.instance, chosen.endpoint, chosen.ledger_prefill_cost)
@@ -396,7 +396,7 @@ def select_authoritative_allocate_candidate(
     Load-balance scans all endpoints. KV-cache affinity in unified mode re-ranks EVERY reported
     endpoint by ``prefill_load_scale*prefill_cost + load_weight*fresh_load``; older affinity callers
     without per-endpoint prefill_cost fall back to "least-loaded among the ranked alternates".
-    smetric_gated re-sorts by ledger prefill_cost and applies the two mean gates.
+    c2lb re-sorts by ledger prefill_cost and applies the two mean gates.
     Other policies keep the proposed endpoint. ``excluded`` (pairs this CAS round already
     rejected) is forwarded to every branch that scans beyond ``candidates``.
     """
@@ -430,8 +430,8 @@ def select_authoritative_allocate_candidate(
             )
             if selected is not None:
                 return selected
-    if candidate_policy == CANDIDATE_POLICY_SMETRIC_GATED:
-        selected = select_smetric_gated(
+    if candidate_policy == CANDIDATE_POLICY_C2LB:
+        selected = select_c2lb(
             ctx,
             candidate,
             gated_candidates,

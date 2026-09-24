@@ -8,7 +8,7 @@
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
 
-"""Tests for SMetricGatedPolicy: prefill_cost order, then first endpoint under both ledger averages."""
+"""Tests for C2LBPolicy: prefill_cost order, then first endpoint under both ledger averages."""
 
 import json
 from types import SimpleNamespace
@@ -19,7 +19,7 @@ import pytest
 from motor.common.resources.endpoint import Endpoint, EndpointStatus, Workload, WorkloadAction
 from motor.common.resources.http_msg_spec import EventType
 from motor.common.resources.instance import Instance, InsStatus, PDRole, ParallelConfig
-from motor.config.coordinator import CoordinatorConfig, SchedulerType, SMetricGatedConfig
+from motor.config.coordinator import CoordinatorConfig, SchedulerType, C2LBConfig
 from motor.coordinator.api_client.conductor_api_client import TENANT_ID, conductor_instance_id
 from motor.coordinator.domain import ScheduledResource
 from motor.coordinator.domain.instance_manager import InstanceManager
@@ -29,13 +29,13 @@ from motor.coordinator.scheduler.allocate_arbitration import ArbitrationContext
 from motor.coordinator.scheduler.policy.factory import create
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.common.utils.singleton import ThreadSafeSingleton
-from motor.coordinator.scheduler.policy.smetric_gated import (
+from motor.coordinator.scheduler.policy.c2lb import (
     PICK_ACTIVE_GATE,
     PICK_BOTH_GATES,
     PICK_MIN_LEDGER_PREFILL,
     GatedCandidate,
-    SMetricGatedPolicy,
-    SMetricTokenizer,
+    C2LBPolicy,
+    C2LBTokenizer,
     _cpu_hit_blocks,
     pick_gated,
     sort_candidates,
@@ -45,7 +45,7 @@ from motor.coordinator.scheduler.runtime.scheduler_client import (
     SchedulerClientConfig,
 )
 from motor.coordinator.scheduler.runtime.zmq_protocol import (
-    CANDIDATE_POLICY_SMETRIC_GATED,
+    CANDIDATE_POLICY_C2LB,
     KNOWN_CANDIDATE_POLICIES,
 )
 from motor.coordinator.scheduler.scheduler import Scheduler
@@ -101,8 +101,7 @@ def _req_info(token_count: int = 100, req_id: str = "req-gated") -> SimpleNamesp
         req_data={},
         req_len=token_count * 4,
         token_ids=list(range(token_count)),
-        smetric_debug=None,
-        smetric_gated_debug=None,
+        c2lb_debug=None,
         kv_affinity_debug=None,
     )
 
@@ -129,8 +128,8 @@ def _arbitration_context(
         is_instance_circuit_open=lambda instance_id: instance_id in blocked_set,
         endpoint_instance_score_weight=0.0,
         is_load_balance_scheduler=False,
-        smetric_gated_active_factor=active_factor,
-        smetric_gated_cpu_factor=cpu_factor,
+        c2lb_active_factor=active_factor,
+        c2lb_cpu_factor=cpu_factor,
     )
 
 
@@ -174,20 +173,20 @@ class TestCpuHitLedger:
         assert (change.active_tokens, change.prefill_cost, change.cpu_hit_blocks) == (-10, -4, -3)
 
 
-class TestSMetricTokenizer:
+class TestC2LBTokenizer:
     def setup_method(self):
-        ThreadSafeSingleton._instances.pop(SMetricTokenizer, None)
+        ThreadSafeSingleton._instances.pop(C2LBTokenizer, None)
 
     def teardown_method(self):
-        ThreadSafeSingleton._instances.pop(SMetricTokenizer, None)
+        ThreadSafeSingleton._instances.pop(C2LBTokenizer, None)
 
     def test_encode_without_model_returns_empty(self):
-        assert SMetricTokenizer().encode("hello") == []
+        assert C2LBTokenizer().encode("hello") == []
 
     def test_is_not_kv_affinity_tokenizer(self):
         from motor.coordinator.scheduler.policy.kv_cache_affinity import TokenizerManager
 
-        assert SMetricTokenizer is not TokenizerManager
+        assert C2LBTokenizer is not TokenizerManager
 
 
 class TestConductorParsing:
@@ -352,7 +351,7 @@ class TestPickGated:
 
 
 class TestPolicy:
-    @patch("motor.coordinator.scheduler.policy.smetric_gated.ConductorApiClient.query_conductor")
+    @patch("motor.coordinator.scheduler.policy.c2lb.ConductorApiClient.query_conductor")
     def test_score_endpoints_reads_cost_and_cpu_hits_and_orders_by_ledger(self, mock_query):
         inst_a = _instance(1, [_endpoint(10, prefill_cost=300), _endpoint(11, prefill_cost=100)])
         inst_b = _instance(2, [_endpoint(20, prefill_cost=200)])
@@ -367,45 +366,45 @@ class TestPolicy:
             },
         )
 
-        ranked = SMetricGatedPolicy.score_endpoints([inst_a, inst_b], req_info)
+        ranked = C2LBPolicy.score_endpoints([inst_a, inst_b], req_info)
 
         assert [(c.endpoint.id, c.ledger_prefill_cost, c.prefill_cost, c.cpu_hit_blocks) for c in ranked] == [
             (11, 100.0, 100.0, 0.0),
             (20, 200.0, 50.0, 0.0),
             (10, 300.0, 10.0, 4.0),
         ]
-        assert req_info.smetric_gated_debug == {(1, 11): (100.0, 0.0), (2, 20): (50.0, 0.0), (1, 10): (10.0, 4.0)}
+        assert req_info.c2lb_debug == {(1, 11): (100.0, 0.0), (2, 20): (50.0, 0.0), (1, 10): (10.0, 4.0)}
         assert allocated_prefill_cost(req_info, 1, 10) == 10.0
         assert allocated_cpu_hit_blocks(req_info, 1, 10) == 4.0
         assert allocated_cpu_hit_blocks(req_info, 9, 9) == 0.0
 
-    @patch("motor.coordinator.scheduler.policy.smetric_gated.ConductorApiClient.query_conductor")
+    @patch("motor.coordinator.scheduler.policy.c2lb.ConductorApiClient.query_conductor")
     def test_worker_proposal_puts_gated_pick_first(self, mock_query):
         inst_a = _instance(1, [_endpoint(10, active_tokens=500, prefill_cost=10)])
         inst_b = _instance(2, [_endpoint(20, active_tokens=10, prefill_cost=80)])
         req_info = _req_info(100)
         mock_query.return_value = _conductor_tenant(inst_a, inst_b, dp={(1, 10): 90, (2, 20): 20})
 
-        ranked = SMetricGatedPolicy.select_endpoint_candidates_from_list([inst_a, inst_b], req_info, top_k=2)
+        ranked = C2LBPolicy.select_endpoint_candidates_from_list([inst_a, inst_b], req_info, top_k=2)
 
         assert [(ep.id, score) for _i, ep, score in ranked] == [(20, 80.0), (10, 10.0)]
 
-    @patch("motor.coordinator.scheduler.policy.smetric_gated.ConductorApiClient.query_conductor")
+    @patch("motor.coordinator.scheduler.policy.c2lb.ConductorApiClient.query_conductor")
     def test_no_tenant_returns_none(self, mock_query):
         mock_query.return_value = {}
-        assert SMetricGatedPolicy.score_endpoints([_instance(1, [_endpoint(10)])], _req_info()) is None
+        assert C2LBPolicy.score_endpoints([_instance(1, [_endpoint(10)])], _req_info()) is None
 
-    @patch("motor.coordinator.scheduler.policy.smetric_gated.ConductorApiClient.query_conductor")
+    @patch("motor.coordinator.scheduler.policy.c2lb.ConductorApiClient.query_conductor")
     def test_missing_prompt_skips_conductor(self, mock_query):
         req_info = _req_info()
         req_info.token_ids = None
         req_info.engine_token_ids = None
         req_info.req_data = {}
-        assert SMetricGatedPolicy.score_endpoints([_instance(1, [_endpoint(10)])], req_info) is None
+        assert C2LBPolicy.score_endpoints([_instance(1, [_endpoint(10)])], req_info) is None
         mock_query.assert_not_called()
 
-    @patch("motor.coordinator.scheduler.policy.smetric_gated.SMetricTokenizer")
-    @patch("motor.coordinator.scheduler.policy.smetric_gated.ConductorApiClient.query_conductor")
+    @patch("motor.coordinator.scheduler.policy.c2lb.C2LBTokenizer")
+    @patch("motor.coordinator.scheduler.policy.c2lb.ConductorApiClient.query_conductor")
     def test_local_tokenizer_used_when_token_ids_missing(self, mock_query, mock_tok_cls):
         inst = _instance(1, [_endpoint(10)])
         req_info = _req_info()
@@ -415,28 +414,28 @@ class TestPolicy:
         mock_tok_cls.return_value.apply_chat_template.return_value = list(range(8))
         mock_query.return_value = _conductor_tenant(inst, dp={(1, 10): 0})
 
-        ranked = SMetricGatedPolicy.score_endpoints([inst], req_info)
+        ranked = C2LBPolicy.score_endpoints([inst], req_info)
 
         mock_tok_cls.return_value.apply_chat_template.assert_called_once()
         assert mock_query.call_args.args[1] == list(range(8))
         assert ranked[0].prefill_cost == 8.0
 
-    @patch("motor.coordinator.scheduler.policy.smetric_gated.ConductorApiClient.query_conductor")
+    @patch("motor.coordinator.scheduler.policy.c2lb.ConductorApiClient.query_conductor")
     def test_prefers_engine_token_ids_over_token_ids(self, mock_query):
         inst = _instance(1, [_endpoint(10)])
         req_info = _req_info(100)
         req_info.engine_token_ids = list(range(40))
         mock_query.return_value = _conductor_tenant(inst, dp={(1, 10): 10})
-        ranked = SMetricGatedPolicy.score_endpoints([inst], req_info)
+        ranked = C2LBPolicy.score_endpoints([inst], req_info)
         mock_query.assert_called_once()
         assert mock_query.call_args.args[1] == list(range(40))
         assert ranked[0].prefill_cost == 30.0
 
     def test_decode_falls_back_to_load_balance(self):
-        policy = SMetricGatedPolicy(MockInstanceProvider())
+        policy = C2LBPolicy(MockInstanceProvider())
         inst = _instance(1, [_endpoint(10)], role=PDRole.ROLE_D)
         with (
-            patch.object(SMetricGatedPolicy, "select_endpoint_from_list") as mock_gated,
+            patch.object(C2LBPolicy, "select_endpoint_from_list") as mock_gated,
             patch.object(
                 LoadBalancePolicy, "select_endpoint_from_list", return_value=(inst, inst.get_all_endpoints()[0])
             ) as mock_lb,
@@ -447,31 +446,31 @@ class TestPolicy:
         assert selected[0].id == 1
 
     def test_factory_and_protocol_registration(self):
-        assert isinstance(create(SchedulerType.SMETRIC_GATED, MockInstanceProvider()), SMetricGatedPolicy)
-        assert SchedulerType.from_string("smetric_gated") is SchedulerType.SMETRIC_GATED
-        assert CANDIDATE_POLICY_SMETRIC_GATED in KNOWN_CANDIDATE_POLICIES
+        assert isinstance(create(SchedulerType.C2LB, MockInstanceProvider()), C2LBPolicy)
+        assert SchedulerType.from_string("c2lb") is SchedulerType.C2LB
+        assert CANDIDATE_POLICY_C2LB in KNOWN_CANDIDATE_POLICIES
 
     def test_scheduler_pushes_mean_factors_from_config(self):
         config = CoordinatorConfig()
-        config.scheduler_config.prefill_scheduler_type = SchedulerType.SMETRIC_GATED
+        config.scheduler_config.prefill_scheduler_type = SchedulerType.C2LB
         config.scheduler_config.decode_scheduler_type = SchedulerType.LOAD_BALANCE
-        config.scheduler_config.smetric_gated.active_tokens_mean_factor = 1.5
-        config.scheduler_config.smetric_gated.cpu_hit_blocks_mean_factor = 0.5
+        config.scheduler_config.c2lb.active_tokens_mean_factor = 1.5
+        config.scheduler_config.c2lb.cpu_hit_blocks_mean_factor = 0.5
         scheduler = Scheduler(instance_provider=MockInstanceProvider(), config=config)
         policy = scheduler.get_scheduling_policy(PDRole.ROLE_P)
-        assert isinstance(policy, SMetricGatedPolicy)
+        assert isinstance(policy, C2LBPolicy)
         assert policy.mean_factors == (1.5, 0.5)
         assert scheduler.get_scheduling_policy(PDRole.ROLE_D) is not policy
-        assert not isinstance(scheduler.get_scheduling_policy(PDRole.ROLE_D), SMetricGatedPolicy)
+        assert not isinstance(scheduler.get_scheduling_policy(PDRole.ROLE_D), C2LBPolicy)
 
-    def test_uses_smetric_gated_is_prefill_only(self):
+    def test_uses_c2lb_is_prefill_only(self):
         config = CoordinatorConfig()
-        config.scheduler_config.prefill_scheduler_type = SchedulerType.SMETRIC_GATED
+        config.scheduler_config.prefill_scheduler_type = SchedulerType.C2LB
         config.scheduler_config.decode_scheduler_type = SchedulerType.LOAD_BALANCE
-        assert config.scheduler_config.uses_smetric_gated() is True
+        assert config.scheduler_config.uses_c2lb() is True
         config.scheduler_config.prefill_scheduler_type = SchedulerType.LOAD_BALANCE
-        config.scheduler_config.decode_scheduler_type = SchedulerType.SMETRIC_GATED
-        assert config.scheduler_config.uses_smetric_gated() is False
+        config.scheduler_config.decode_scheduler_type = SchedulerType.C2LB
+        assert config.scheduler_config.uses_c2lb() is False
 
     def test_json_config_sets_factors(self, tmp_path):
         cfg_path = tmp_path / "coordinator.json"
@@ -479,19 +478,19 @@ class TestPolicy:
             json.dumps(
                 {
                     "scheduler_config": {
-                        "prefill_scheduler_type": "smetric_gated",
+                        "prefill_scheduler_type": "c2lb",
                         "decode_scheduler_type": "load_balance",
-                        "smetric_gated": {"active_tokens_mean_factor": 1.3, "cpu_hit_blocks_mean_factor": 0.8},
+                        "c2lb": {"active_tokens_mean_factor": 1.3, "cpu_hit_blocks_mean_factor": 0.8},
                     }
                 }
             ),
             encoding="utf-8",
         )
         config = CoordinatorConfig.from_json(str(cfg_path))
-        assert config.scheduler_config.prefill_scheduler_type is SchedulerType.SMETRIC_GATED
+        assert config.scheduler_config.prefill_scheduler_type is SchedulerType.C2LB
         assert config.scheduler_config.decode_scheduler_type is SchedulerType.LOAD_BALANCE
-        assert config.scheduler_config.smetric_gated.active_tokens_mean_factor == 1.3
-        assert config.scheduler_config.smetric_gated.cpu_hit_blocks_mean_factor == 0.8
+        assert config.scheduler_config.c2lb.active_tokens_mean_factor == 1.3
+        assert config.scheduler_config.c2lb.cpu_hit_blocks_mean_factor == 0.8
 
     def test_legacy_scheduler_type_json_sets_both_roles(self, tmp_path, caplog):
         cfg_path = tmp_path / "coordinator.json"
@@ -499,17 +498,17 @@ class TestPolicy:
             json.dumps(
                 {
                     "scheduler_config": {
-                        "scheduler_type": "smetric_gated",
-                        "smetric_gated": {"active_tokens_mean_factor": 1.1, "cpu_hit_blocks_mean_factor": 0.9},
+                        "scheduler_type": "c2lb",
+                        "c2lb": {"active_tokens_mean_factor": 1.1, "cpu_hit_blocks_mean_factor": 0.9},
                     }
                 }
             ),
             encoding="utf-8",
         )
         config = CoordinatorConfig.from_json(str(cfg_path))
-        assert config.scheduler_config.prefill_scheduler_type is SchedulerType.SMETRIC_GATED
-        assert config.scheduler_config.decode_scheduler_type is SchedulerType.SMETRIC_GATED
-        assert "decode_scheduler_type=smetric_gated is ignored" in caplog.text
+        assert config.scheduler_config.prefill_scheduler_type is SchedulerType.C2LB
+        assert config.scheduler_config.decode_scheduler_type is SchedulerType.C2LB
+        assert "decode_scheduler_type=c2lb is ignored" in caplog.text
 
     def test_in_process_selection_uses_factors(self):
         inst_a = _instance(1, [_endpoint(10, active_tokens=22, prefill_cost=1)])
@@ -518,11 +517,11 @@ class TestPolicy:
         instances = [inst_a, inst_b, inst_c]
 
         def fake_score(insts, info):
-            info.smetric_gated_debug = {}
+            info.c2lb_debug = {}
             return sort_candidates([GatedCandidate(i, i.get_all_endpoints()[0], 0.0, 0.0) for i in insts])
 
-        policy = SMetricGatedPolicy(MockInstanceProvider())
-        with patch.object(SMetricGatedPolicy, "score_endpoints", side_effect=fake_score):
+        policy = C2LBPolicy(MockInstanceProvider())
+        with patch.object(C2LBPolicy, "score_endpoints", side_effect=fake_score):
             plain = policy.select_instance_and_endpoint_from_list(instances, PDRole.ROLE_P, _req_info())
             policy.set_mean_factors(1.2, 1.0)
             loose = policy.select_instance_and_endpoint_from_list(instances, PDRole.ROLE_P, _req_info())
@@ -535,7 +534,7 @@ class TestPolicy:
         ep = Mock()
         ep.id = 10
         with patch.object(LoadBalancePolicy, "select_endpoint_from_instance", return_value=ep) as mock_lb:
-            assert select_endpoint_for_instance(inst, scheduler_type="smetric_gated") is ep
+            assert select_endpoint_for_instance(inst, scheduler_type="c2lb") is ep
         mock_lb.assert_called_once()
 
     @pytest.mark.asyncio
@@ -559,8 +558,8 @@ class TestPolicy:
 def _client(active_factor: float = 1.0, cpu_factor: float = 1.0) -> AsyncSchedulerClient:
     return AsyncSchedulerClient(
         SchedulerClientConfig(
-            scheduler_type="smetric_gated",
-            smetric_gated=SMetricGatedConfig(
+            scheduler_type="c2lb",
+            c2lb=C2LBConfig(
                 active_tokens_mean_factor=active_factor,
                 cpu_hit_blocks_mean_factor=cpu_factor,
             ),
@@ -573,7 +572,7 @@ class TestClientDispatch:
         client = _client(active_factor=1.7, cpu_factor=0.3)
         inst = _instance(1, [_endpoint(10)])
         with patch.object(
-            SMetricGatedPolicy,
+            C2LBPolicy,
             "select_endpoint_candidates_from_list",
             return_value=[(inst, inst.get_all_endpoints()[0], 0.0)],
         ) as m:
@@ -583,21 +582,21 @@ class TestClientDispatch:
         assert kwargs["cpu_hit_blocks_mean_factor"] == 0.3
 
     def test_default_factors_when_config_absent(self):
-        client = AsyncSchedulerClient(SchedulerClientConfig(scheduler_type="smetric_gated"))
-        assert (client._smetric_gated_active_factor, client._smetric_gated_cpu_factor) == (1.0, 1.0)
+        client = AsyncSchedulerClient(SchedulerClientConfig(scheduler_type="c2lb"))
+        assert (client._c2lb_active_factor, client._c2lb_cpu_factor) == (1.0, 1.0)
 
     def test_prefill_uses_gated_policy(self):
         client = _client()
         inst = _instance(1, [_endpoint(10)])
         ranked = [(inst, inst.get_all_endpoints()[0], 3.0)]
         with (
-            patch.object(SMetricGatedPolicy, "select_endpoint_candidates_from_list", return_value=ranked) as m,
+            patch.object(C2LBPolicy, "select_endpoint_candidates_from_list", return_value=ranked) as m,
             patch.object(client, "_select_endpoint_candidates_by_load_balance") as mock_lb,
         ):
             candidates, policy = client._select_endpoint_candidates_from_list_with_policy(
                 [inst], PDRole.ROLE_P, _req_info(), top_k=1
             )
-        assert candidates == ranked and policy == "smetric_gated"
+        assert candidates == ranked and policy == "c2lb"
         m.assert_called_once()
         mock_lb.assert_not_called()
 
@@ -606,7 +605,7 @@ class TestClientDispatch:
         inst = _instance(1, [_endpoint(10)])
         lb = [(inst, inst.get_all_endpoints()[0], 0.5)]
         with (
-            patch.object(SMetricGatedPolicy, "select_endpoint_candidates_from_list", return_value=None) as m,
+            patch.object(C2LBPolicy, "select_endpoint_candidates_from_list", return_value=None) as m,
             patch.object(client, "_select_endpoint_candidates_by_load_balance", return_value=lb) as mock_lb,
         ):
             _, p_policy = client._select_endpoint_candidates_from_list_with_policy(
@@ -622,7 +621,7 @@ class TestClientDispatch:
     def test_role_split_decode_uses_load_balance_even_when_prefill_is_gated(self):
         client = AsyncSchedulerClient(
             SchedulerClientConfig(
-                prefill_scheduler_type="smetric_gated",
+                prefill_scheduler_type="c2lb",
                 decode_scheduler_type="load_balance",
             )
         )
@@ -630,7 +629,7 @@ class TestClientDispatch:
         ranked = [(inst, inst.get_all_endpoints()[0], 3.0)]
         lb = [(inst, inst.get_all_endpoints()[0], 0.5)]
         with (
-            patch.object(SMetricGatedPolicy, "select_endpoint_candidates_from_list", return_value=ranked) as m,
+            patch.object(C2LBPolicy, "select_endpoint_candidates_from_list", return_value=ranked) as m,
             patch.object(client, "_select_endpoint_candidates_by_load_balance", return_value=lb) as mock_lb,
         ):
             _, p_policy = client._select_endpoint_candidates_from_list_with_policy(
@@ -639,7 +638,7 @@ class TestClientDispatch:
             _, d_policy = client._select_endpoint_candidates_from_list_with_policy(
                 [inst], PDRole.ROLE_D, _req_info(), 1
             )
-        assert p_policy == "smetric_gated" and d_policy == "load_balance"
+        assert p_policy == "c2lb" and d_policy == "load_balance"
         m.assert_called_once()
         mock_lb.assert_called_once()
 
@@ -649,7 +648,7 @@ class TestClientDispatch:
         ep = inst.get_all_endpoints()[0]
         committed = client._committed_workload_for(
             PDRole.ROLE_P,
-            CANDIDATE_POLICY_SMETRIC_GATED,
+            CANDIDATE_POLICY_C2LB,
             inst,
             ep,
             Workload(active_tokens=100.0),
@@ -704,7 +703,7 @@ class TestArbitration:
             (1, 10),
             [(1, 10), (1, 11), (2, 20)],
             PDRole.ROLE_P,
-            CANDIDATE_POLICY_SMETRIC_GATED,
+            CANDIDATE_POLICY_C2LB,
             gated_candidates=_gated_quads((2, 20, 50.0, 6.0), (1, 10, 10.0, 1.0), (1, 11, 20.0, 2.0)),
         )
 
@@ -726,7 +725,7 @@ class TestArbitration:
             (1, 10),
             [(1, 10), (1, 11)],
             PDRole.ROLE_P,
-            CANDIDATE_POLICY_SMETRIC_GATED,
+            CANDIDATE_POLICY_C2LB,
             gated_candidates=_gated_quads((1, 10, 1.0, 0.0), (1, 11, 99.0, 0.0)),
         )
 
@@ -747,7 +746,7 @@ class TestArbitration:
             (1, 10),
             [(1, 10), (1, 11)],
             PDRole.ROLE_P,
-            CANDIDATE_POLICY_SMETRIC_GATED,
+            CANDIDATE_POLICY_C2LB,
             gated_candidates=_gated_quads((1, 10, 5.0, 0.0), (1, 11, 60.0, 0.0)),
         )
 
@@ -766,7 +765,7 @@ class TestArbitration:
             (1, 10),
             [(1, 10), (1, 11), (1, 12)],
             PDRole.ROLE_P,
-            CANDIDATE_POLICY_SMETRIC_GATED,
+            CANDIDATE_POLICY_C2LB,
             gated_candidates=quads,
         )
         assert strict[1].id == 11
@@ -776,7 +775,7 @@ class TestArbitration:
             (1, 10),
             [(1, 10), (1, 11), (1, 12)],
             PDRole.ROLE_P,
-            CANDIDATE_POLICY_SMETRIC_GATED,
+            CANDIDATE_POLICY_C2LB,
             gated_candidates=quads,
         )
         assert loose[1].id == 10
@@ -796,7 +795,7 @@ class TestArbitration:
             (1, 10),
             [(1, 10), (1, 11), (1, 12)],
             PDRole.ROLE_P,
-            CANDIDATE_POLICY_SMETRIC_GATED,
+            CANDIDATE_POLICY_C2LB,
             gated_candidates=quads,
         )
         assert plain[1].id == 11
@@ -806,7 +805,7 @@ class TestArbitration:
             (1, 10),
             [(1, 10), (1, 11), (1, 12)],
             PDRole.ROLE_P,
-            CANDIDATE_POLICY_SMETRIC_GATED,
+            CANDIDATE_POLICY_C2LB,
             gated_candidates=quads,
         )
         assert loose[1].id == 10
@@ -821,7 +820,7 @@ class TestArbitration:
             (1, 10),
             [(1, 10)],
             PDRole.ROLE_P,
-            CANDIDATE_POLICY_SMETRIC_GATED,
+            CANDIDATE_POLICY_C2LB,
             gated_candidates=None,
         )
         assert selected is not None
@@ -839,7 +838,7 @@ class TestArbitration:
             (1, 10),
             [(1, 10), (2, 20)],
             PDRole.ROLE_P,
-            CANDIDATE_POLICY_SMETRIC_GATED,
+            CANDIDATE_POLICY_C2LB,
             gated_candidates=_gated_quads((1, 10, 1.0, 0.0), (9, 99, 2.0, 0.0), (2, 20, 3.0, 0.0)),
         )
 
@@ -859,7 +858,7 @@ class TestArbitration:
             (1, 10),
             [(1, 10), (2, 20)],
             PDRole.ROLE_P,
-            CANDIDATE_POLICY_SMETRIC_GATED,
+            CANDIDATE_POLICY_C2LB,
             gated_candidates=_gated_quads((1, 10, 1.0, 0.0), (2, 20, 3.0, 0.0)),
             required_engine_type="sglang",
         )
@@ -876,7 +875,7 @@ class TestArbitration:
             (1, 10),
             [(1, 10)],
             PDRole.ROLE_P,
-            CANDIDATE_POLICY_SMETRIC_GATED,
+            CANDIDATE_POLICY_C2LB,
             gated_candidates=_gated_quads((1, 10, 1.0, 0.0)),
         )
         assert selected is None

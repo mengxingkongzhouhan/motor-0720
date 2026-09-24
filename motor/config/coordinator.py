@@ -197,9 +197,9 @@ class SchedulerType(Enum):
     LOAD_BALANCE = "load_balance"
     ROUND_ROBIN = "round_robin"
     KV_CACHE_AFFINITY = "kv_cache_affinity"
-    # SMetric ordering (ledger prefill_cost ascending), then the first endpoint at or below both
+    # C2LB ordering (ledger prefill_cost ascending), then the first endpoint at or below both
     # ledger averages (active_tokens and cpu_hit_blocks) wins. Prefill / encode / union only.
-    SMETRIC_GATED = "smetric_gated"
+    C2LB = "c2lb"
 
     @classmethod
     def from_string(cls, value: str) -> Optional["SchedulerType"]:
@@ -396,10 +396,10 @@ class KvAffinityConfig:
 
 
 @dataclass
-class SMetricGatedConfig:
-    """Tunables for ``prefill_scheduler_type=smetric_gated``.
+class C2LBConfig:
+    """Tunables for ``prefill_scheduler_type=c2lb``.
 
-    Nested under ``scheduler_config.smetric_gated`` in user JSON. Endpoints are walked in ledger
+    Nested under ``scheduler_config.c2lb`` in user JSON. Endpoints are walked in ledger
     ``prefill_cost`` order and the first one passing both gates is committed:
     ``active_tokens <= mean(active_tokens) * active_tokens_mean_factor`` and
     ``cpu_hit_blocks <= mean(cpu_hit_blocks) * cpu_hit_blocks_mean_factor``.
@@ -426,8 +426,8 @@ class SchedulerConfig:
     dp_stats_window: int = 60
     # kv_cache_affinity tunables (affinity + load + per-medium weights).
     kv_affinity: KvAffinityConfig = field(default_factory=KvAffinityConfig)
-    # smetric_gated tunables (gate thresholds = candidate mean * factor).
-    smetric_gated: SMetricGatedConfig = field(default_factory=SMetricGatedConfig)
+    # c2lb tunables (gate thresholds = candidate mean * factor).
+    c2lb: C2LBConfig = field(default_factory=C2LBConfig)
     # KV event registration config for kv-conductor.
     kv_conductor_config: KvConductorConfig = field(default_factory=KvConductorConfig)
 
@@ -446,9 +446,9 @@ class SchedulerConfig:
         """Prefill / encode / union affinity only; decode never takes the KVA path."""
         return self.prefill_scheduler_type == SchedulerType.KV_CACHE_AFFINITY
 
-    def uses_smetric_gated(self) -> bool:
-        """Prefill / encode / union smetric_gated only; decode never takes the gated path."""
-        return self.prefill_scheduler_type == SchedulerType.SMETRIC_GATED
+    def uses_c2lb(self) -> bool:
+        """Prefill / encode / union c2lb only; decode never takes the gated path."""
+        return self.prefill_scheduler_type == SchedulerType.C2LB
 
     @property
     def scheduler_type(self) -> SchedulerType:
@@ -1084,9 +1084,9 @@ class CoordinatorConfig:
                 "decode_scheduler_type=kv_cache_affinity is ignored for decode instance selection; "
                 "decode still uses load_balance"
             )
-        if self.scheduler_config.decode_scheduler_type == SchedulerType.SMETRIC_GATED:
+        if self.scheduler_config.decode_scheduler_type == SchedulerType.C2LB:
             logger.warning(
-                "decode_scheduler_type=smetric_gated is ignored for decode instance selection; "
+                "decode_scheduler_type=c2lb is ignored for decode instance selection; "
                 "decode still uses load_balance"
             )
 
@@ -1264,15 +1264,15 @@ class CoordinatorConfig:
         )
         if affinity.mode not in KV_AFFINITY_MODES:
             self._errors.append(f"kv_affinity.mode must be one of {KV_AFFINITY_MODES}, got {affinity.mode!r}")
-        gated = self.scheduler_config.smetric_gated
+        gated = self.scheduler_config.c2lb
         self._validate_positive_number(
             gated.active_tokens_mean_factor,
-            "smetric_gated.active_tokens_mean_factor",
+            "c2lb.active_tokens_mean_factor",
             allow_zero=True,
         )
         self._validate_positive_number(
             gated.cpu_hit_blocks_mean_factor,
-            "smetric_gated.cpu_hit_blocks_mean_factor",
+            "c2lb.cpu_hit_blocks_mean_factor",
             allow_zero=True,
         )
         if self.context_budget_mode not in CONTEXT_BUDGET_MODES:
@@ -1505,10 +1505,10 @@ class CoordinatorConfig:
             f"    ├─ KV Affinity W CPU:          {self.scheduler_config.kv_affinity.w_cpu}\n"
             f"    ├─ KV Affinity W Disk:         {self.scheduler_config.kv_affinity.w_disk}\n"
             f"    ├─ KV Affinity Hit Rate:       {self.scheduler_config.kv_affinity.hit_rate_threshold}\n"
-            f"    ├─ SMetric Gated Active Factor: "
-            f"{self.scheduler_config.smetric_gated.active_tokens_mean_factor}\n"
-            f"    ├─ SMetric Gated CPU Factor:    "
-            f"{self.scheduler_config.smetric_gated.cpu_hit_blocks_mean_factor}\n"
+            f"    ├─ C2LB Active Factor: "
+            f"{self.scheduler_config.c2lb.active_tokens_mean_factor}\n"
+            f"    ├─ C2LB CPU Factor:    "
+            f"{self.scheduler_config.c2lb.cpu_hit_blocks_mean_factor}\n"
             f"    ├─ DP Stats Window:            {self.scheduler_config.dp_stats_window}s\n"
             f"    └─ Context Budget Mode:        {self.context_budget_mode}\n"
             "\n"

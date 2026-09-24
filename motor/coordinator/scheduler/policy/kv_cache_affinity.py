@@ -712,11 +712,9 @@ class TokenizerManager(ThreadSafeSingleton):
             kv_config = getattr(config, "prefill_kv_event_config", None)
         render_enabled = bool(getattr(getattr(config, "render_config", None), "enable", False))
         affinity_enabled = isinstance(scheduler_config, SchedulerConfig) and scheduler_config.uses_kv_cache_affinity()
-        smetric_enabled = isinstance(scheduler_config, SchedulerConfig) and scheduler_config.uses_smetric_gated()
         eager_load = bool(
             (kv_config and getattr(kv_config, "conductor_service", ""))
             or affinity_enabled
-            or smetric_enabled
             or (config.context_budget_mode == CONTEXT_BUDGET_ON and not render_enabled)
         )
         needs_tokenizer = eager_load or render_enabled

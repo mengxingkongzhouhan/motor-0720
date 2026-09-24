@@ -36,7 +36,6 @@ from motor.coordinator.scheduler.policy.c2lb import (
     C2LBPolicy,
     C2LBTokenizer,
     _cpu_hit_blocks,
-    _npu_hit_blocks,
     _request_npu_hit,
     pick_gated,
     sort_candidates,
@@ -203,10 +202,10 @@ class TestConductorParsing:
         assert _cpu_hit_blocks({"cpu_blocks": "x"}) == 0
         assert _cpu_hit_blocks({"cpu_blocks": -3}) == 0
 
-    def test_npu_blocks_and_hit_rate(self):
-        assert _npu_hit_blocks({"npu_blocks": 2, "cpu_blocks": 5, "matched_tokens": 64}) == 2
-        assert _npu_hit_blocks(40) == 0
-        assert _npu_hit_blocks({"npu_blocks": "x"}) == 0
+    def test_npu_hit_rate(self):
+        assert _request_npu_hit({"npu_blocks": 2, "cpu_blocks": 5, "matched_tokens": 64}, 128) == 2.0
+        assert _request_npu_hit(40, 100) == 0
+        assert _request_npu_hit({"npu_blocks": "x"}, 100) == 0
         assert _request_npu_hit({"npu_blocks": 1}, 100) == 1.28
         assert _request_npu_hit({"npu_blocks": 1}, 0) == 0
 

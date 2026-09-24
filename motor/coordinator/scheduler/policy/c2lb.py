@@ -378,21 +378,15 @@ def _cpu_hit_blocks(matched: object) -> float:
         return 0.0
 
 
-def _npu_hit_blocks(matched: object) -> float:
-    """NPU-tier matched blocks from a DpBlocks conductor entry; 0 for legacy integer matches."""
-    if not isinstance(matched, dict):
-        return 0.0
-    try:
-        return max(0.0, float(matched.get("npu_blocks", 0) or 0))
-    except (TypeError, ValueError):
-        return 0.0
-
-
 def _request_npu_hit(matched: object, isl: int) -> float:
     """This request's NPU prefix hit rate: ``npu_blocks * BLOCK_SIZE / isl``."""
-    if isl <= 0:
+    if isl <= 0 or not isinstance(matched, dict):
         return 0.0
-    return _npu_hit_blocks(matched) * BLOCK_SIZE / float(isl)
+    try:
+        npu_blocks = max(0.0, float(matched.get("npu_blocks", 0) or 0))
+    except (TypeError, ValueError):
+        return 0.0
+    return npu_blocks * BLOCK_SIZE / float(isl)
 
 
 def _ledger_value(endpoint: Endpoint, field: str) -> float:

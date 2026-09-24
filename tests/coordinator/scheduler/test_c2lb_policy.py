@@ -23,7 +23,6 @@ from motor.config.coordinator import CoordinatorConfig, SchedulerType, C2LBConfi
 from motor.coordinator.api_client.conductor_api_client import TENANT_ID, conductor_instance_id
 from motor.coordinator.domain import ScheduledResource
 from motor.coordinator.domain.instance_manager import InstanceManager
-from motor.coordinator.domain.workload_calculator import allocated_cpu_hit_blocks, allocated_prefill_cost
 from motor.coordinator.scheduler import allocate_arbitration
 from motor.coordinator.scheduler.allocate_arbitration import ArbitrationContext
 from motor.coordinator.scheduler.policy.factory import create
@@ -410,9 +409,6 @@ class TestPolicy:
             (2, 20): (50.0, 0.0, 0.0),
             (1, 10): (10.0, 4.0, 1.28),
         }
-        assert allocated_prefill_cost(req_info, 1, 10) == 10.0
-        assert allocated_cpu_hit_blocks(req_info, 1, 10) == 4.0
-        assert allocated_cpu_hit_blocks(req_info, 9, 9) == 0.0
 
     @patch("motor.coordinator.scheduler.policy.c2lb.ConductorApiClient.query_conductor")
     def test_worker_proposal_puts_gated_pick_first(self, mock_query):
@@ -690,7 +686,6 @@ class TestClientDispatch:
             Workload(active_tokens=100.0),
             {},
             100.0,
-            prefill_cost_map={(1, 10): 60.0},
             cpu_hit_map={(1, 10): 3.0},
         )
         assert (committed.active_tokens, committed.isl, committed.cpu_hit_blocks) == (100.0, 100.0, 3.0)

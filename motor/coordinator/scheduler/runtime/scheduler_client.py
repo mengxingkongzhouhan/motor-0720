@@ -1042,7 +1042,6 @@ class AsyncSchedulerClient:
         demand: Workload,
         matched_tokens_map: dict[tuple[int, int], float],
         isl: float,
-        prefill_cost_map: dict[tuple[int, int], float] | None = None,
         cpu_hit_map: dict[tuple[int, int], float] | None = None,
     ) -> Workload:
         """Same commit formula the former ALLOCATE_ONLY handler used (R4).
@@ -1261,11 +1260,6 @@ class AsyncSchedulerClient:
             for item in candidate_endpoints
             if item.get("matched_tokens") is not None
         }
-        prefill_cost_map = {
-            (int(item["instance_id"]), int(item["endpoint_id"])): float(item["prefill_cost"])
-            for item in candidate_endpoints
-            if item.get("prefill_cost") is not None
-        }
         cpu_hit_map = {
             (int(item["instance_id"]), int(item["endpoint_id"])): float(item["cpu_hit_blocks"])
             for item in candidate_endpoints
@@ -1373,7 +1367,6 @@ class AsyncSchedulerClient:
                 demand,
                 matched_tokens_map,
                 isl,
-                prefill_cost_map=prefill_cost_map,
                 cpu_hit_map=cpu_hit_map,
             )
             meta = self._workload_reader.entry_meta(out_instance.id, out_endpoint.id)

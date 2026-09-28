@@ -390,8 +390,8 @@ fn test_disk_continuation_from_cpu_breakpoint() {
     assert_eq!(dp0.npu_blocks, 1);
     assert_eq!(dp0.cpu_blocks, 1);
     assert_eq!(dp0.disk_blocks, 1);
-    // Disk only holds the tail; the SSD-resident hash list is that tail.
-    assert_eq!(dp0.disk_block_hashes, vec!["300".to_string()]);
+    // Engine-only Disk events have no MemCache object key to return.
+    assert!(dp0.disk_block_hashes.is_empty());
     // Unweighted coverage = exclusive sum × block_size.
     assert_eq!(dp0.matched_tokens, 3 * 4);
 }
@@ -1238,7 +1238,7 @@ fn test_disk_continuation_from_hbm_when_cpu_miss() {
     assert_eq!(dp0.npu_blocks, 1);
     assert_eq!(dp0.cpu_blocks, 0);
     assert_eq!(dp0.disk_blocks, 1);
-    assert_eq!(dp0.disk_block_hashes, vec!["300".to_string()]);
+    assert!(dp0.disk_block_hashes.is_empty());
     // Unweighted coverage includes exclusive disk extension.
     assert_eq!(dp0.matched_tokens, 2 * 4);
 }
@@ -1430,12 +1430,10 @@ fn test_lower_tier_longer_replica_extends_coverage() {
         dp0.disk_blocks, 2,
         "exclusive Disk blocks are the extension beyond NPU"
     );
-    assert_eq!(
-        dp0.disk_block_hashes,
-        vec!["201".to_string(), "202".to_string()],
-        "SSD hash list is the exclusive Disk extension beyond NPU"
+    assert!(
+        dp0.disk_block_hashes.is_empty(),
+        "numeric engine hashes must not be exposed as MemCache prefetch keys"
     );
-    assert_eq!(dp0.disk_block_hashes.len() as u32, dp0.disk_blocks);
     assert_eq!(
         dp0.matched_tokens,
         3 * 4,
@@ -1590,7 +1588,7 @@ fn test_exclusive_sum_is_unweighted_matched_tokens() {
     assert_eq!(dp0.npu_blocks, 1);
     assert_eq!(dp0.cpu_blocks, 1);
     assert_eq!(dp0.disk_blocks, 1);
-    assert_eq!(dp0.disk_block_hashes, vec!["300".to_string()]);
+    assert!(dp0.disk_block_hashes.is_empty());
     assert_eq!(
         dp0.matched_tokens,
         (dp0.npu_blocks + dp0.cpu_blocks + dp0.disk_blocks) * 4
@@ -1630,7 +1628,7 @@ fn test_disk_only_coverage_matched_tokens() {
     assert_eq!(dp0.npu_blocks, 0);
     assert_eq!(dp0.cpu_blocks, 0);
     assert_eq!(dp0.disk_blocks, 1);
-    assert_eq!(dp0.disk_block_hashes, vec!["100".to_string()]);
+    assert!(dp0.disk_block_hashes.is_empty());
     assert_eq!(dp0.matched_tokens, 4);
 }
 
@@ -1683,7 +1681,7 @@ fn test_query_by_hash_returns_ssd_block_hashes() {
         .unwrap();
     let dp0 = &resp.tenants["t1"]["inst-1"].dp["0"];
     assert_eq!(dp0.disk_blocks, 1);
-    assert_eq!(dp0.disk_block_hashes, vec!["300".to_string()]);
+    assert!(dp0.disk_block_hashes.is_empty());
 }
 
 /// MemCache `object_keys` are what `/query` returns as `disk_block_hashes`.

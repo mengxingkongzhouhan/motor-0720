@@ -215,20 +215,22 @@ async def test_writer_snapshot_and_heartbeat(native_lib):
         writer.write_snapshot()
         writer.write_heartbeat()
         header = writer.native.read_header()
-        assert header["schema_version"] == SCHEMA_VERSION == 4
+        assert header["schema_version"] == SCHEMA_VERSION == 5
         assert header["sequence"] % 2 == 0
         assert header["heartbeat"] == 1
         reader.attach()
         patched: dict[tuple[int, int], tuple[PDRole, float]] = {}
 
         class _Cache:
-            def patch_workload_from_shm(self, instance_id, endpoint_id, role, active_tokens) -> None:
-                patched[(instance_id, endpoint_id)] = (role, active_tokens)
+            def patch_workload_from_shm(
+                self, instance_id, endpoint_id, role, active_tokens, isl=0.0, cpu_hit_blocks=0.0
+            ) -> None:
+                patched[(instance_id, endpoint_id)] = (role, active_tokens, isl, cpu_hit_blocks)
 
         version, stale = reader.read_and_patch_cache(_Cache(), role=None)
         assert version == 1
         assert stale is False
-        assert patched == {(1, 10): (PDRole.ROLE_P, 0.0)}
+        assert patched == {(1, 10): (PDRole.ROLE_P, 0.0, 0.0, 0.0)}
     finally:
         reader.detach()
         writer.release()
@@ -268,7 +270,9 @@ async def test_writer_snapshot_preserves_cas_tokens(native_lib):
     try:
         writer.write_snapshot()
         meta = writer.native.load_entry(0)
-        status, actual = writer.native.cas_add(1, 10, int(meta["generation"]), 0.0, 10.0)
+        status, actual = writer.native.cas_add(
+            1, 10, int(meta["generation"]), 0.0, 10.0, isl=12.0, cpu_hit_blocks=3.0
+        )
         assert status == STATUS_OK
         assert actual == 10.0
         await im.refresh_instances(EventType.ADD, [_make_real_instance(2, 20, 0.0)])
@@ -276,6 +280,8 @@ async def test_writer_snapshot_preserves_cas_tokens(native_lib):
         first = writer.native.load_entry(0)
         assert first["instance_id"] == 1
         assert first["active_tokens"] == 10.0
+        assert first["isl"] == pytest.approx(12.0)
+        assert first["cpu_hit_blocks"] == pytest.approx(3.0)
         second = writer.native.load_entry(1)
         assert second["instance_id"] == 2
         assert second["active_tokens"] == 0.0

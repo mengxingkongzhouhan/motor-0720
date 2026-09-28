@@ -319,7 +319,7 @@ motor_var_is_explicit_zero() {
 # the per-crate flags when they were not explicitly set, so an explicit
 # SKIP_WORKLOAD_SHM_BUILD=0 / SKIP_KV_CONDUCTOR_BUILD=0 still forces a rebuild of
 # that one crate. It does NOT authorize shipping a wheel without workload-shm: if
-# lib/libmindie_workload_shm.so is missing, build.sh ignores the skip and rebuilds
+# lib/libmindie_workload_shm.so is missing or ABI-stale, build.sh ignores the skip and rebuilds
 # (see the workload-shm section), so a first-time build still works unattended.
 # Default bash build.sh already reuses present artifacts; this flag is for
 # callers that want to skip cargo even when they also pass other SKIP_*=0 later.

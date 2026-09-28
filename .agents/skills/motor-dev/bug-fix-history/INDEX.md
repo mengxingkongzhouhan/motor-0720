@@ -63,5 +63,6 @@
 | 2026-09-15 | controller | DP 缩容等待状态和瞬时故障导致路由冻结或误缩容 | [dp-scale-down-state-safety.md](controller/dp-scale-down-state-safety.md) | DP scale-down, WAITING_ENGINE_FAULT, false DEAD, engine relaunch, serving overlay |
 | 2026-09-23 | node_manager | NodeManager FT 代理契约漂移导致请求失败、端口冲突或虚推未迁移 | [ft-proxy-contract-drift.md](node_manager/ft-proxy-contract-drift.md) | NodeManager, FT proxy, finalize empty list, DP master, EADDRINUSE, virtual inference migration |
 | 2026-09-09 | coordinator | PD 分离请求在 Decode 才因 Prefill 改写字段被拒绝 | [pd-stream-options-late-rejection.md](coordinator/pd-stream-options-late-rejection.md) | coordinator, PD separation, stream_options, min_tokens, Decode HTTP-400, KV cache expiry |
+| 2026-09-24 | coordinator | checkout 残留 ABI 2 `.so` 无法绑定 schema-5 | [stale-abi-so-refused.md](coordinator/stale-abi-so-refused.md) | ABI 2, leftover .so, schema-5, MIN_ABI_VERSION, build.sh |
 | 2026-09-17 | deployer | 容器快照部署进度条停在 90% | [snapshot-progress-wait2start.md](deployer/snapshot-progress-wait2start.md) | deployer, container snapshot, progress, WAIT2START, 90% |
 | 2026-09-21 | node_manager | 关闭 vLLM 启动加速仍覆盖原生引擎配置 | [disabled-startup-acceleration-overrides.md](node_manager/disabled-startup-acceleration-overrides.md) | NodeManager, vLLM startup acceleration, disabled feature, engine override |

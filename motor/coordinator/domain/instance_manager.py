@@ -91,12 +91,20 @@ def _clamp_workload_floor(workload: Workload) -> bool:
     if workload.active_tokens < 0:
         workload.active_tokens = 0.0
         floored = True
+    if workload.isl < 0:
+        workload.isl = 0.0
+        floored = True
+    if workload.cpu_hit_blocks < 0:
+        workload.cpu_hit_blocks = 0.0
+        floored = True
     return floored
 
 
 def _rebuild_instance_workload(instance: Instance) -> bool:
     """Rebuild an instance workload from its endpoint ledgers and floor invalid values."""
     active_tokens = 0.0
+    isl = 0.0
+    cpu_hit_blocks = 0.0
     floored = False
     for pod_endpoints in (instance.endpoints or {}).values():
         for endpoint in (pod_endpoints or {}).values():
@@ -104,8 +112,12 @@ def _rebuild_instance_workload(instance: Instance) -> bool:
                 endpoint.workload = Workload()
             floored = _clamp_workload_floor(endpoint.workload) or floored
             active_tokens += endpoint.workload.active_tokens
+            isl += endpoint.workload.isl
+            cpu_hit_blocks += endpoint.workload.cpu_hit_blocks
     instance.gathered_workload = Workload(
         active_tokens=active_tokens,
+        isl=isl,
+        cpu_hit_blocks=cpu_hit_blocks,
     )
     return floored
 
@@ -278,7 +290,8 @@ class InstanceManager:
                 f"workload_floor:{instance_id}:{endpoint_id}",
                 "Workload floored to 0 (release exceeded allocation, accounting gap) "
                 f"instance_id={instance_id} endpoint_id={endpoint_id} "
-                f"change=(tokens={workload_change.active_tokens})",
+                f"change=(tokens={workload_change.active_tokens},"
+                f"isl={workload_change.isl},cpu_hits={workload_change.cpu_hit_blocks})",
                 window_sec=60,
                 level="WARNING",
             )

@@ -65,9 +65,28 @@ source ./scripts/ensure_rust.sh
 motor_apply_skip_rust_build_shorthand
 motor_source_cargo_env || true
 
+# Exit 0 (bash true) when path is missing or ABI < Python MIN_ABI_VERSION.
+# Python SystemExit(1) means the .so is current and may be reused.
+motor_workload_shm_so_needs_rebuild() {
+    local so="${1:?}"
+    local rc=0
+    PYTHONPATH="${PWD}${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
+        "from motor.coordinator.workload_shm_rs.wheel_gate import workload_shm_so_needs_rebuild; import sys; raise SystemExit(0 if workload_shm_so_needs_rebuild(sys.argv[1]) else 1)" \
+        "$so" || rc=$?
+    if [[ "$rc" -eq 1 ]]; then
+        return 1
+    fi
+    return 0
+}
+
+_shm_lib_unusable="0"
+if motor_workload_shm_so_needs_rebuild "$WORKLOAD_SHM_LIB"; then
+    _shm_lib_unusable="1"
+fi
+
 _shm_needs_cargo="0"
 if [[ -z "${WORKLOAD_SHM_PREBUILT:-}" ]]; then
-    if [[ ! -f "$WORKLOAD_SHM_LIB" ]] || motor_var_is_explicit_zero SKIP_WORKLOAD_SHM_BUILD; then
+    if [[ "$_shm_lib_unusable" == "1" ]] || motor_var_is_explicit_zero SKIP_WORKLOAD_SHM_BUILD; then
         _shm_needs_cargo="1"
     fi
 fi
@@ -81,13 +100,14 @@ fi
 if ! motor_cargo_usable; then
     if [[ "$_shm_needs_cargo" != "1" && "$_kv_needs_cargo" != "1" ]]; then
         echo "native artifacts already present; skip rustup."
-    elif [[ "$_shm_needs_cargo" == "1" && ! -f "$WORKLOAD_SHM_LIB" && -z "${WORKLOAD_SHM_PREBUILT:-}" ]]; then
+    elif [[ "$_shm_needs_cargo" == "1" && "$_shm_lib_unusable" == "1" && -z "${WORKLOAD_SHM_PREBUILT:-}" ]]; then
         echo "=== rust toolchain ==="
         if ! motor_ensure_cargo; then
             echo "[ERROR] refusing to emit dist/motor-*.whl: cargo is required to compile libmindie_workload_shm.so." >&2
             echo "  Coordinator cannot start without this library (no Python ledger fallback)." >&2
-            echo "  Install Rust, or set WORKLOAD_SHM_PREBUILT, or copy the .so into $WORKLOAD_SHM_LIB_DIR/." >&2
-            echo "  Offline: SKIP_RUST_INSTALL=1 plus a prebuilt library." >&2
+            echo "  Install Rust, or set WORKLOAD_SHM_PREBUILT to an ABI-current .so, or copy one into $WORKLOAD_SHM_LIB_DIR/." >&2
+            echo "  A leftover ABI-old .so from a previous checkout cannot start this branch." >&2
+            echo "  Offline: SKIP_RUST_INSTALL=1 plus a prebuilt ABI-current library." >&2
             exit 1
         fi
     else
@@ -105,9 +125,9 @@ fi
 
 # --- Required workload-shm (coordinator) build ---
 # Default: reuse motor/coordinator/workload_shm_rs/lib/libmindie_workload_shm.so
-# if it already exists. Compile only when the file is missing (or when
-# SKIP_WORKLOAD_SHM_BUILD=0 is set explicitly to force a rebuild after .rs changes).
-# PREBUILT always copies over lib/. Missing .so after this step is a hard error.
+# if it already exists and its ABI is current. Compile when the file is missing,
+# ABI-stale, or SKIP_WORKLOAD_SHM_BUILD=0. PREBUILT always copies over lib/.
+# Missing or ABI-stale .so after this step is a hard error.
 
 echo "=== workload-shm ==="
 
@@ -121,12 +141,14 @@ if [[ -n "${WORKLOAD_SHM_PREBUILT:-}" ]]; then
     chmod +x "$WORKLOAD_SHM_LIB"
     echo "workload-shm library ready (pre-built): $WORKLOAD_SHM_LIB"
 
-elif [[ -f "$WORKLOAD_SHM_LIB" ]] && ! motor_var_is_explicit_zero SKIP_WORKLOAD_SHM_BUILD; then
+elif [[ "$_shm_lib_unusable" != "1" ]] && ! motor_var_is_explicit_zero SKIP_WORKLOAD_SHM_BUILD; then
     echo "workload-shm library ready (existing, skip cargo): $WORKLOAD_SHM_LIB"
 
 elif motor_cargo_usable; then
     if [[ "${SKIP_WORKLOAD_SHM_BUILD:-0}" == "1" ]]; then
-        echo "[WARNING] SKIP_WORKLOAD_SHM_BUILD=1 ignored because $WORKLOAD_SHM_LIB is missing."
+        echo "[WARNING] SKIP_WORKLOAD_SHM_BUILD=1 ignored because $WORKLOAD_SHM_LIB is missing or ABI-stale."
+    elif [[ "$_shm_lib_unusable" == "1" && -f "$WORKLOAD_SHM_LIB" ]]; then
+        echo "[WARNING] $WORKLOAD_SHM_LIB ABI is below this checkout; rebuilding."
     fi
     echo "Building workload-shm from source (cargo build --release)..."
     (
@@ -144,18 +166,18 @@ elif motor_cargo_usable; then
     chmod +x "$WORKLOAD_SHM_LIB"
     echo "workload-shm library ready (cargo-built): $WORKLOAD_SHM_LIB"
 
-elif [[ -f "$WORKLOAD_SHM_LIB" ]]; then
+elif [[ -f "$WORKLOAD_SHM_LIB" && "$_shm_lib_unusable" != "1" ]]; then
     echo "workload-shm library ready (existing, no cargo): $WORKLOAD_SHM_LIB"
 
 else
-    echo "[ERROR] refusing to emit dist/motor-*.whl: libmindie_workload_shm.so is missing and cargo is unavailable." >&2
-    echo "  Coordinator cannot start without this library (no Python ledger fallback)." >&2
+    echo "[ERROR] refusing to emit dist/motor-*.whl: libmindie_workload_shm.so is missing or ABI-stale and cargo is unavailable." >&2
+    echo "  Coordinator cannot start without an ABI-current library (no Python ledger fallback)." >&2
     echo "  Options:" >&2
-    echo "    1. WORKLOAD_SHM_PREBUILT=/path/to/libmindie_workload_shm.so bash build.sh" >&2
-    echo "    2. cp /path/to/libmindie_workload_shm.so $WORKLOAD_SHM_LIB_DIR/ && bash build.sh" >&2
+    echo "    1. WORKLOAD_SHM_PREBUILT=/path/to/ABI-current/libmindie_workload_shm.so bash build.sh" >&2
+    echo "    2. cp an ABI-current libmindie_workload_shm.so $WORKLOAD_SHM_LIB_DIR/ && bash build.sh" >&2
     echo "    3. Unset SKIP_RUST_INSTALL and retry (build.sh installs rustup), or install cargo on PATH" >&2
-    echo "  SKIP_RUST_BUILD=1 / SKIP_WORKLOAD_SHM_BUILD=1 only reuse an existing .so; they do not" >&2
-    echo "  authorize a first-time build without one." >&2
+    echo "  SKIP_RUST_BUILD=1 / SKIP_WORKLOAD_SHM_BUILD=1 only reuse an ABI-current .so; they do not" >&2
+    echo "  authorize a first-time or ABI-upgrade build without one." >&2
     exit 1
 fi
 
@@ -163,6 +185,12 @@ if [[ ! -f "$WORKLOAD_SHM_LIB" ]]; then
     echo "[ERROR] refusing to emit dist/motor-*.whl: $WORKLOAD_SHM_LIB is missing after the workload-shm build step." >&2
     echo "  cargo/prebuilt must produce libmindie_workload_shm.so before pip wheel." >&2
     echo "  Coordinator cannot start without this library (no Python ledger fallback)." >&2
+    exit 1
+fi
+if motor_workload_shm_so_needs_rebuild "$WORKLOAD_SHM_LIB"; then
+    echo "[ERROR] refusing to emit dist/motor-*.whl: $WORKLOAD_SHM_LIB ABI is below this checkout." >&2
+    echo "  Coordinator cannot start with a leftover .so from a previous branch." >&2
+    echo "  Rebuild with cargo, or set WORKLOAD_SHM_PREBUILT to an ABI-current library." >&2
     exit 1
 fi
 

@@ -37,6 +37,7 @@ from motor.coordinator.scheduler.runtime.zmq_protocol import (
     CANDIDATE_POLICY_LOAD_BALANCE,
     CANDIDATE_POLICY_ROUND_ROBIN,
     CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+    CANDIDATE_POLICY_C2LB,
     pack_send_frames,
     unpack_recv_payload,
     ZMQMessageSerializer,
@@ -47,6 +48,7 @@ from motor.config.coordinator import (
     KV_AFFINITY_MODE_UNIFIED,
     KV_AFFINITY_MODES,
     KvAffinityConfig,
+    C2LBConfig,
 )
 from motor.coordinator.fault_tolerance.precision.streak_result import (
     PrecisionStreakResult,
@@ -54,6 +56,7 @@ from motor.coordinator.fault_tolerance.precision.streak_result import (
 from motor.coordinator.scheduler.policy.load_balance import LoadBalancePolicy
 from motor.coordinator.scheduler.policy.round_robin import RoundRobinPolicy
 from motor.coordinator.scheduler.policy.kv_cache_affinity import KvCacheAffinityPolicy
+from motor.coordinator.scheduler.policy.c2lb import C2LB_ROLES, C2LBPolicy
 from motor.coordinator.domain.workload_calculator import (
     calculate_committed_workload,
     calculate_demand_workload,
@@ -161,6 +164,7 @@ class _SchedulerInstanceCache:
             PDRole.ROLE_U: {},
         }
         self._endpoint_map: dict[tuple[int, int], Endpoint] = {}
+        self._ledger_overlay: dict[tuple[int, int], tuple[float, float]] = {}
         self._lock = asyncio.Lock()
 
     def get_instances(self, role: PDRole) -> list[Instance]:
@@ -177,8 +181,14 @@ class _SchedulerInstanceCache:
         endpoint_id: int,
         role: PDRole,
         active_tokens: float,
+        isl: float | None = None,
+        cpu_hit_blocks: float | None = None,
     ) -> None:
-        """Patch single endpoint workload from shared memory. Skip if not in cache."""
+        """Patch single endpoint workload from shared memory. Skip if not in cache.
+
+        Token-only patches (overlay args omitted) keep the worker overlay cache. Passing
+        ``isl`` / ``cpu_hit_blocks`` SETs those fields from SHM and syncs the overlay.
+        """
         role_map = self._instance_map.get(role) or {}
         cached_instance = role_map.get(instance_id)
         if not cached_instance:
@@ -187,12 +197,24 @@ class _SchedulerInstanceCache:
         if not cached_endpoint:
             return
         old_workload = cached_endpoint.workload or Workload()
+        overlay = self._ledger_overlay.get((instance_id, endpoint_id), (0.0, 0.0))
+        next_isl = overlay[0] if isl is None else float(isl)
+        next_cpu = overlay[1] if cpu_hit_blocks is None else float(cpu_hit_blocks)
         cached_endpoint.workload = Workload(
             active_tokens=active_tokens,
+            isl=next_isl,
+            cpu_hit_blocks=next_cpu,
         )
         if cached_instance.gathered_workload is None:
             cached_instance.gathered_workload = Workload()
         cached_instance.gathered_workload.active_tokens += active_tokens - old_workload.active_tokens
+        if isl is not None or cpu_hit_blocks is not None:
+            cached_instance.gathered_workload.isl += next_isl - old_workload.isl
+            cached_instance.gathered_workload.cpu_hit_blocks += next_cpu - old_workload.cpu_hit_blocks
+            if next_isl == 0.0 and next_cpu == 0.0:
+                self._ledger_overlay.pop((instance_id, endpoint_id), None)
+            else:
+                self._ledger_overlay[(instance_id, endpoint_id)] = (next_isl, next_cpu)
 
     def _apply_role_under_lock(self, role: PDRole, instances: list[Instance]) -> None:
         """Update cache and maps for one role. Must be called with _lock held."""
@@ -207,6 +229,7 @@ class _SchedulerInstanceCache:
                 for pod_eps in (inst.endpoints or {}).values():
                     for ep in (pod_eps or {}).values():
                         self._endpoint_map[(inst.id, ep.id)] = ep
+        self._reapply_ledger_overlay()
 
     @staticmethod
     def _role_of(inst: Instance) -> PDRole | None:
@@ -257,6 +280,7 @@ class _SchedulerInstanceCache:
                     for pod_eps in (inst.endpoints or {}).values():
                         for ep in (pod_eps or {}).values():
                             self._endpoint_map[(inst.id, ep.id)] = ep
+            self._reapply_ledger_overlay()
         return True
 
     async def apply_remove(self, instances: list[Instance]) -> None:
@@ -273,6 +297,69 @@ class _SchedulerInstanceCache:
                         self._instance_cache[role] = sorted(role_map.values(), key=lambda i: i.id)
                 for key in [k for k in self._endpoint_map if k[0] == iid]:
                     del self._endpoint_map[key]
+                for key in [k for k in self._ledger_overlay if k[0] == iid]:
+                    del self._ledger_overlay[key]
+
+    def apply_ledger_delta(
+        self,
+        instance_id: int,
+        endpoint_id: int,
+        role: PDRole,
+        isl_delta: float,
+        cpu_hit_blocks_delta: float,
+    ) -> None:
+        """Accumulate isl / cpu_hit_blocks after a successful SHM CAS and stamp the endpoint.
+
+        Scoring refresh later SETs the same fields from schema-5 SHM.
+        """
+        key = (instance_id, endpoint_id)
+        old_isl, old_cpu = self._ledger_overlay.get(key, (0.0, 0.0))
+        new_isl = max(0.0, old_isl + float(isl_delta))
+        new_cpu = max(0.0, old_cpu + float(cpu_hit_blocks_delta))
+        if new_isl == 0.0 and new_cpu == 0.0:
+            self._ledger_overlay.pop(key, None)
+        else:
+            self._ledger_overlay[key] = (new_isl, new_cpu)
+        self._stamp_ledger_overlay(instance_id, endpoint_id, role, new_isl, new_cpu)
+
+    def _stamp_ledger_overlay(
+        self,
+        instance_id: int,
+        endpoint_id: int,
+        role: PDRole,
+        isl: float,
+        cpu_hit_blocks: float,
+    ) -> None:
+        cached_endpoint = self._endpoint_map.get((instance_id, endpoint_id))
+        if cached_endpoint is None:
+            return
+        old = cached_endpoint.workload or Workload()
+        cached_endpoint.workload = Workload(
+            active_tokens=old.active_tokens,
+            isl=isl,
+            cpu_hit_blocks=cpu_hit_blocks,
+        )
+        role_map = self._instance_map.get(role) or {}
+        cached_instance = role_map.get(instance_id)
+        if cached_instance is None:
+            return
+        if cached_instance.gathered_workload is None:
+            cached_instance.gathered_workload = Workload()
+        cached_instance.gathered_workload.isl += isl - old.isl
+        cached_instance.gathered_workload.cpu_hit_blocks += cpu_hit_blocks - old.cpu_hit_blocks
+
+    def _reapply_ledger_overlay(self) -> None:
+        """Re-stamp overlay onto newly replaced instance objects (membership refresh)."""
+        for (instance_id, endpoint_id), (isl, cpu_hit_blocks) in self._ledger_overlay.items():
+            cached_endpoint = self._endpoint_map.get((instance_id, endpoint_id))
+            if cached_endpoint is None:
+                continue
+            old = cached_endpoint.workload or Workload()
+            cached_endpoint.workload = Workload(
+                active_tokens=old.active_tokens,
+                isl=isl,
+                cpu_hit_blocks=cpu_hit_blocks,
+            )
 
 
 class _SchedulerTransport:
@@ -626,6 +713,8 @@ class SchedulerClientConfig:
     endpoint_instance_score_weight: float = 0.05
     # kv_cache_affinity tunables (see SchedulerConfig.kv_affinity).
     kv_affinity: KvAffinityConfig | None = None
+    # c2lb tunables (see SchedulerConfig.c2lb).
+    c2lb: C2LBConfig | None = None
     dp_stats_window: int = 60
     # Worker 0 dumps dp_stats every dp_stats_window seconds.
     # Inference worker_index==0 sets this; Obs/standby (worker_index is None) leave it off.
@@ -672,6 +761,10 @@ class AsyncSchedulerClient:
         self._kv_affinity_w_cpu = max(0.0, float(affinity.w_cpu))
         self._kv_affinity_w_disk = max(0.0, float(affinity.w_disk))
         self._kv_affinity_hit_rate_threshold = min(1.0, max(0.0, float(affinity.hit_rate_threshold)))
+        gated = config.c2lb or C2LBConfig()
+        self._c2lb_active_factor = max(0.0, float(gated.active_tokens_mean_factor))
+        self._c2lb_cpu_factor = max(0.0, float(gated.cpu_hit_blocks_mean_factor))
+        self._c2lb_isl_factor = max(0.0, float(gated.isl_mean_factor))
 
         self._dp_stats = DpStatsLogger(window_sec=config.dp_stats_window)
         self._log_dp_stats = bool(config.log_dp_stats)
@@ -766,7 +859,7 @@ class AsyncSchedulerClient:
         self._dp_stats.emit_window(self._snapshot_dp_stats())
 
     def _snapshot_dp_stats(self) -> list[tuple[int, int, float]]:
-        """Read current per-DP ``active_tokens`` from schema-4 SHM."""
+        """Read current per-DP ``active_tokens`` from schema-5 SHM."""
         reader = self._workload_reader
         native = getattr(reader, "native", None) if reader is not None else None
         if native is None:
@@ -937,6 +1030,9 @@ class AsyncSchedulerClient:
             is_instance_circuit_open=self.is_instance_blocked,
             endpoint_instance_score_weight=self._endpoint_instance_score_weight,
             is_load_balance_scheduler=self._scheduler_type_for_role(role) == "load_balance",
+            c2lb_active_factor=self._c2lb_active_factor,
+            c2lb_cpu_factor=self._c2lb_cpu_factor,
+            c2lb_isl_factor=self._c2lb_isl_factor,
         )
 
     def _committed_workload_for(
@@ -948,17 +1044,37 @@ class AsyncSchedulerClient:
         demand: Workload,
         matched_tokens_map: dict[tuple[int, int], float],
         isl: float,
+        cpu_hit_map: dict[tuple[int, int], float] | None = None,
     ) -> Workload:
-        """Same commit formula the former ALLOCATE_ONLY handler used (R4)."""
-        if (
-            candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY
-            and isl > 0
-            and role in (PDRole.ROLE_P, PDRole.ROLE_U)
-        ):
-            return calculate_committed_workload(
-                role,
-                isl,
-                matched_tokens=matched_tokens_map.get((instance.id, endpoint.id), 0.0),
+        """Same commit formula the former ALLOCATE_ONLY handler used (R4).
+
+        c2lb stamps schema-5 overlay ``isl = max(0, request_isl)`` and cpu_blocks.
+        kv_cache_affinity commits SHM ``active_tokens`` as ``isl - matched`` and leaves
+        overlay ``isl`` / ``cpu_hit_blocks`` at 0. RR/LB leave overlay fields at 0.
+        """
+        if candidate_policy == CANDIDATE_POLICY_C2LB and role in (PDRole.ROLE_P, PDRole.ROLE_U):
+            active_tokens = demand.active_tokens
+            if isl > 0:
+                active_tokens = calculate_committed_workload(
+                    role,
+                    isl,
+                    matched_tokens=matched_tokens_map.get((instance.id, endpoint.id), 0.0),
+                ).active_tokens
+            return Workload(
+                active_tokens=active_tokens,
+                isl=max(0.0, float(isl)),
+                cpu_hit_blocks=(cpu_hit_map or {}).get((instance.id, endpoint.id), 0.0),
+            )
+        if candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY and role in (PDRole.ROLE_P, PDRole.ROLE_U):
+            active_tokens = demand.active_tokens
+            if isl > 0:
+                active_tokens = calculate_committed_workload(
+                    role,
+                    isl,
+                    matched_tokens=matched_tokens_map.get((instance.id, endpoint.id), 0.0),
+                ).active_tokens
+            return Workload(
+                active_tokens=active_tokens
             )
         return demand
 
@@ -986,13 +1102,14 @@ class AsyncSchedulerClient:
         required_engine_type: str | None = None,
         required_dispatch_capability: str | None = None,
     ) -> tuple[Instance, Endpoint, Workload] | None:
-        """Select locally, then CAS-commit on schema-4 SHM (no ALLOCATE_ONLY ZMQ)."""
+        """Select locally, then CAS-commit on schema-5 SHM (no ALLOCATE_ONLY ZMQ)."""
         from motor.coordinator.scheduler.runtime.workload_shm.layout import FLAG_BLOCKED
         from motor.coordinator.scheduler.runtime.workload_shm.native import (
             STATUS_BLOCKED,
             STATUS_CHANGED,
             STATUS_OK,
             STATUS_SLOT_INVALID,
+            cas_status_name,
         )
 
         role_str = role.value if role is not None else (getattr(PDRole.ROLE_U, "value", "union"))
@@ -1068,12 +1185,33 @@ class AsyncSchedulerClient:
                 return None
             proposed_instance, proposed_endpoint, _ = candidates[0]
             affinity_debug = getattr(req_info, "kv_affinity_debug", None)
+            gated_debug = getattr(req_info, "c2lb_debug", None)
             global_affinity = (
                 candidate_policy == CANDIDATE_POLICY_KV_CACHE_AFFINITY
                 and isinstance(affinity_debug, dict)
                 and any(rec[2] is not None for rec in affinity_debug.values())
             )
-            if global_affinity:
+            if candidate_policy == CANDIDATE_POLICY_C2LB and isinstance(gated_debug, dict):
+                allowed_instance_ids = {
+                    candidate.id
+                    for candidate in self._filter_instances(
+                        self._cache.get_instances(role),
+                        normalized_engine_type or None,
+                        normalized_dispatch_capability or None,
+                    )
+                }
+                candidate_endpoints = [
+                    {
+                        "instance_id": ins_id,
+                        "endpoint_id": ep_id,
+                        "prefill_cost": rec[0],
+                        "cpu_hit_blocks": rec[1],
+                        "npu_hit": rec[2] if len(rec) > 2 else 0.0,
+                    }
+                    for (ins_id, ep_id), rec in gated_debug.items()
+                    if (not normalized_engine_type or ins_id in allowed_instance_ids)
+                ]
+            elif global_affinity:
                 allowed_instance_ids = {
                     candidate.id
                     for candidate in self._filter_instances(
@@ -1124,12 +1262,45 @@ class AsyncSchedulerClient:
             for item in candidate_endpoints
             if item.get("matched_tokens") is not None
         }
+        cpu_hit_map = {
+            (int(item["instance_id"]), int(item["endpoint_id"])): float(item["cpu_hit_blocks"])
+            for item in candidate_endpoints
+            if item.get("cpu_hit_blocks") is not None
+        }
+        gated_quads = [
+            (
+                int(item["instance_id"]),
+                int(item["endpoint_id"]),
+                float(item["prefill_cost"]),
+                float(item.get("cpu_hit_blocks") or 0.0),
+                float(item.get("npu_hit") or 0.0),
+            )
+            for item in candidate_endpoints
+            if item.get("prefill_cost") is not None
+        ]
         proposed = (proposed_instance.id, proposed_endpoint.id)
         excluded: set[tuple[int, int]] = set()
+        # Same as LB/RR/affinity: first CAS validates the policy winner. CHANGED/BLOCKED
+        # refresh SHM and re-run allocate_arbitration (c2lb re-gates on that path).
         use_authoritative = False
         native = self._workload_reader.native
         if native is None:
             return None
+        cas_counts = {
+            "none_meta": 0,
+            "blocked_flag": 0,
+            "changed": 0,
+            "blocked": 0,
+            "slot_invalid": 0,
+            "already_excluded": 0,
+            "other": 0,
+        }
+        last_iid: int | None = None
+        last_eid: int | None = None
+        last_reason = ""
+        last_expected: float | None = None
+        last_actual: float | None = None
+        last_slot: int | None = None
 
         for _attempt in range(_MAX_CAS_ALLOCATE_ATTEMPTS):
             # First attempt reuses the candidate-selection refresh above; later retries re-read.
@@ -1152,6 +1323,8 @@ class AsyncSchedulerClient:
                     normalized_engine_type or None,
                     excluded=excluded,
                     required_dispatch_capability=normalized_dispatch_capability or None,
+                    gated_candidates=gated_quads if candidate_policy == CANDIDATE_POLICY_C2LB else None,
+                    req_id=req_info.req_id,
                 )
             else:
                 selected = select_valid_candidate(
@@ -1174,13 +1347,18 @@ class AsyncSchedulerClient:
                         normalized_engine_type or None,
                         excluded=excluded,
                         required_dispatch_capability=normalized_dispatch_capability or None,
+                        gated_candidates=gated_quads if candidate_policy == CANDIDATE_POLICY_C2LB else None,
+                        req_id=req_info.req_id,
                     )
                     use_authoritative = True
             if selected is None:
                 return None
             out_instance, out_endpoint, selected_score = selected
             pair = (out_instance.id, out_endpoint.id)
+            last_iid, last_eid = pair
             if pair in excluded:
+                cas_counts["already_excluded"] += 1
+                last_reason = "already_excluded"
                 use_authoritative = True
                 continue
             committed = self._committed_workload_for(
@@ -1191,12 +1369,21 @@ class AsyncSchedulerClient:
                 demand,
                 matched_tokens_map,
                 isl,
+                cpu_hit_map=cpu_hit_map,
             )
             meta = self._workload_reader.entry_meta(out_instance.id, out_endpoint.id)
             if meta is None or int(meta.get("flags", 0)) & FLAG_BLOCKED:
+                if meta is None:
+                    cas_counts["none_meta"] += 1
+                    last_reason = "none_meta"
+                else:
+                    cas_counts["blocked_flag"] += 1
+                    last_reason = "blocked_flag"
                 excluded.add(pair)
                 use_authoritative = True
                 continue
+            last_expected = float(meta["active_tokens"])
+            last_slot = meta.get("slot")
             status, actual = native.cas_add(
                 out_instance.id,
                 out_endpoint.id,
@@ -1204,9 +1391,20 @@ class AsyncSchedulerClient:
                 float(meta["active_tokens"]),
                 float(committed.active_tokens),
                 slot=meta.get("slot"),
+                isl=float(committed.isl),
+                cpu_hit_blocks=float(committed.cpu_hit_blocks),
             )
+            last_actual = actual
+            last_reason = cas_status_name(status)
             if status == STATUS_OK:
                 self._cache.patch_workload_from_shm(out_instance.id, out_endpoint.id, role, actual)
+                self._cache.apply_ledger_delta(
+                    out_instance.id,
+                    out_endpoint.id,
+                    role,
+                    committed.isl,
+                    committed.cpu_hit_blocks,
+                )
                 meta["active_tokens"] = actual
                 self._dp_stats.record(
                     instance_id=out_instance.id,
@@ -1243,23 +1441,60 @@ class AsyncSchedulerClient:
                 )
                 return (out_instance, out_endpoint, committed)
             if status == STATUS_CHANGED:
+                cas_counts["changed"] += 1
                 use_authoritative = True
                 continue
             if status in (STATUS_BLOCKED, STATUS_SLOT_INVALID):
+                if status == STATUS_BLOCKED:
+                    cas_counts["blocked"] += 1
+                else:
+                    cas_counts["slot_invalid"] += 1
                 excluded.add(pair)
                 use_authoritative = True
                 continue
+            cas_counts["other"] += 1
             logger.error(
-                "select_and_allocate unexpected cas status=%s role=%s req_id=%s",
+                "select_and_allocate unexpected cas status=%s name=%s role=%s req_id=%s "
+                "pair=%s-%s expected=%s actual=%s slot=%s",
                 status,
+                cas_status_name(status),
                 role_str,
                 req_info.req_id,
+                out_instance.id,
+                out_endpoint.id,
+                last_expected,
+                actual,
+                last_slot,
             )
             return None
+        shm_valid_pairs = len(getattr(self._workload_reader, "_meta", {}) or {})
+        pair_in_meta = (
+            last_iid is not None
+            and last_eid is not None
+            and self._workload_reader.entry_meta(last_iid, last_eid) is not None
+        )
         logger.warning(
-            "select_and_allocate exhausted CAS retries role=%s req_id=%s",
+            "select_and_allocate exhausted CAS retries role=%s req_id=%s "
+            "none_meta=%d blocked_flag=%d changed=%d blocked=%d slot_invalid=%d "
+            "already_excluded=%d other=%d last_pair=%s-%s last_reason=%s "
+            "expected=%s actual=%s slot=%s shm_valid_pairs=%d pair_in_meta=%s",
             role_str,
             req_info.req_id,
+            cas_counts["none_meta"],
+            cas_counts["blocked_flag"],
+            cas_counts["changed"],
+            cas_counts["blocked"],
+            cas_counts["slot_invalid"],
+            cas_counts["already_excluded"],
+            cas_counts["other"],
+            last_iid,
+            last_eid,
+            last_reason,
+            last_expected,
+            last_actual,
+            last_slot,
+            shm_valid_pairs,
+            pair_in_meta,
         )
         return None
 
@@ -1415,7 +1650,7 @@ class AsyncSchedulerClient:
         return False
 
     async def update_workload(self, params: UpdateWorkloadParams) -> bool:
-        """Release path: CAS-sub floor 0 on schema-4 SHM (no UPDATE_WORKLOAD ZMQ)."""
+        """Release path: CAS-sub floor 0 on schema-5 SHM (no UPDATE_WORKLOAD ZMQ)."""
         from motor.coordinator.scheduler.runtime.workload_shm.native import STATUS_OK
 
         role_str = params.role.value if hasattr(params.role, "value") else str(params.role)
@@ -1446,12 +1681,16 @@ class AsyncSchedulerClient:
             )
             return False
         delta = abs(float(params.workload_change.active_tokens))
+        isl_delta = abs(float(getattr(params.workload_change, "isl", 0) or 0))
+        cpu_delta = abs(float(getattr(params.workload_change, "cpu_hit_blocks", 0) or 0))
         status, actual = self._workload_reader.native.cas_sub_floor0(
             params.instance_id,
             params.endpoint_id,
             int(meta["generation"]),
             delta,
             slot=meta.get("slot"),
+            isl=isl_delta,
+            cpu_hit_blocks=cpu_delta,
         )
         if status != STATUS_OK:
             logger.warning(
@@ -1472,6 +1711,13 @@ class AsyncSchedulerClient:
         # (a second cas_sub_floor0 would subtract the same delta twice).
         try:
             self._cache.patch_workload_from_shm(params.instance_id, params.endpoint_id, role, actual)
+            self._cache.apply_ledger_delta(
+                params.instance_id,
+                params.endpoint_id,
+                role,
+                float(getattr(params.workload_change, "isl", 0) or 0),
+                float(getattr(params.workload_change, "cpu_hit_blocks", 0) or 0),
+            )
         except Exception as e:
             logger.warning(
                 "update_workload cache patch failed after CAS success instance_id=%s endpoint_id=%s "
@@ -1802,6 +2048,23 @@ class AsyncSchedulerClient:
             if candidates:
                 return candidates, CANDIDATE_POLICY_LOAD_BALANCE
             logger.warning("load_balance failed, falling back to round-robin")
+        elif st == "c2lb":
+            if role in C2LB_ROLES:
+                ranked = C2LBPolicy.select_endpoint_candidates_from_list(
+                    instances,
+                    req_info,
+                    top_k=max(1, top_k),
+                    active_tokens_mean_factor=self._c2lb_active_factor,
+                    cpu_hit_blocks_mean_factor=self._c2lb_cpu_factor,
+                    isl_mean_factor=self._c2lb_isl_factor,
+                )
+                if ranked:
+                    return ranked, CANDIDATE_POLICY_C2LB
+                logger.warning("c2lb did not select an endpoint, falling back to load_balance")
+            candidates = self._select_endpoint_candidates_by_load_balance(instances, role, top_k)
+            if candidates:
+                return candidates, CANDIDATE_POLICY_LOAD_BALANCE
+            logger.warning("load_balance unavailable, falling back to round-robin")
         elif st == "kv_cache_affinity":
             # Affinity ranking applies to KVA-eligible roles only; others fall through to
             # the load_balance -> round_robin chain below.
@@ -1857,7 +2120,7 @@ class AsyncSchedulerClient:
         if not all_endpoints:
             return None
         st = self._scheduler_type_for_role(role)
-        if st in ("load_balance", "kv_cache_affinity"):
+        if st in ("load_balance", "kv_cache_affinity", "c2lb"):
             ep = LoadBalancePolicy.select_endpoint_from_instance(instance)
             if ep:
                 return (instance, ep)

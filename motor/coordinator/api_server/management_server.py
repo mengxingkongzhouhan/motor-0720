@@ -211,7 +211,7 @@ class ManagementServer(BaseCoordinatorServer):
             await self._stop_control_plane()
 
     async def _start_control_plane(self) -> None:
-        """Bind ROUTER/PUB and create schema-4 SHM, then serve control-plane RPCs in-process."""
+        """Bind ROUTER/PUB and create schema-5 SHM, then serve control-plane RPCs in-process."""
         await self._control_plane.start_control_plane()
         self._control_plane._loop_task = asyncio.create_task(self._control_plane.run_request_loop())
 

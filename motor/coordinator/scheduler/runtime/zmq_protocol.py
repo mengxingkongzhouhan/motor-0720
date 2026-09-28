@@ -27,7 +27,7 @@ logger = get_logger(__name__)
 class SchedulerRequestType(str, Enum):
     """
     Control-plane request types served by Mgmt (ROUTER). Data-plane allocate/release
-    is CAS on schema-4 SHM; there is no ALLOCATE / UPDATE / REFRESH RPC.
+    is CAS on schema-5 SHM; there is no ALLOCATE / UPDATE / REFRESH RPC.
     """
 
     GET_AVAILABLE_INSTANCES = "get_available_instances"  # Worker/Obs fetch instance list and workload shm name
@@ -73,11 +73,13 @@ class SchedulerResponse(msgspec.Struct):
 CANDIDATE_POLICY_LOAD_BALANCE = "load_balance"
 CANDIDATE_POLICY_ROUND_ROBIN = "round_robin"
 CANDIDATE_POLICY_KV_CACHE_AFFINITY = "kv_cache_affinity"
+CANDIDATE_POLICY_C2LB = "c2lb"
 KNOWN_CANDIDATE_POLICIES = frozenset(
     {
         CANDIDATE_POLICY_LOAD_BALANCE,
         CANDIDATE_POLICY_ROUND_ROBIN,
         CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+        CANDIDATE_POLICY_C2LB,
     }
 )
 

@@ -13,7 +13,7 @@
 Counts successfully committed ALLOCATE_ONLY requests per
 ``(instance_id, dp_rank)`` with ``collections.Counter``.  Emission is driven
 by the scheduler client's ``window_sec`` timer (worker 0): each tick
-snapshots schema-4 SHM ``active_tokens`` and prints them together with the
+snapshots schema-5 SHM ``active_tokens`` and prints them together with the
 request counts accumulated since the previous tick.  A DP whose
 ``(requests, active_tokens)`` pair is unchanged since the last printed
 line (implicit baseline ``(0, 0)``) is omitted.  ``record()`` never logs

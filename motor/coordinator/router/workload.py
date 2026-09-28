@@ -123,7 +123,11 @@ class WorkloadActionHandler:
                     "Request %s attempt %s not allocated for role %s, tokens release ignored", req_id, attempt_seq, role
                 )
                 return (None, None)
-            workload_change = Workload(active_tokens=-current_workload.active_tokens)
+            workload_change = Workload(
+                active_tokens=-current_workload.active_tokens,
+                isl=-float(getattr(current_workload, "isl", 0) or 0),
+                cpu_hit_blocks=-float(getattr(current_workload, "cpu_hit_blocks", 0) or 0),
+            )
             # Keep the local record until the scheduler ACKs the release (finalize_release), so a
             # failed/cancelled RPC can recompute and resend. The caller must mark the release done
             # atomically with the CAS ACK (before finalize_release) so this path is only reachable

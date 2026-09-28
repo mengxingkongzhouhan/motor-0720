@@ -102,7 +102,7 @@ struct MediumEnds {
     ///
     /// Contains only MemCache `object_key`s recorded from pool events.
     /// Disk blocks without an object key are omitted.
-    disk_hashes: Vec<String>,
+    disk_object_keys: Vec<String>,
 }
 
 /// The two accumulators a matching pass writes into.
@@ -217,10 +217,10 @@ pub(crate) struct OffloadPoolState {
     /// `block_hash → workers`: pool events waiting for offload `tokens_hash`.
     /// Values are `FxHashSet` to deduplicate repeated deliveries.
     pub(crate) pending_pool: FxHashMap<u64, FxHashSet<PendingPoolEvent>>,
-    /// Engine `block_hash` → MemCache `object_key`, filled from the pool
-    /// stored event's parallel `object_keys` array. `/query` remaps the
-    /// exclusive Disk slice through this table so prefetch gets the store
-    /// key, not the numeric seq_hash.
+    /// Engine `block_hash` → MemCache `object_key`, filled from Disk stored
+    /// events and removed with the corresponding Disk removed/cleared events.
+    /// `/query` remaps the exclusive Disk slice through this table so prefetch
+    /// gets the store key, not the numeric seq_hash.
     pub(crate) object_keys: FxHashMap<u64, String>,
 }
 
@@ -624,7 +624,8 @@ impl IndexerEntry {
                 sink.medium_ends
                     .entry((instance_id.clone(), *dp_rank))
                     .or_default()
-                    .disk_hashes = self.resolve_disk_object_keys(reached.blocks_from(exclusive_from));
+                    .disk_object_keys =
+                    self.resolve_disk_object_keys(reached.blocks_from(exclusive_from));
             }
             if let Some(local) = local {
                 Self::note_local_hits(sink.medium_ends, instance_id, *dp_rank, medium, local);
@@ -746,6 +747,22 @@ impl IndexerEntry {
                 state.object_keys.insert(*hash, key.clone());
             }
         }
+    }
+
+    /// Remove store keys after the pool reports the corresponding objects removed.
+    pub(crate) fn remove_object_keys(&self, block_hashes: &[u64]) {
+        if block_hashes.is_empty() {
+            return;
+        }
+        let mut state = self.offload_pool_state.write();
+        for hash in block_hashes {
+            state.object_keys.remove(hash);
+        }
+    }
+
+    /// Clear store keys when the pool clears all objects for this model/tenant.
+    pub(crate) fn clear_object_keys(&self) {
+        self.offload_pool_state.write().object_keys.clear();
     }
 
     /// Resolve exclusive Disk blocks to MemCache object keys for `/query`.
@@ -1368,10 +1385,10 @@ impl Indexer {
             dp_match.cpu_blocks = cpu;
             dp_match.disk_blocks = disk;
             debug_assert!(
-                ends.disk_hashes.len() as u32 <= disk,
+                ends.disk_object_keys.len() as u32 <= disk,
                 "disk_block_hashes cannot exceed exclusive disk_blocks"
             );
-            dp_match.disk_block_hashes = ends.disk_hashes.clone();
+            dp_match.disk_block_hashes = ends.disk_object_keys.clone();
             dp_match.matched_tokens = covered.saturating_mul(block_size);
             if self.query_options.split_cpu_hits {
                 // `cpu_local` is counted over the same exclusive range as `cpu`,

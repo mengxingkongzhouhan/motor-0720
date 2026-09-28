@@ -1547,10 +1547,10 @@ fn test_pool_arrives_before_offload_multi_worker() {
     assert!(scores.blocks.contains_key(&w1));
 }
 
-/// Pool event is queued, then a pool removal arrives — pending entry
-/// should be evicted (block never enters the tree).
+/// Pool event is queued, then a pool removal arrives — pending state and
+/// the associated MemCache object key should be evicted.
 #[test]
-fn test_pool_removal_cleans_pending() {
+fn test_pool_removal_cleans_pending_and_object_key() {
     use crate::indexer::Indexer;
 
     let indexer = Indexer::new();
@@ -1565,11 +1565,11 @@ fn test_pool_removal_cleans_pending() {
         model_name: Some("m".into()),
         tenant_id: Some("t".into()),
         backend_id: Some("pool".into()),
-        medium: Some("cpu".into()),
+        medium: Some("disk".into()),
         dp_rank: Some(0),
         seq_hashes: Some(vec![FlexHash(0xD00D)]),
         block_hashes: None,
-        object_keys: None,
+        object_keys: Some(vec!["object-key-d00d".into()]),
     };
     apply_pool_event(
         &indexer,
@@ -1578,7 +1578,7 @@ fn test_pool_removal_cleans_pending() {
         "t",
         "pool",
         0,
-        &[StorageMedium::Cpu],
+        &[StorageMedium::Disk],
         MatchMode::None,
         &None,
     )
@@ -1588,6 +1588,10 @@ fn test_pool_removal_cleans_pending() {
     {
         let state = entry.offload_pool_state.read();
         assert!(state.pending_pool.contains_key(&0xD00D));
+        assert_eq!(
+            state.object_keys.get(&0xD00D).map(String::as_str),
+            Some("object-key-d00d")
+        );
     }
 
     // Pool removal arrives → evict from pending.
@@ -1599,7 +1603,7 @@ fn test_pool_removal_cleans_pending() {
         model_name: Some("m".into()),
         tenant_id: Some("t".into()),
         backend_id: Some("pool".into()),
-        medium: Some("cpu".into()),
+        medium: Some("disk".into()),
         dp_rank: Some(0),
         seq_hashes: Some(vec![FlexHash(0xD00D)]),
         block_hashes: None,
@@ -1612,16 +1616,17 @@ fn test_pool_removal_cleans_pending() {
         "t",
         "pool",
         0,
-        &[StorageMedium::Cpu],
+        &[StorageMedium::Disk],
         MatchMode::None,
         &None,
     )
     .unwrap();
 
-    // Pending should be empty now.
+    // Pending state and the prefetch key should both be gone.
     {
         let state = entry.offload_pool_state.read();
         assert!(state.pending_pool.is_empty());
+        assert!(state.object_keys.is_empty());
         assert!(state.offload.is_empty());
     }
 
@@ -2024,11 +2029,11 @@ fn test_cleared_cleans_pending() {
         model_name: Some("m".into()),
         tenant_id: Some("t".into()),
         backend_id: Some("pool".into()),
-        medium: Some("cpu".into()),
+        medium: Some("disk".into()),
         dp_rank: Some(0),
         seq_hashes: Some(vec![FlexHash(0xABC)]),
         block_hashes: None,
-        object_keys: None,
+        object_keys: Some(vec!["object-key-abc".into()]),
     };
     apply_pool_event(
         &indexer,
@@ -2037,13 +2042,14 @@ fn test_cleared_cleans_pending() {
         "t",
         "pool",
         0,
-        &[StorageMedium::Cpu],
+        &[StorageMedium::Disk],
         MatchMode::None,
         &None,
     )
     .unwrap();
 
     assert_eq!(entry.pending_count(), 1);
+    assert_eq!(entry.offload_pool_state.read().object_keys.len(), 1);
 
     // Cleared event → pending entries removed.
     let clear_ev = PoolEvent {
@@ -2054,7 +2060,7 @@ fn test_cleared_cleans_pending() {
         model_name: Some("m".into()),
         tenant_id: Some("t".into()),
         backend_id: Some("pool".into()),
-        medium: Some("cpu".into()),
+        medium: Some("disk".into()),
         dp_rank: Some(0),
         seq_hashes: None,
         block_hashes: None,
@@ -2067,7 +2073,7 @@ fn test_cleared_cleans_pending() {
         "t",
         "pool",
         0,
-        &[StorageMedium::Cpu],
+        &[StorageMedium::Disk],
         MatchMode::None,
         &None,
     )
@@ -2077,6 +2083,10 @@ fn test_cleared_cleans_pending() {
         entry.pending_count(),
         0,
         "cleared event should remove pending pool entries"
+    );
+    assert!(
+        entry.offload_pool_state.read().object_keys.is_empty(),
+        "cleared event should remove object keys"
     );
 }
 

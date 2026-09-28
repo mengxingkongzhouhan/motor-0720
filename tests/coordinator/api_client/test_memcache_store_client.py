@@ -24,25 +24,18 @@ def _reset_store_client():
     MemcacheStoreClient.reset_for_tests()
 
 
-def test_hashes_to_keys_preserves_object_keys():
-    object_key = "wen25-7B@pcp0@dcp1@head_or_tp_rank:0@group:0@cache_role:kv@abc"
-    second_key = "wen25-7B@pcp0@dcp1@head_or_tp_rank:0@group:0@cache_role:kv@def"
-    assert MemcacheStoreClient.hashes_to_keys([object_key, second_key, 203]) == [
-        object_key,
-        second_key,
-    ]
-    assert MemcacheStoreClient.hashes_to_keys(None) == []
-    assert MemcacheStoreClient.hashes_to_keys(["x", "", None, True, 1.5]) == ["x"]
-
-
 def test_prefetch_skips_empty_keys():
-    assert MemcacheStoreClient.prefetch_disk_blocks([]) is False
-    assert MemcacheStoreClient.prefetch_disk_blocks(None) is False
+    with patch.object(MemcacheStoreClient, "_executor") as executor:
+        MemcacheStoreClient.prefetch_disk_blocks([])
+        MemcacheStoreClient.prefetch_disk_blocks(None)
+    executor.submit.assert_not_called()
 
 
 @patch.object(MemcacheStoreClient, "_is_memcache_backend", return_value=False)
 def test_prefetch_skips_non_memcache_backend(_mock_backend):
-    assert MemcacheStoreClient.prefetch_disk_blocks(["model@layer:3@aaa"]) is False
+    with patch.object(MemcacheStoreClient, "_executor") as executor:
+        MemcacheStoreClient.prefetch_disk_blocks(["model@layer:3@aaa"])
+    executor.submit.assert_not_called()
 
 
 @patch.object(MemcacheStoreClient, "_is_memcache_backend", return_value=True)
@@ -52,7 +45,7 @@ def test_prefetch_queues_work_without_calling_store(_mock_backend):
     object_keys = ["model@layer:3@aaa", "model@layer:3@bbb"]
 
     with patch.object(MemcacheStoreClient, "_executor") as executor:
-        assert MemcacheStoreClient.prefetch_disk_blocks(object_keys) is True
+        MemcacheStoreClient.prefetch_disk_blocks(object_keys)
 
     executor.submit.assert_called_once_with(MemcacheStoreClient._prefetch_disk_blocks_sync, object_keys)
     store.prefetch.assert_not_called()
@@ -64,7 +57,7 @@ def test_background_prefetch_calls_store_ssd_to_dram():
     MemcacheStoreClient._store = store
     object_keys = ["model@layer:3@aaa", "model@layer:3@bbb"]
 
-    assert MemcacheStoreClient._prefetch_disk_blocks_sync(object_keys) is True
+    MemcacheStoreClient._prefetch_disk_blocks_sync(object_keys)
     store.prefetch.assert_called_once_with(object_keys, src_media=2, dst_media=1, flags=0)
 
 
@@ -72,26 +65,31 @@ def test_background_prefetch_nonzero_rc_is_fail_open():
     store = Mock()
     store.prefetch.return_value = 7
     MemcacheStoreClient._store = store
-    assert MemcacheStoreClient._prefetch_disk_blocks_sync(["model@layer:3@aaa"]) is False
+    object_keys = ["model@layer:3@aaa"]
+    MemcacheStoreClient._prefetch_disk_blocks_sync(object_keys)
+    store.prefetch.assert_called_once_with(object_keys, src_media=2, dst_media=1, flags=0)
 
 
 def test_background_prefetch_exception_is_fail_open():
     store = Mock()
     store.prefetch.side_effect = RuntimeError("meta down")
     MemcacheStoreClient._store = store
-    assert MemcacheStoreClient._prefetch_disk_blocks_sync(["model@layer:3@aaa"]) is False
+    object_keys = ["model@layer:3@aaa"]
+    MemcacheStoreClient._prefetch_disk_blocks_sync(object_keys)
+    store.prefetch.assert_called_once_with(object_keys, src_media=2, dst_media=1, flags=0)
 
 
 def test_background_prefetch_skips_when_store_unavailable():
     MemcacheStoreClient._init_failed = True
-    assert MemcacheStoreClient._prefetch_disk_blocks_sync(["model@layer:3@aaa"]) is False
+    MemcacheStoreClient._prefetch_disk_blocks_sync(["model@layer:3@aaa"])
 
 
 @patch.object(MemcacheStoreClient, "_is_memcache_backend", return_value=True)
 def test_prefetch_submit_failure_is_fail_open(_mock_backend):
     with patch.object(MemcacheStoreClient, "_executor") as executor:
         executor.submit.side_effect = RuntimeError("executor stopped")
-        assert MemcacheStoreClient.prefetch_disk_blocks(["model@layer:3@aaa"]) is False
+        MemcacheStoreClient.prefetch_disk_blocks(["model@layer:3@aaa"])
+    executor.submit.assert_called_once()
 
 
 def test_is_memcache_backend_case_insensitive():

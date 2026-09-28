@@ -44,54 +44,47 @@ class MemcacheStoreClient:
     _init_failed: bool = False
     _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="memcache-prefetch")
 
-    @staticmethod
-    def hashes_to_keys(block_hashes: Iterable[Any] | None) -> list[str]:
-        """Keep non-empty MemCache object keys from ``disk_block_hashes``."""
-        return [key for key in block_hashes or [] if isinstance(key, str) and key]
-
     @classmethod
-    def prefetch_disk_blocks(cls, block_hashes: Iterable[Any] | None) -> bool:
+    def prefetch_disk_blocks(cls, object_keys: Iterable[str] | None) -> None:
         """Submit exclusive SSD-hit blocks for background DRAM prefetch.
 
-        ``keys`` are the conductor ``disk_block_hashes`` values. Calls
+        ``object_keys`` are the conductor ``disk_block_hashes`` values. Calls
         ``store.prefetch(keys, src_media=2, dst_media=1, flags=0)``
         (SSD→DRAM; the only combination MemCache currently supports).
 
         Returns as soon as the work is submitted; the scheduling path does not
-        wait for ``store.prefetch``. Empty input, a non-memcache backend, or an
-        executor error returns ``False``. Background failures are logged and
-        never affect scheduling.
+        wait for ``store.prefetch``. Empty input and non-memcache backends are
+        skipped. Submission and background failures are logged and never affect
+        scheduling.
         """
-        keys = cls.hashes_to_keys(block_hashes)
+        keys = [key for key in object_keys or () if key]
         if not keys:
-            return False
+            return
         if not cls._is_memcache_backend():
             logger.debug("skip memcache prefetch: store_backend is not memcache")
-            return False
+            return
         try:
             cls._executor.submit(cls._prefetch_disk_blocks_sync, keys)
         except RuntimeError as exc:
             logger.warning("could not submit memcache prefetch keys=%d: %s", len(keys), exc)
-            return False
+            return
         logger.debug("memcache prefetch queued keys=%d", len(keys))
-        return True
 
     @classmethod
-    def _prefetch_disk_blocks_sync(cls, keys: list[str]) -> bool:
+    def _prefetch_disk_blocks_sync(cls, keys: list[str]) -> None:
         """Run one blocking MemCache prefetch in the background executor."""
         store = cls._get_store()
         if store is None:
-            return False
+            return
         try:
             result = store.prefetch(keys, src_media=_SSD_MEDIA, dst_media=_DRAM_MEDIA, flags=0)
         except Exception as exc:  # noqa: BLE001 — fail-open on the schedule path
             logger.warning("memcache prefetch raised keys=%d: %s", len(keys), exc)
-            return False
+            return
         if result != 0:
             logger.warning("memcache prefetch failed rc=%s keys=%d", result, len(keys))
-            return False
-        logger.info("memcache prefetch submitted keys=%d", len(keys))
-        return True
+            return
+        logger.info("memcache prefetch completed keys=%d", len(keys))
 
     @classmethod
     def reset_for_tests(cls) -> None:

@@ -387,39 +387,30 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
         if not isinstance(matched_raw, dict):
             return []
         raw = matched_raw.get("disk_block_hashes") or []
-        keys: list[str] = []
         if not isinstance(raw, list):
             return []
-        for item in raw:
-            if isinstance(item, str) and item:
-                keys.append(item)
-        return keys
+        return [item for item in raw if isinstance(item, str) and item]
 
     @staticmethod
     def prefetch_ssd_hits_for_dp(
         req_info: RequestInfo | None,
         instance_id: object,
         endpoint_id: object,
-    ) -> bool:
+    ) -> None:
         """After a DP is chosen, prefetch its exclusive SSD-hit blocks into DRAM.
 
         Uses the ``disk_block_hashes`` stashed from the conductor ``/query``
-        response as MemCache ``prefetch`` keys (SSD→DRAM). Fail-open: missing
-        hashes, a non-memcache backend, or a store error never fail scheduling.
+        response as MemCache ``prefetch`` keys (SSD→DRAM).
         """
-        try:
-            if req_info is None:
-                return False
-            hashes_by_ep = getattr(req_info, "kv_disk_block_hashes", None) or {}
-            hashes = hashes_by_ep.get((instance_id, endpoint_id)) or []
-            if not hashes:
-                return False
-            from motor.coordinator.api_client.memcache_store_client import MemcacheStoreClient
+        if req_info is None:
+            return
+        hashes_by_ep = req_info.kv_disk_block_hashes or {}
+        object_keys = hashes_by_ep.get((instance_id, endpoint_id))
+        if not object_keys:
+            return
+        from motor.coordinator.api_client.memcache_store_client import MemcacheStoreClient
 
-            return MemcacheStoreClient.prefetch_disk_blocks(hashes)
-        except Exception as exc:  # noqa: BLE001 — never fail the committed allocate
-            logger.warning("SSD prefetch skipped instance=%s endpoint=%s: %s", instance_id, endpoint_id, exc)
-            return False
+        MemcacheStoreClient.prefetch_disk_blocks(object_keys)
 
     @staticmethod
     def _collect_load_candidates(

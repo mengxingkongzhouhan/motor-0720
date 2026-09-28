@@ -609,21 +609,14 @@ class TestKvCacheAffinityPolicy(unittest.TestCase):
             (2, 1): ["other@key"],
         }
 
-        self.assertTrue(KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp(req_info, 1, 0))
+        KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp(req_info, 1, 0)
         mock_prefetch.assert_called_once_with(["model@layer:3@aaa", "model@layer:3@bbb"])
 
         mock_prefetch.reset_mock()
-        self.assertFalse(KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp(req_info, 9, 9))
+        KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp(req_info, 9, 9)
         mock_prefetch.assert_not_called()
-        self.assertFalse(KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp(None, 1, 0))
+        KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp(None, 1, 0)
         mock_prefetch.assert_not_called()
-
-    @patch("motor.coordinator.api_client.memcache_store_client.MemcacheStoreClient.prefetch_disk_blocks")
-    def test_prefetch_ssd_hits_fail_open(self, mock_prefetch):
-        mock_prefetch.side_effect = RuntimeError("store down")
-        req_info = RequestInfo(req_id="r2", req_data={}, req_len=0, api="v1/completions")
-        req_info.kv_disk_block_hashes = {(1, 0): ["model@layer:3@aaa"]}
-        self.assertFalse(KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp(req_info, 1, 0))
 
     @patch('motor.coordinator.scheduler.policy.kv_cache_affinity.ConductorApiClient.query_conductor')
     @patch('motor.coordinator.scheduler.policy.kv_cache_affinity.TokenizerManager')

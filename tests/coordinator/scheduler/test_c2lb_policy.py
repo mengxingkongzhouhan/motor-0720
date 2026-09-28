@@ -238,7 +238,7 @@ class TestPickGated:
                 _cand(4, ledger_prefill=40, active=0, cpu=0),
             ]
         )
-        chosen, reason, mean_active, mean_cpu = pick_gated(ranked)
+        chosen, reason, mean_active, mean_cpu = pick_gated(ranked, 1.0, 1.0, 1.0)
         assert chosen.endpoint.id == 3
         assert reason == PICK_BOTH_GATES
         assert mean_active == 30 and mean_cpu == 25
@@ -251,7 +251,7 @@ class TestPickGated:
                 _cand(3, ledger_prefill=3, active=30, cpu=30),
             ]
         )
-        chosen, reason, _a, _c = pick_gated(ranked)
+        chosen, reason, _a, _c = pick_gated(ranked, 1.0, 1.0, 1.0)
         assert chosen.endpoint.id == 1 and reason == PICK_BOTH_GATES
 
     def test_just_above_mean_is_rejected(self):
@@ -262,7 +262,7 @@ class TestPickGated:
                 _cand(3, ledger_prefill=3, active=30, cpu=30),
             ]
         )
-        chosen, reason, _a, _c = pick_gated(ranked)
+        chosen, reason, _a, _c = pick_gated(ranked, 1.0, 1.0, 1.0)
         assert chosen.endpoint.id == 2 and reason == PICK_BOTH_GATES
 
     def test_idle_cluster_passes_both_gates(self):
@@ -279,7 +279,7 @@ class TestPickGated:
                 _cand(3, ledger_prefill=40, active=5, cpu=5, npu_hit=0.0),
             ]
         )
-        chosen, reason, _a, _c = pick_gated(ranked)
+        chosen, reason, _a, _c = pick_gated(ranked, 1.0, 1.0, 1.0)
         assert chosen.endpoint.id == 2 and reason == PICK_BOTH_GATES
 
     def test_high_npu_hit_ignored_when_load_gate_fails(self):
@@ -297,7 +297,7 @@ class TestPickGated:
         ranked = sort_candidates(
             [_cand(1, ledger_prefill=5, active=10, cpu=30), _cand(2, ledger_prefill=6, active=30, cpu=10)]
         )
-        chosen, reason, _a, _c = pick_gated(ranked)
+        chosen, reason, _a, _c = pick_gated(ranked, 1.0, 1.0, 1.0)
         assert chosen.endpoint.id == 1 and reason == PICK_MIN_LEDGER_PREFILL
 
     def test_all_equal_load_passes_gates_and_takes_lowest_ledger_prefill(self):
@@ -338,8 +338,8 @@ class TestPickGated:
                 _cand(3, ledger_prefill=3, active=30, cpu=0),
             ]
         )
-        plain, reason_plain, _a, _c = pick_gated(ranked)
-        loose, reason_loose, _a2, _c2 = pick_gated(ranked, active_tokens_mean_factor=1.2)
+        plain, reason_plain, _a, _c = pick_gated(ranked, 1.0, 1.0, 1.0)
+        loose, reason_loose, _a2, _c2 = pick_gated(ranked, 1.2, 1.0, 1.0)
         assert plain.endpoint.id == 2 and reason_plain == PICK_BOTH_GATES
         assert loose.endpoint.id == 1 and reason_loose == PICK_BOTH_GATES
 
@@ -351,8 +351,8 @@ class TestPickGated:
                 _cand(3, ledger_prefill=3, active=40, cpu=20),
             ]
         )
-        plain, _r, _a, _c = pick_gated(ranked)
-        tight, _r2, _a2, _c2 = pick_gated(ranked, active_tokens_mean_factor=0.5)
+        plain, _r, _a, _c = pick_gated(ranked, 1.0, 1.0, 1.0)
+        tight, _r2, _a2, _c2 = pick_gated(ranked, 0.5, 1.0, 1.0)
         assert plain.endpoint.id == 1
         assert tight.endpoint.id == 2
 
@@ -364,8 +364,8 @@ class TestPickGated:
                 _cand(3, ledger_prefill=3, active=50, cpu=10),
             ]
         )
-        plain, reason_plain, _a, _c = pick_gated(ranked)
-        loose, reason_loose, _a2, _c2 = pick_gated(ranked, cpu_hit_blocks_mean_factor=2.0)
+        plain, reason_plain, _a, _c = pick_gated(ranked, 1.0, 1.0, 1.0)
+        loose, reason_loose, _a2, _c2 = pick_gated(ranked, 1.0, 2.0, 1.0)
         assert plain.endpoint.id == 2 and reason_plain == PICK_BOTH_GATES
         assert loose.endpoint.id == 1 and reason_loose == PICK_BOTH_GATES
 
@@ -377,9 +377,9 @@ class TestPickGated:
                 _cand(3, ledger_prefill=20, active=5, cpu=5, npu_hit=0.0),
             ]
         )
-        plain, reason_plain, _a, _c = pick_gated(ranked)
-        loose, reason_loose, _a2, _c2 = pick_gated(ranked, isl_mean_factor=2.0)
-        tight, reason_tight, _a3, _c3 = pick_gated(ranked, isl_mean_factor=0.4)
+        plain, reason_plain, _a, _c = pick_gated(ranked, 1.0, 1.0, 1.0)
+        loose, reason_loose, _a2, _c2 = pick_gated(ranked, 1.0, 1.0, 2.0)
+        tight, reason_tight, _a3, _c3 = pick_gated(ranked, 1.0, 1.0, 0.4)
         assert plain.endpoint.id == 1 and reason_plain == PICK_BOTH_GATES
         assert loose.endpoint.id == 2 and reason_loose == PICK_BOTH_GATES
         assert tight.endpoint.id == 1 and reason_tight == PICK_BOTH_GATES
@@ -390,7 +390,7 @@ class TestPickGated:
         )
         _c, _r, active_threshold, cpu_threshold = pick_gated(ranked, -3.0, None)
         assert active_threshold == 0.0
-        assert cpu_threshold == 20.0
+        assert cpu_threshold == 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +591,7 @@ class TestPolicy:
             return sort_candidates([GatedCandidate(i, i.get_all_endpoints()[0], 0.0, 0.0) for i in insts])
 
         policy = C2LBPolicy(MockInstanceProvider())
+        policy.set_mean_factors(1.0, 1.0, 1.0)
         with patch.object(C2LBPolicy, "score_endpoints", side_effect=fake_score):
             plain = policy.select_instance_and_endpoint_from_list(instances, PDRole.ROLE_P, _req_info())
             policy.set_mean_factors(1.2, 1.0, 1.0)
@@ -655,7 +656,7 @@ class TestClientDispatch:
 
     def test_default_factors_when_config_absent(self):
         client = AsyncSchedulerClient(SchedulerClientConfig(scheduler_type="c2lb"))
-        assert (client._c2lb_active_factor, client._c2lb_cpu_factor, client._c2lb_isl_factor) == (1.0, 1.0, 1.0)
+        assert (client._c2lb_active_factor, client._c2lb_cpu_factor, client._c2lb_isl_factor) == (1.5, 1.5, 1.5)
 
     def test_prefill_uses_gated_policy(self):
         client = _client()

@@ -32,6 +32,8 @@ use super::helpers::{resolve_medium, resolve_workers};
 /// map carries its own `backend_id` (the originating LocalService's Pod
 /// IP), `event_type` ("stored"/"removed"/"cleared"), `medium`, and
 /// `seq_hashes` (uint64 array when `hash_as_int=true`, else hex strings).
+/// Optional `object_keys` is the MemCache store identity, parallel to
+/// `seq_hashes`; `/query` returns it as `disk_block_hashes`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct MemcacheEventBatch {
     #[serde(default)]
@@ -65,6 +67,14 @@ pub(crate) struct PoolEvent {
     pub(crate) seq_hashes: Option<Vec<FlexHash>>,
     #[serde(default)]
     pub(crate) block_hashes: Option<Vec<FlexHash>>,
+    /// MemCache store keys, parallel to `seq_hashes` / `block_hashes`.
+    ///
+    /// These are the identities `prefetch` needs (e.g.
+    /// `wen25-7B@pcp0@dcp1@...@<content-hash>`). Engine `block_hash` /
+    /// `seq_hashes` stay the matching key; `/query` remaps the exclusive
+    /// Disk slice through this table.
+    #[serde(default)]
+    pub(crate) object_keys: Option<Vec<String>>,
 }
 
 /// Apply a single pool backend event to the indexer.
@@ -134,6 +144,9 @@ pub(crate) fn apply_pool_event(
     let entry = indexer.get_or_create(mn, tid);
 
     let target_workers = resolve_workers(match_mode, hbm_ip_index, be_id, dp_rank, &target_media);
+    let has_disk_target = target_workers
+        .iter()
+        .any(|worker| worker.medium == StorageMedium::Disk);
 
     // One line per parsed event so a 356-event dump can be counted by
     // outcome (`stored` / `removed` / `cleared` / `no_hashes` / `no_workers`)
@@ -176,6 +189,9 @@ pub(crate) fn apply_pool_event(
             entry.apply_event(worker, &KvCacheEventData::Cleared)?;
             entry.remove_pending_worker(worker);
         }
+        if has_disk_target {
+            entry.clear_object_keys();
+        }
         return Ok(());
     }
 
@@ -190,10 +206,20 @@ pub(crate) fn apply_pool_event(
         return Ok(());
     }
 
+    let block_hashes: Vec<u64> = seq_hashes.iter().map(|h| h.0).collect();
+
+    // Record Disk store keys even when the pool event is still pending: the
+    // later offload confirmation inserts the numeric hash into Disk, and
+    // `/query` then remaps that hash through this table.
+    if is_stored && has_disk_target {
+        if let Some(ref keys) = pool_event.object_keys {
+            entry.record_object_keys(&block_hashes, keys);
+        }
+    }
+
     // ── Stored / Removed ──────────────────────────────────────────────
     for worker in &target_workers {
         if is_stored {
-            let block_hashes: Vec<u64> = seq_hashes.iter().map(|h| h.0).collect();
             let preview: Vec<u64> = block_hashes.iter().take(4).copied().collect();
             let blocks = entry.ingest_pool_blocks(&block_hashes, worker);
 
@@ -232,7 +258,6 @@ pub(crate) fn apply_pool_event(
                 }
             }
         } else if is_removed {
-            let block_hashes: Vec<u64> = seq_hashes.iter().map(|h| h.0).collect();
             let tree_hashes = entry.evict_pending_blocks(&block_hashes, worker);
 
             if tree_hashes.is_empty() {
@@ -270,6 +295,9 @@ pub(crate) fn apply_pool_event(
                 "kv_event dropped"
             );
         }
+    }
+    if is_removed && has_disk_target {
+        entry.remove_object_keys(&block_hashes);
     }
 
     Ok(())

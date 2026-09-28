@@ -97,9 +97,12 @@ struct MediumEnds {
     /// sits in this DP's own Pod — hence on its own machine. The remainder of
     /// `cpu - npu` is what has to come over the wire.
     cpu_local: u32,
-    /// Engine `block_hash` of the exclusive Disk slice, prefix order.
+    /// Store identities of the exclusive Disk slice, prefix order.
     /// Same range as `disk_blocks`: `[max(npu, cpu), disk)`.
-    disk_hashes: Vec<u64>,
+    ///
+    /// Contains only MemCache `object_key`s recorded from pool events.
+    /// Disk blocks without an object key are omitted.
+    disk_object_keys: Vec<String>,
 }
 
 /// The two accumulators a matching pass writes into.
@@ -214,6 +217,11 @@ pub(crate) struct OffloadPoolState {
     /// `block_hash → workers`: pool events waiting for offload `tokens_hash`.
     /// Values are `FxHashSet` to deduplicate repeated deliveries.
     pub(crate) pending_pool: FxHashMap<u64, FxHashSet<PendingPoolEvent>>,
+    /// Engine `block_hash` → MemCache `object_key`, filled from Disk stored
+    /// events and removed with the corresponding Disk removed/cleared events.
+    /// `/query` remaps the exclusive Disk slice through this table so prefetch
+    /// gets the store key, not the numeric seq_hash.
+    pub(crate) object_keys: FxHashMap<u64, String>,
 }
 
 /// Key identifying a unique indexer instance: (model_name, tenant_id).
@@ -616,11 +624,8 @@ impl IndexerEntry {
                 sink.medium_ends
                     .entry((instance_id.clone(), *dp_rank))
                     .or_default()
-                    .disk_hashes = reached
-                    .blocks_from(exclusive_from)
-                    .iter()
-                    .map(|h| h.0)
-                    .collect();
+                    .disk_object_keys =
+                    self.resolve_disk_object_keys(reached.blocks_from(exclusive_from));
             }
             if let Some(local) = local {
                 Self::note_local_hits(sink.medium_ends, instance_id, *dp_rank, medium, local);
@@ -725,6 +730,54 @@ impl IndexerEntry {
             return Some((cached.content.parent_hash, cached.content.tokens_hash));
         }
         None
+    }
+
+    /// Record MemCache `object_keys` against the parallel engine hashes.
+    ///
+    /// Arrays are zipped; a shorter side is truncated. Empty keys are
+    /// ignored so a later event can still fill them. Last writer wins —
+    /// the store key is content-addressed, so repeats are the same string.
+    pub(crate) fn record_object_keys(&self, block_hashes: &[u64], object_keys: &[String]) {
+        if object_keys.is_empty() || block_hashes.is_empty() {
+            return;
+        }
+        let mut state = self.offload_pool_state.write();
+        for (hash, key) in block_hashes.iter().zip(object_keys.iter()) {
+            if !key.is_empty() {
+                state.object_keys.insert(*hash, key.clone());
+            }
+        }
+    }
+
+    /// Remove store keys after the pool reports the corresponding objects removed.
+    pub(crate) fn remove_object_keys(&self, block_hashes: &[u64]) {
+        if block_hashes.is_empty() {
+            return;
+        }
+        let mut state = self.offload_pool_state.write();
+        for hash in block_hashes {
+            state.object_keys.remove(hash);
+        }
+    }
+
+    /// Clear store keys when the pool clears all objects for this model/tenant.
+    pub(crate) fn clear_object_keys(&self) {
+        self.offload_pool_state.write().object_keys.clear();
+    }
+
+    /// Resolve exclusive Disk blocks to MemCache object keys for `/query`.
+    ///
+    /// Blocks without a recorded `object_key` are omitted. Numeric engine
+    /// hashes are matching identities, not valid MemCache prefetch keys.
+    fn resolve_disk_object_keys(&self, hashes: &[SequenceBlockHash]) -> Vec<String> {
+        if hashes.is_empty() {
+            return Vec::new();
+        }
+        let state = self.offload_pool_state.read();
+        hashes
+            .iter()
+            .filter_map(|h| state.object_keys.get(&h.0).cloned())
+            .collect()
     }
 
     /// Ingest pool backend blocks from Mooncake / YuanRong stored events.
@@ -1331,12 +1384,11 @@ impl Indexer {
             dp_match.npu_blocks = npu;
             dp_match.cpu_blocks = cpu;
             dp_match.disk_blocks = disk;
-            debug_assert_eq!(
-                ends.disk_hashes.len() as u32,
-                disk,
-                "disk_block_hashes must match exclusive disk_blocks"
+            debug_assert!(
+                ends.disk_object_keys.len() as u32 <= disk,
+                "disk_block_hashes cannot exceed exclusive disk_blocks"
             );
-            dp_match.disk_block_hashes = ends.disk_hashes.clone();
+            dp_match.disk_block_hashes = ends.disk_object_keys.clone();
             dp_match.matched_tokens = covered.saturating_mul(block_size);
             if self.query_options.split_cpu_hits {
                 // `cpu_local` is counted over the same exclusive range as `cpu`,

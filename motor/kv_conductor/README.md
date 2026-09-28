@@ -221,8 +221,9 @@ Coordinator                                  KV Conductor
       │            "npu_blocks": 1,            │  <- exclusive NPU blocks
       │            "cpu_blocks": 0,            │  <- exclusive CPU beyond NPU
       │            "disk_blocks": 2,           │  <- exclusive Disk beyond max(NPU,CPU)
-      │            "disk_block_hashes": [      │  <- those 2 exclusive Disk blocks'
-      │              201, 202]                 │     engine block_hash (prefix order)
+      │            "disk_block_hashes": [      │  <- exclusive Disk blocks'
+      │              "wen25-7B@...@<hash-a>",   │     recorded MemCache object_key;
+      │              "wen25-7B@...@<hash-b>"]  │     blocks without keys are omitted
       │          }                             │
       │        }                               │
       │      }                                 │
@@ -244,7 +245,7 @@ Coordinator                                  KV Conductor
 | 字段 | 含义 |
 |------|------|
 | `npu_blocks` / `cpu_blocks` / `disk_blocks` | 该 DP 互斥真实命中块数（同前缀副本只归最高优先级介质） |
-| `disk_block_hashes` | 互斥 Disk 块的引擎 `block_hash`（前缀顺序），与 `disk_blocks` 一一对应。同前缀已归到 NPU/CPU 的副本不列入。无互斥 Disk 命中时省略 |
+| `disk_block_hashes` | 互斥 Disk 块中已上报的 MemCache `object_keys`（前缀顺序，供 prefetch 使用）。未上报 object key 的块直接省略，不再回退为数字 `block_hash`，因此数组可能短于 `disk_blocks`。同前缀已归到 NPU/CPU 的副本不列入；数组为空时字段省略 |
 | `matched_tokens` | 互斥块数之和 × `block_size`（真实覆盖长度） |
 | `longest_matched` | 该实例所有 DP 的 `matched_tokens` 最大值 |
 | `cpu_local_blocks` / `cpu_remote_blocks` | `cpu_blocks` 按搬运代价拆开：本 Pod DRAM（几乎免费）/ 需要传输。**默认不下发**，需 `--split-cpu-hits` 开启 |
@@ -259,8 +260,8 @@ Coordinator                                  KV Conductor
 **默认关闭**：关闭时 `/query` 响应每个 DP 不下发 `cpu_local_blocks` / `cpu_remote_blocks`
 （无 SSD 命中时只剩 `matched_tokens` / `npu_blocks` / `cpu_blocks` / `disk_blocks`
 四个字段），走查也不做逐块 owner 统计；开启后才多出本地/远端拆分。开关只影响这两个
-字段的有无，`cpu_blocks` 等覆盖数值不变。有互斥 Disk 命中时下发 `disk_block_hashes`
-（与 `disk_blocks` 一一对应），与该开关无关。
+字段的有无，`cpu_blocks` 等覆盖数值不变。有互斥 Disk 命中且记录了 MemCache object key
+时下发 `disk_block_hashes`，与该开关无关。
 
 判断依据是**边的 owner**：一条池事件会广播给上报它的那个 Pod 里的所有 DP，所以「owner 里有
 当前 DP」等价于「这块在当前 DP 自己的 Pod 里」，而同 Pod 必然同机 —— 于是这就是一次免搬运

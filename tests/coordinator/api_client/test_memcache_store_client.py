@@ -42,40 +42,56 @@ def test_prefetch_skips_empty_keys():
 
 @patch.object(MemcacheStoreClient, "_is_memcache_backend", return_value=False)
 def test_prefetch_skips_non_memcache_backend(_mock_backend):
-    assert MemcacheStoreClient.prefetch_disk_blocks([201, 202]) is False
+    assert MemcacheStoreClient.prefetch_disk_blocks(["model@layer:3@aaa"]) is False
 
 
 @patch.object(MemcacheStoreClient, "_is_memcache_backend", return_value=True)
-def test_prefetch_calls_store_ssd_to_dram(_mock_backend):
+def test_prefetch_queues_work_without_calling_store(_mock_backend):
+    store = Mock()
+    MemcacheStoreClient._store = store
+    object_keys = ["model@layer:3@aaa", "model@layer:3@bbb"]
+
+    with patch.object(MemcacheStoreClient, "_executor") as executor:
+        assert MemcacheStoreClient.prefetch_disk_blocks(object_keys) is True
+
+    executor.submit.assert_called_once_with(MemcacheStoreClient._prefetch_disk_blocks_sync, object_keys)
+    store.prefetch.assert_not_called()
+
+
+def test_background_prefetch_calls_store_ssd_to_dram():
     store = Mock()
     store.prefetch.return_value = 0
     MemcacheStoreClient._store = store
     object_keys = ["model@layer:3@aaa", "model@layer:3@bbb"]
 
-    assert MemcacheStoreClient.prefetch_disk_blocks(object_keys) is True
+    assert MemcacheStoreClient._prefetch_disk_blocks_sync(object_keys) is True
     store.prefetch.assert_called_once_with(object_keys, src_media=2, dst_media=1, flags=0)
 
 
-@patch.object(MemcacheStoreClient, "_is_memcache_backend", return_value=True)
-def test_prefetch_nonzero_rc_is_fail_open(_mock_backend):
+def test_background_prefetch_nonzero_rc_is_fail_open():
     store = Mock()
     store.prefetch.return_value = 7
     MemcacheStoreClient._store = store
-    assert MemcacheStoreClient.prefetch_disk_blocks([201]) is False
+    assert MemcacheStoreClient._prefetch_disk_blocks_sync(["model@layer:3@aaa"]) is False
 
 
-@patch.object(MemcacheStoreClient, "_is_memcache_backend", return_value=True)
-def test_prefetch_exception_is_fail_open(_mock_backend):
+def test_background_prefetch_exception_is_fail_open():
     store = Mock()
     store.prefetch.side_effect = RuntimeError("meta down")
     MemcacheStoreClient._store = store
-    assert MemcacheStoreClient.prefetch_disk_blocks([201]) is False
+    assert MemcacheStoreClient._prefetch_disk_blocks_sync(["model@layer:3@aaa"]) is False
+
+
+def test_background_prefetch_skips_when_store_unavailable():
+    MemcacheStoreClient._init_failed = True
+    assert MemcacheStoreClient._prefetch_disk_blocks_sync(["model@layer:3@aaa"]) is False
 
 
 @patch.object(MemcacheStoreClient, "_is_memcache_backend", return_value=True)
-def test_prefetch_skips_when_store_unavailable(_mock_backend):
-    MemcacheStoreClient._init_failed = True
-    assert MemcacheStoreClient.prefetch_disk_blocks([201]) is False
+def test_prefetch_submit_failure_is_fail_open(_mock_backend):
+    with patch.object(MemcacheStoreClient, "_executor") as executor:
+        executor.submit.side_effect = RuntimeError("executor stopped")
+        assert MemcacheStoreClient.prefetch_disk_blocks(["model@layer:3@aaa"]) is False
 
 
 def test_is_memcache_backend_case_insensitive():

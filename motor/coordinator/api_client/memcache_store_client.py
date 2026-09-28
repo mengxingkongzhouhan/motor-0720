@@ -18,6 +18,7 @@ it does not allocate a local DRAM/HBM pool.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import threading
 from typing import Any, Iterable
 
@@ -41,6 +42,7 @@ class MemcacheStoreClient:
     _lock = threading.Lock()
     _store: Any = None
     _init_failed: bool = False
+    _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="memcache-prefetch")
 
     @staticmethod
     def hashes_to_keys(block_hashes: Iterable[Any] | None) -> list[str]:
@@ -49,14 +51,16 @@ class MemcacheStoreClient:
 
     @classmethod
     def prefetch_disk_blocks(cls, block_hashes: Iterable[Any] | None) -> bool:
-        """Prefetch exclusive SSD-hit blocks into DRAM.
+        """Submit exclusive SSD-hit blocks for background DRAM prefetch.
 
         ``keys`` are the conductor ``disk_block_hashes`` values. Calls
         ``store.prefetch(keys, src_media=2, dst_media=1, flags=0)``
         (SSD→DRAM; the only combination MemCache currently supports).
 
-        Fail-open: empty input, a non-memcache backend, a missing package, or
-        a store error logs and returns ``False`` — scheduling is not affected.
+        Returns as soon as the work is submitted; the scheduling path does not
+        wait for ``store.prefetch``. Empty input, a non-memcache backend, or an
+        executor error returns ``False``. Background failures are logged and
+        never affect scheduling.
         """
         keys = cls.hashes_to_keys(block_hashes)
         if not keys:
@@ -64,6 +68,17 @@ class MemcacheStoreClient:
         if not cls._is_memcache_backend():
             logger.debug("skip memcache prefetch: store_backend is not memcache")
             return False
+        try:
+            cls._executor.submit(cls._prefetch_disk_blocks_sync, keys)
+        except RuntimeError as exc:
+            logger.warning("could not submit memcache prefetch keys=%d: %s", len(keys), exc)
+            return False
+        logger.debug("memcache prefetch queued keys=%d", len(keys))
+        return True
+
+    @classmethod
+    def _prefetch_disk_blocks_sync(cls, keys: list[str]) -> bool:
+        """Run one blocking MemCache prefetch in the background executor."""
         store = cls._get_store()
         if store is None:
             return False

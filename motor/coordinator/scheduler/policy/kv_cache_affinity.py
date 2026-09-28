@@ -382,20 +382,25 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
         )
 
     @staticmethod
-    def _disk_block_hashes(matched_raw: object) -> list[int]:
-        """Exclusive SSD-hit engine ``block_hash`` values from a conductor DP entry."""
+    def _disk_block_hashes(matched_raw: object) -> list[str]:
+        """Exclusive SSD-hit MemCache object keys from a conductor DP entry."""
         if not isinstance(matched_raw, dict):
             return []
         raw = matched_raw.get("disk_block_hashes") or []
-        hashes: list[int] = []
+        keys: list[str] = []
         if not isinstance(raw, list):
             return []
         for item in raw:
-            try:
-                hashes.append(int(item))
-            except (TypeError, ValueError):
+            if isinstance(item, str):
+                key = item
+            elif isinstance(item, int) and not isinstance(item, bool):
+                # Compatibility with a rolling-upgrade conductor from before PR #39.
+                key = str(item)
+            else:
                 continue
-        return hashes
+            if key:
+                keys.append(key)
+        return keys
 
     @staticmethod
     def prefetch_ssd_hits_for_dp(
@@ -436,7 +441,7 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
     ) -> tuple[
         list[tuple[float, int, float, Instance, Endpoint, tuple[int, int, int] | None]],
         bool,
-        dict[tuple[object, object], list[int]],
+        dict[tuple[object, object], list[str]],
     ]:
         """
         Build the per-endpoint scoring tuples shared by the load-aware selection modes.
@@ -448,10 +453,11 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
         reports per-medium blocks. Returns ``(candidates, any_instance, disk_hash_map)``;
         ``any_instance`` distinguishes "conductor reported nothing for our instances" (fall back)
         from "reported, but no endpoints". ``disk_hash_map`` is the exclusive SSD
-        ``disk_block_hashes`` keyed by ``(instance_id, endpoint_id)``.
+        MemCache object keys from ``disk_block_hashes``, keyed by
+        ``(instance_id, endpoint_id)``.
         """
         candidates: list[tuple[float, int, float, Instance, Endpoint, tuple[int, int, int] | None]] = []
-        disk_hash_map: dict[tuple[object, object], list[int]] = {}
+        disk_hash_map: dict[tuple[object, object], list[str]] = {}
         any_instance = False
         for instance in instances:
             instance_data = tenant.get(conductor_instance_id(instance), None)

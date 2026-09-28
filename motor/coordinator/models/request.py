@@ -76,9 +76,10 @@ class RequestInfo(BaseModel):
     kv_disk_block_hashes: dict | None = Field(
         default=None,
         exclude=True,
-        description="Per-endpoint exclusive SSD-hit engine block hashes from the conductor "
-        "``disk_block_hashes`` field. Keyed by (instance_id, endpoint_id). Used after the "
-        "final DP is chosen to MemCache-prefetch those keys SSD→DRAM.",
+        description="Per-endpoint exclusive SSD-hit MemCache object keys from the conductor "
+        "``disk_block_hashes`` field. Keyed by (instance_id, endpoint_id). Numeric strings "
+        "are possible as a conductor fallback. Used after the final DP is chosen to "
+        "MemCache-prefetch those keys SSD→DRAM.",
     )
     api: str = Field(..., description="API need to be forwarded")
     entry_api: str = Field(

@@ -1030,7 +1030,10 @@ class TestSelectAndAllocateCas:
         client, writer = await _client_with_shm(im, name)
         _seed_shm_tokens(writer, 1, 10, 1.0)
         req = RequestInfo(req_id="req-pf", req_data={}, req_len=8, api="completions", token_ids=[1, 2, 3, 4])
-        req.kv_disk_block_hashes = {(1, 10): [201, 202], (2, 20): [900]}
+        req.kv_disk_block_hashes = {
+            (1, 10): ["model@layer:3@aaa", "model@layer:3@bbb"],
+            (2, 20): ["other@key"],
+        }
         try:
             with patch(
                 "motor.coordinator.scheduler.runtime.scheduler_client.KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp"

@@ -494,12 +494,13 @@ class TestKvCacheAffinityPolicy(unittest.TestCase):
         self.assertEqual(debug[3], (768, 128, 0))
 
     def test_disk_block_hashes_from_conductor_dp(self):
-        """Exclusive SSD hashes are ints; junk values are skipped."""
+        """MemCache object keys are preserved; old numeric hashes become strings."""
+        object_key = "model@layer:3@content-hash"
         self.assertEqual(
             KvCacheAffinityPolicy._disk_block_hashes(
-                {"disk_blocks": 2, "disk_block_hashes": [201, "202", "x", None]}
+                {"disk_blocks": 3, "disk_block_hashes": [object_key, "202", 201, None, True]}
             ),
-            [201, 202],
+            [object_key, "202", "201"],
         )
         self.assertEqual(KvCacheAffinityPolicy._disk_block_hashes(200), [])
         self.assertEqual(KvCacheAffinityPolicy._disk_block_hashes({"matched_tokens": 120}), [])
@@ -535,7 +536,7 @@ class TestKvCacheAffinityPolicy(unittest.TestCase):
                             "cpu_blocks": 0,
                             "disk_blocks": 2,
                             "matched_tokens": 384,
-                            "disk_block_hashes": [201, 202],
+                            "disk_block_hashes": ["model@layer:3@aaa", "model@layer:3@bbb"],
                         },
                         "1": {
                             "npu_blocks": 2,
@@ -550,7 +551,10 @@ class TestKvCacheAffinityPolicy(unittest.TestCase):
 
         result = KvCacheAffinityPolicy.select_endpoint_from_list(instances, mock_req_info, load_weight=0.0)
         self.assertIsNotNone(result)
-        self.assertEqual(mock_req_info.kv_disk_block_hashes[(7, 0)], [201, 202])
+        self.assertEqual(
+            mock_req_info.kv_disk_block_hashes[(7, 0)],
+            ["model@layer:3@aaa", "model@layer:3@bbb"],
+        )
         self.assertNotIn((7, 1), mock_req_info.kv_disk_block_hashes)
 
     @patch.object(KvCacheAffinityPolicy, "_conductor_block_size", return_value=128)
@@ -579,7 +583,7 @@ class TestKvCacheAffinityPolicy(unittest.TestCase):
                             "cpu_blocks": 0,
                             "disk_blocks": 2,
                             "matched_tokens": 256,
-                            "disk_block_hashes": [300, 301],
+                            "disk_block_hashes": ["model@layer:4@aaa", "model@layer:4@bbb"],
                         }
                     }
                 }
@@ -590,17 +594,23 @@ class TestKvCacheAffinityPolicy(unittest.TestCase):
             [mock_instance], mock_req_info, mode="load_gated", load_gate_topn=1
         )
         self.assertIsNotNone(result)
-        self.assertEqual(mock_req_info.kv_disk_block_hashes[(3, 0)], [300, 301])
+        self.assertEqual(
+            mock_req_info.kv_disk_block_hashes[(3, 0)],
+            ["model@layer:4@aaa", "model@layer:4@bbb"],
+        )
 
     @patch("motor.coordinator.api_client.memcache_store_client.MemcacheStoreClient.prefetch_disk_blocks")
     def test_prefetch_ssd_hits_for_committed_dp(self, mock_prefetch):
         """Only the final DP's stashed exclusive hashes are prefetched."""
         mock_prefetch.return_value = True
         req_info = RequestInfo(req_id="r1", req_data={}, req_len=0, api="v1/completions")
-        req_info.kv_disk_block_hashes = {(1, 0): [201, 202], (2, 1): [900]}
+        req_info.kv_disk_block_hashes = {
+            (1, 0): ["model@layer:3@aaa", "model@layer:3@bbb"],
+            (2, 1): ["other@key"],
+        }
 
         self.assertTrue(KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp(req_info, 1, 0))
-        mock_prefetch.assert_called_once_with([201, 202])
+        mock_prefetch.assert_called_once_with(["model@layer:3@aaa", "model@layer:3@bbb"])
 
         mock_prefetch.reset_mock()
         self.assertFalse(KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp(req_info, 9, 9))
@@ -612,7 +622,7 @@ class TestKvCacheAffinityPolicy(unittest.TestCase):
     def test_prefetch_ssd_hits_fail_open(self, mock_prefetch):
         mock_prefetch.side_effect = RuntimeError("store down")
         req_info = RequestInfo(req_id="r2", req_data={}, req_len=0, api="v1/completions")
-        req_info.kv_disk_block_hashes = {(1, 0): [201]}
+        req_info.kv_disk_block_hashes = {(1, 0): ["model@layer:3@aaa"]}
         self.assertFalse(KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp(req_info, 1, 0))
 
     @patch('motor.coordinator.scheduler.policy.kv_cache_affinity.ConductorApiClient.query_conductor')

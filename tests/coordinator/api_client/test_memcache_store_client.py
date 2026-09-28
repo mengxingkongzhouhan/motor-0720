@@ -24,10 +24,15 @@ def _reset_store_client():
     MemcacheStoreClient.reset_for_tests()
 
 
-def test_hashes_to_keys_decimal_strings():
-    assert MemcacheStoreClient.hashes_to_keys([201, "202", 203]) == ["201", "202", "203"]
+def test_hashes_to_keys_preserves_object_keys():
+    object_key = "wen25-7B@pcp0@dcp1@head_or_tp_rank:0@group:0@cache_role:kv@abc"
+    assert MemcacheStoreClient.hashes_to_keys([object_key, "202", 203]) == [
+        object_key,
+        "202",
+        "203",
+    ]
     assert MemcacheStoreClient.hashes_to_keys(None) == []
-    assert MemcacheStoreClient.hashes_to_keys(["x", None, 1.5]) == ["1"]
+    assert MemcacheStoreClient.hashes_to_keys(["x", "", None, True, 1.5]) == ["x"]
 
 
 def test_prefetch_skips_empty_keys():
@@ -45,9 +50,10 @@ def test_prefetch_calls_store_ssd_to_dram(_mock_backend):
     store = Mock()
     store.prefetch.return_value = 0
     MemcacheStoreClient._store = store
+    object_keys = ["model@layer:3@aaa", "model@layer:3@bbb"]
 
-    assert MemcacheStoreClient.prefetch_disk_blocks([201, 202]) is True
-    store.prefetch.assert_called_once_with(["201", "202"], src_media=2, dst_media=1, flags=0)
+    assert MemcacheStoreClient.prefetch_disk_blocks(object_keys) is True
+    store.prefetch.assert_called_once_with(object_keys, src_media=2, dst_media=1, flags=0)
 
 
 @patch.object(MemcacheStoreClient, "_is_memcache_backend", return_value=True)

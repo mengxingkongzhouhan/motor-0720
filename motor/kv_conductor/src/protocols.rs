@@ -968,7 +968,7 @@ mod tests {
                 npu_blocks: 1,
                 cpu_blocks: 0,
                 disk_blocks: 2,
-                disk_block_hashes: vec!["201".into(), "202".into()],
+                disk_block_hashes: vec!["object-key-a".into(), "object-key-b".into()],
                 ..Default::default()
             },
         );
@@ -977,7 +977,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             parsed["DP"]["0"]["disk_block_hashes"],
-            serde_json::json!(["201", "202"])
+            serde_json::json!(["object-key-a", "object-key-b"])
         );
         assert_eq!(parsed["DP"]["0"]["disk_blocks"], 2);
     }
@@ -1216,7 +1216,7 @@ mod tests {
                 // 2 of the 3 pooled blocks are on this DP's own machine.
                 cpu_local_blocks: Some(2),
                 cpu_remote_blocks: Some(1),
-                disk_block_hashes: vec!["900".into(), "901".into()],
+                disk_block_hashes: vec!["object-key-a".into(), "object-key-b".into()],
             },
         );
         instances.insert(
@@ -1259,7 +1259,7 @@ mod tests {
         assert_eq!(dps["1"]["cpu_remote_blocks"], 1);
         assert_eq!(
             dps["1"]["disk_block_hashes"],
-            serde_json::json!(["900", "901"])
+            serde_json::json!(["object-key-a", "object-key-b"])
         );
     }
 

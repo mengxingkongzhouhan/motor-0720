@@ -100,8 +100,8 @@ struct MediumEnds {
     /// Store identities of the exclusive Disk slice, prefix order.
     /// Same range as `disk_blocks`: `[max(npu, cpu), disk)`.
     ///
-    /// Prefer the MemCache `object_key` recorded from the pool event;
-    /// fall back to the decimal engine `block_hash` when no key was seen.
+    /// Contains only MemCache `object_key`s recorded from pool events.
+    /// Disk blocks without an object key are omitted.
     disk_hashes: Vec<String>,
 }
 
@@ -624,7 +624,7 @@ impl IndexerEntry {
                 sink.medium_ends
                     .entry((instance_id.clone(), *dp_rank))
                     .or_default()
-                    .disk_hashes = self.resolve_disk_block_ids(reached.blocks_from(exclusive_from));
+                    .disk_hashes = self.resolve_disk_object_keys(reached.blocks_from(exclusive_from));
             }
             if let Some(local) = local {
                 Self::note_local_hits(sink.medium_ends, instance_id, *dp_rank, medium, local);
@@ -748,26 +748,18 @@ impl IndexerEntry {
         }
     }
 
-    /// Map exclusive Disk `block_hash`es to the identities `/query` returns.
+    /// Resolve exclusive Disk blocks to MemCache object keys for `/query`.
     ///
-    /// Prefers the MemCache `object_key` recorded from the pool event.
-    /// Blocks that never carried `object_keys` (engine-only Disk inserts,
-    /// Mooncake) fall back to the decimal engine hash so the
-    /// `len == disk_blocks` invariant still holds.
-    fn resolve_disk_block_ids(&self, hashes: &[SequenceBlockHash]) -> Vec<String> {
+    /// Blocks without a recorded `object_key` are omitted. Numeric engine
+    /// hashes are matching identities, not valid MemCache prefetch keys.
+    fn resolve_disk_object_keys(&self, hashes: &[SequenceBlockHash]) -> Vec<String> {
         if hashes.is_empty() {
             return Vec::new();
         }
         let state = self.offload_pool_state.read();
         hashes
             .iter()
-            .map(|h| {
-                state
-                    .object_keys
-                    .get(&h.0)
-                    .cloned()
-                    .unwrap_or_else(|| h.0.to_string())
-            })
+            .filter_map(|h| state.object_keys.get(&h.0).cloned())
             .collect()
     }
 
@@ -1375,10 +1367,9 @@ impl Indexer {
             dp_match.npu_blocks = npu;
             dp_match.cpu_blocks = cpu;
             dp_match.disk_blocks = disk;
-            debug_assert_eq!(
-                ends.disk_hashes.len() as u32,
-                disk,
-                "disk_block_hashes must match exclusive disk_blocks"
+            debug_assert!(
+                ends.disk_hashes.len() as u32 <= disk,
+                "disk_block_hashes cannot exceed exclusive disk_blocks"
             );
             dp_match.disk_block_hashes = ends.disk_hashes.clone();
             dp_match.matched_tokens = covered.saturating_mul(block_size);

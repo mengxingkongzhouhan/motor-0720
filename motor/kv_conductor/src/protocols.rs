@@ -307,10 +307,9 @@ pub struct DpBlocks {
     /// partitioning, only the blocks beyond `max(npu_end, cpu_end)`.
     ///
     /// For MemCache this is the event's `object_keys` (the prefetch key),
-    /// not the numeric engine `seq_hashes` / `block_hash`. Blocks that
-    /// never carried `object_keys` fall back to the decimal engine hash
-    /// so the `len == disk_blocks` invariant still holds. Empty / omitted
-    /// when there is no exclusive Disk contribution.
+    /// not the numeric engine `seq_hashes` / `block_hash`. Blocks without
+    /// a recorded object key are omitted, so this list may be shorter than
+    /// `disk_blocks`. Empty lists are omitted from the response.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disk_block_hashes: Vec<String>,
     /// How `cpu_blocks` splits by how far the block has to travel.

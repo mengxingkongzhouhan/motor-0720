@@ -32,6 +32,8 @@ use super::helpers::{resolve_medium, resolve_workers};
 /// map carries its own `backend_id` (the originating LocalService's Pod
 /// IP), `event_type` ("stored"/"removed"/"cleared"), `medium`, and
 /// `seq_hashes` (uint64 array when `hash_as_int=true`, else hex strings).
+/// Optional `object_keys` is the MemCache store identity, parallel to
+/// `seq_hashes`; `/query` returns it as `disk_block_hashes`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct MemcacheEventBatch {
     #[serde(default)]
@@ -39,7 +41,7 @@ pub(crate) struct MemcacheEventBatch {
 }
 
 /// Deserialized msgpack event from a pool backend ZMQ PUB frame.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub(crate) struct PoolEvent {
     #[serde(default)]
     pub(crate) event_id: u64,
@@ -65,6 +67,14 @@ pub(crate) struct PoolEvent {
     pub(crate) seq_hashes: Option<Vec<FlexHash>>,
     #[serde(default)]
     pub(crate) block_hashes: Option<Vec<FlexHash>>,
+    /// MemCache store keys, parallel to `seq_hashes` / `block_hashes`.
+    ///
+    /// These are the identities `prefetch` needs (e.g.
+    /// `wen25-7B@pcp0@dcp1@...@<content-hash>`). Engine `block_hash` /
+    /// `seq_hashes` stay the matching key; `/query` remaps the exclusive
+    /// Disk slice through this table.
+    #[serde(default)]
+    pub(crate) object_keys: Option<Vec<String>>,
 }
 
 /// Apply a single pool backend event to the indexer.
@@ -188,6 +198,16 @@ pub(crate) fn apply_pool_event(
             "kv_event dropped"
         );
         return Ok(());
+    }
+
+    // Record store keys even when the pool event is still pending: the
+    // later offload confirmation inserts the numeric hash into Disk, and
+    // `/query` then remaps that hash through this table.
+    if is_stored {
+        if let Some(ref keys) = pool_event.object_keys {
+            let hashes: Vec<u64> = seq_hashes.iter().map(|h| h.0).collect();
+            entry.record_object_keys(&hashes, keys);
+        }
     }
 
     // ── Stored / Removed ──────────────────────────────────────────────

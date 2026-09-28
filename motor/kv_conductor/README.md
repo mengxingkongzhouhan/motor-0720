@@ -222,7 +222,8 @@ Coordinator                                  KV Conductor
       │            "cpu_blocks": 0,            │  <- exclusive CPU beyond NPU
       │            "disk_blocks": 2,           │  <- exclusive Disk beyond max(NPU,CPU)
       │            "disk_block_hashes": [      │  <- those 2 exclusive Disk blocks'
-      │              201, 202]                 │     engine block_hash (prefix order)
+      │              "wen25-7B@...@<hash-a>",   │     MemCache object_key (or decimal
+      │              "wen25-7B@...@<hash-b>"]  │     engine block_hash if no key)
       │          }                             │
       │        }                               │
       │      }                                 │
@@ -244,7 +245,7 @@ Coordinator                                  KV Conductor
 | 字段 | 含义 |
 |------|------|
 | `npu_blocks` / `cpu_blocks` / `disk_blocks` | 该 DP 互斥真实命中块数（同前缀副本只归最高优先级介质） |
-| `disk_block_hashes` | 互斥 Disk 块的引擎 `block_hash`（前缀顺序），与 `disk_blocks` 一一对应。同前缀已归到 NPU/CPU 的副本不列入。无互斥 Disk 命中时省略 |
+| `disk_block_hashes` | 互斥 Disk 块的 store 身份（前缀顺序），与 `disk_blocks` 一一对应。MemCache 上报了 `object_keys` 时就是该数组（prefetch 用的 key）；否则回退为引擎 `block_hash` 的十进制字符串。同前缀已归到 NPU/CPU 的副本不列入。无互斥 Disk 命中时省略 |
 | `matched_tokens` | 互斥块数之和 × `block_size`（真实覆盖长度） |
 | `longest_matched` | 该实例所有 DP 的 `matched_tokens` 最大值 |
 | `cpu_local_blocks` / `cpu_remote_blocks` | `cpu_blocks` 按搬运代价拆开：本 Pod DRAM（几乎免费）/ 需要传输。**默认不下发**，需 `--split-cpu-hits` 开启 |

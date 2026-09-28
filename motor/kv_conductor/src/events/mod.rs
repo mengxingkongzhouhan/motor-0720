@@ -13,11 +13,12 @@
 //! Supports two event source formats:
 //!
 //! 1. **Pool backend** (Mooncake / Memcache / YuanRong): `PoolEvent` with
-//!    `seq_hashes`/`block_hashes`, processed by `apply_pool_event`.  No
-//!    `token_ids` on the wire — `tokens_hash` comes from the engine offload
-//!    cache, retained content (TTL-bounded),
+//!    `seq_hashes`/`block_hashes` (and MemCache `object_keys`), processed
+//!    by `apply_pool_event`.  No `token_ids` on the wire — `tokens_hash`
+//!    comes from the engine offload cache, retained content (TTL-bounded),
 //!    or a prior lower-tier insert via the two-phase match (CPU→Disk
-//!    promotion).
+//!    promotion).  `object_keys` is the store identity `/query` returns as
+//!    `disk_block_hashes`; matching still uses the numeric hash.
 //!
 //! 2. **vLLM engine** (native): `VllmEventMap` with `token_ids` + `block_size`,
 //!    processed by `apply_vllm_event`.  `tokens_hash` is re-computed from

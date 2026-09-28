@@ -71,7 +71,7 @@ BLOCK_SIZE = 128
 C2LB_ROLES = frozenset({PDRole.ROLE_P, PDRole.ROLE_U})
 
 # Gate threshold = candidate mean * factor; 1.0 is the plain average.
-DEFAULT_MEAN_FACTOR = 1.0
+DEFAULT_MEAN_FACTOR = 1.5
 _TOKENIZER_LOAD_RETRY_SECONDS = 30.0
 
 # C2LB discounts a cached prefix 1:1 against prompt length. Not configurable; not shared with

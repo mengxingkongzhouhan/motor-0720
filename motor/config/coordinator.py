@@ -411,11 +411,11 @@ class C2LBConfig:
 
     # Multiplier on the candidates' mean active_tokens. >1 loosens the gate (more endpoints pass,
     # ordering by ledger isl dominates), <1 tightens it (only clearly idle endpoints pass).
-    active_tokens_mean_factor: float = 1.0
+    active_tokens_mean_factor: float = 1.5
     # Multiplier on the candidates' mean cpu_hit_blocks, same semantics.
-    cpu_hit_blocks_mean_factor: float = 1.0
+    cpu_hit_blocks_mean_factor: float = 1.5
     # Multiplier on the candidates' mean isl. Used by the high-NPU three-gate path.
-    isl_mean_factor: float = 1.0
+    isl_mean_factor: float = 1.5
 
 
 @dataclass

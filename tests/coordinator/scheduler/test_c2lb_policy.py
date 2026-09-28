@@ -499,6 +499,16 @@ class TestPolicy:
         assert SchedulerType.from_string("c2lb") is SchedulerType.C2LB
         assert CANDIDATE_POLICY_C2LB in KNOWN_CANDIDATE_POLICIES
 
+    def test_default_mean_factors_are_1_5(self):
+        config = CoordinatorConfig()
+        policy = C2LBPolicy(MockInstanceProvider())
+        assert (
+            config.scheduler_config.c2lb.active_tokens_mean_factor,
+            config.scheduler_config.c2lb.cpu_hit_blocks_mean_factor,
+            config.scheduler_config.c2lb.isl_mean_factor,
+        ) == (1.5, 1.5, 1.5)
+        assert policy.mean_factors == (1.5, 1.5, 1.5)
+
     def test_scheduler_pushes_mean_factors_from_config(self):
         config = CoordinatorConfig()
         config.scheduler_config.prefill_scheduler_type = SchedulerType.C2LB

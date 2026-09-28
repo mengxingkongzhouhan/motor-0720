@@ -1219,6 +1219,20 @@ class AsyncSchedulerClient:
                     proposed_instance.id,
                     proposed_endpoint.id,
                 )
+                # Final DP is committed: if that DP has exclusive SSD hits, start
+                # MemCache SSD→DRAM prefetch with the conductor disk_block_hashes.
+                try:
+                    KvCacheAffinityPolicy.prefetch_ssd_hits_for_dp(
+                        req_info, out_instance.id, out_endpoint.id
+                    )
+                except Exception as exc:  # noqa: BLE001 — CAS already committed
+                    logger.warning(
+                        "SSD prefetch after allocate failed req_id=%s instance=%s endpoint=%s: %s",
+                        req_info.req_id,
+                        out_instance.id,
+                        out_endpoint.id,
+                        exc,
+                    )
                 return (out_instance, out_endpoint, committed)
             if status == STATUS_CHANGED:
                 use_authoritative = True

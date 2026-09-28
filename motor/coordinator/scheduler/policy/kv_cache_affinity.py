@@ -382,6 +382,37 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
         )
 
     @staticmethod
+    def _disk_block_hashes(matched_raw: object) -> list[str]:
+        """Exclusive SSD-hit MemCache object keys from a conductor DP entry."""
+        if not isinstance(matched_raw, dict):
+            return []
+        raw = matched_raw.get("disk_block_hashes") or []
+        if not isinstance(raw, list):
+            return []
+        return [item for item in raw if isinstance(item, str) and item]
+
+    @staticmethod
+    def prefetch_ssd_hits_for_dp(
+        req_info: RequestInfo | None,
+        instance_id: object,
+        endpoint_id: object,
+    ) -> None:
+        """After a DP is chosen, prefetch its exclusive SSD-hit blocks into DRAM.
+
+        Uses the ``disk_block_hashes`` stashed from the conductor ``/query``
+        response as MemCache ``prefetch`` keys (SSD→DRAM).
+        """
+        if req_info is None:
+            return
+        hashes_by_ep = req_info.kv_disk_block_hashes or {}
+        object_keys = hashes_by_ep.get((instance_id, endpoint_id))
+        if not object_keys:
+            return
+        from motor.coordinator.api_client.memcache_store_client import MemcacheStoreClient
+
+        MemcacheStoreClient.prefetch_disk_blocks(object_keys)
+
+    @staticmethod
     def _collect_load_candidates(
         instances: list[Instance],
         tenant: dict,
@@ -391,7 +422,11 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
         w_cpu: float = 1.0,
         w_disk: float = 0.0,
         block_size: int = 0,
-    ) -> tuple[list[tuple[float, int, float, Instance, Endpoint, tuple[int, int, int] | None]], bool]:
+    ) -> tuple[
+        list[tuple[float, int, float, Instance, Endpoint, tuple[int, int, int] | None]],
+        bool,
+        dict[tuple[object, object], list[str]],
+    ]:
         """
         Build the per-endpoint scoring tuples shared by the load-aware selection modes.
 
@@ -399,11 +434,14 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
         tier_hit_tokens)`` where ``load_cost`` is the SHM-reported live workload,
         ``matched_tokens`` is the tier-weighted affinity match capped at the prompt, and
         ``tier_hit_tokens`` is ``(hbm, cpu, disk)`` exclusive hit token counts when the conductor
-        reports per-medium blocks. Returns ``(candidates, any_instance)``; ``any_instance``
-        distinguishes "conductor reported nothing for our instances" (fall back) from "reported,
-        but no endpoints".
+        reports per-medium blocks. Returns ``(candidates, any_instance, disk_hash_map)``;
+        ``any_instance`` distinguishes "conductor reported nothing for our instances" (fall back)
+        from "reported, but no endpoints". ``disk_hash_map`` is the exclusive SSD
+        MemCache object keys from ``disk_block_hashes``, keyed by
+        ``(instance_id, endpoint_id)``.
         """
         candidates: list[tuple[float, int, float, Instance, Endpoint, tuple[int, int, int] | None]] = []
+        disk_hash_map: dict[tuple[object, object], list[str]] = {}
         any_instance = False
         for instance in instances:
             instance_data = tenant.get(conductor_instance_id(instance), None)
@@ -422,14 +460,18 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
                 prefill_cost = max(0.0, isl - overlap_credit * matched_tokens)
                 load_cost = ep.workload.calculate_workload_score(PDRole.ROLE_P)
                 tier_hit = KvCacheAffinityPolicy._tier_hit_tokens(matched_raw, block_size)
+                disk_hashes = KvCacheAffinityPolicy._disk_block_hashes(matched_raw)
+                if disk_hashes:
+                    disk_hash_map[(instance.id, ep.id)] = disk_hashes
                 candidates.append((load_cost, matched_tokens, prefill_cost, instance, ep, tier_hit))
-        return candidates, any_instance
+        return candidates, any_instance, disk_hash_map
 
     @staticmethod
     def _stash_affinity_debug(
         req_info: RequestInfo | None,
         raw: list[tuple[float, int, float, Instance, Endpoint, tuple[int, int, int] | None]],
         with_prefill: bool = False,
+        disk_hash_map: dict | None = None,
     ) -> None:
         """
         Cache per-endpoint ``(matched_tokens, load_cost, prefill_cost, tier_hit_tokens)`` on
@@ -460,6 +502,8 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
                 )
                 for (load_cost, matched_tokens, prefill_cost, instance, ep, tier_hit) in raw
             }
+            if disk_hash_map:
+                req_info.kv_disk_block_hashes = disk_hash_map
         except Exception as e:  # pragma: no cover - req_info may be immutable in some callers
             logger.debug("Could not cache kv_affinity_debug on req_info: %s", e)
 
@@ -485,7 +529,7 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
         herding onto a single hot-prefix endpoint. With ``load_weight == 0`` the score is
         affinity-only (longest prefix wins).
         """
-        raw, any_instance = KvCacheAffinityPolicy._collect_load_candidates(
+        raw, any_instance, disk_hash_map = KvCacheAffinityPolicy._collect_load_candidates(
             instances,
             tenant,
             isl,
@@ -533,7 +577,9 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
             len(ranked),
             len(candidates),
         )
-        KvCacheAffinityPolicy._stash_affinity_debug(req_info, raw, with_prefill=True)
+        KvCacheAffinityPolicy._stash_affinity_debug(
+            req_info, raw, with_prefill=True, disk_hash_map=disk_hash_map
+        )
         return [(inst, ep, score) for (score, inst, ep, _matched) in ranked]
 
     @staticmethod
@@ -558,7 +604,7 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
         This gives a *hard* load bound (the choice can never escape the least-loaded set) while
         still exploiting KV-cache affinity as the tie-break inside that set.
         """
-        raw, any_instance = KvCacheAffinityPolicy._collect_load_candidates(
+        raw, any_instance, disk_hash_map = KvCacheAffinityPolicy._collect_load_candidates(
             instances,
             tenant,
             isl,
@@ -599,7 +645,7 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
             topn,
             len(raw),
         )
-        KvCacheAffinityPolicy._stash_affinity_debug(req_info, raw)
+        KvCacheAffinityPolicy._stash_affinity_debug(req_info, raw, disk_hash_map=disk_hash_map)
         return [(inst, ep, load_cost) for (load_cost, _m, _p, inst, ep, _tier) in ranked]
 
     def _select_instance(self, _: PDRole = None) -> Instance | None:

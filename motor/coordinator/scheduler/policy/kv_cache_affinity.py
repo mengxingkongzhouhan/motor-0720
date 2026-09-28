@@ -391,15 +391,8 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
         if not isinstance(raw, list):
             return []
         for item in raw:
-            if isinstance(item, str):
-                key = item
-            elif isinstance(item, int) and not isinstance(item, bool):
-                # Compatibility with a rolling-upgrade conductor from before PR #39.
-                key = str(item)
-            else:
-                continue
-            if key:
-                keys.append(key)
+            if isinstance(item, str) and item:
+                keys.append(item)
         return keys
 
     @staticmethod

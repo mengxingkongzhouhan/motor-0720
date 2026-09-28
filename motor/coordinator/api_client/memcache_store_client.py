@@ -44,23 +44,8 @@ class MemcacheStoreClient:
 
     @staticmethod
     def hashes_to_keys(block_hashes: Iterable[Any] | None) -> list[str]:
-        """Preserve conductor ``disk_block_hashes`` as MemCache object keys.
-
-        PR #39 changed this field from numeric engine hashes to string
-        ``object_keys``. Integers remain accepted for rolling upgrades with an
-        older conductor, but arbitrary strings must pass through unchanged.
-        """
-        keys: list[str] = []
-        for raw in block_hashes or []:
-            if isinstance(raw, str):
-                key = raw
-            elif isinstance(raw, int) and not isinstance(raw, bool):
-                key = str(raw)
-            else:
-                continue
-            if key:
-                keys.append(key)
-        return keys
+        """Keep non-empty MemCache object keys from ``disk_block_hashes``."""
+        return [key for key in block_hashes or [] if isinstance(key, str) and key]
 
     @classmethod
     def prefetch_disk_blocks(cls, block_hashes: Iterable[Any] | None) -> bool:

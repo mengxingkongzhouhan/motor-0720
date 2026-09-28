@@ -26,10 +26,10 @@ def _reset_store_client():
 
 def test_hashes_to_keys_preserves_object_keys():
     object_key = "wen25-7B@pcp0@dcp1@head_or_tp_rank:0@group:0@cache_role:kv@abc"
-    assert MemcacheStoreClient.hashes_to_keys([object_key, "202", 203]) == [
+    second_key = "wen25-7B@pcp0@dcp1@head_or_tp_rank:0@group:0@cache_role:kv@def"
+    assert MemcacheStoreClient.hashes_to_keys([object_key, second_key, 203]) == [
         object_key,
-        "202",
-        "203",
+        second_key,
     ]
     assert MemcacheStoreClient.hashes_to_keys(None) == []
     assert MemcacheStoreClient.hashes_to_keys(["x", "", None, True, 1.5]) == ["x"]

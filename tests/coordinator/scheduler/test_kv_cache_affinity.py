@@ -494,13 +494,13 @@ class TestKvCacheAffinityPolicy(unittest.TestCase):
         self.assertEqual(debug[3], (768, 128, 0))
 
     def test_disk_block_hashes_from_conductor_dp(self):
-        """MemCache object keys are preserved; old numeric hashes become strings."""
+        """MemCache object keys are preserved; numeric engine hashes are ignored."""
         object_key = "model@layer:3@content-hash"
         self.assertEqual(
             KvCacheAffinityPolicy._disk_block_hashes(
-                {"disk_blocks": 3, "disk_block_hashes": [object_key, "202", 201, None, True]}
+                {"disk_blocks": 3, "disk_block_hashes": [object_key, 201, None, True]}
             ),
-            [object_key, "202", "201"],
+            [object_key],
         )
         self.assertEqual(KvCacheAffinityPolicy._disk_block_hashes(200), [])
         self.assertEqual(KvCacheAffinityPolicy._disk_block_hashes({"matched_tokens": 120}), [])

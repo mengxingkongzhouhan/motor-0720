@@ -25,6 +25,8 @@ from motor.coordinator.domain.instance_manager import InstanceManager
 from motor.coordinator.domain.scheduling import UpdateWorkloadParams
 from motor.coordinator.models.request import RequestInfo
 from motor.coordinator.scheduler.runtime.zmq_protocol import (
+    CANDIDATE_POLICY_C2LB,
+    CANDIDATE_POLICY_KV_CACHE_AFFINITY,
     CANDIDATE_POLICY_LOAD_BALANCE,
     SchedulerRequestType,
     SchedulerResponse,
@@ -350,6 +352,24 @@ class TestAsyncSchedulerClient:
         self.client._decode_scheduler_type = "load_balance"
         assert self.client._arbitration_context(PDRole.ROLE_P).is_load_balance_scheduler is False
         assert self.client._arbitration_context(PDRole.ROLE_D).is_load_balance_scheduler is True
+
+    @patch("motor.coordinator.api_client.memcache_store_client.MemcacheStoreClient.prefetch_disk_blocks")
+    def test_ssd_prefetch_switch_and_supported_policies(self, mock_prefetch):
+        req = RequestInfo(req_id="prefetch", req_data={}, req_len=0, api="completions")
+        req.ssd_prefetch_keys = {(1, 10): ["key-a"], (2, 20): ["key-b"]}
+
+        self.client._prefetch_ssd_hits_for_dp(req, CANDIDATE_POLICY_C2LB, 1, 10)
+        mock_prefetch.assert_not_called()
+
+        enabled = AsyncSchedulerClient(SchedulerClientConfig(enable_ssd_prefetch=True))
+        enabled._prefetch_ssd_hits_for_dp(req, CANDIDATE_POLICY_C2LB, 1, 10)
+        enabled._prefetch_ssd_hits_for_dp(req, CANDIDATE_POLICY_KV_CACHE_AFFINITY, 2, 20)
+        assert mock_prefetch.call_args_list == [call(["key-a"]), call(["key-b"])]
+
+        mock_prefetch.reset_mock()
+        enabled._prefetch_ssd_hits_for_dp(req, CANDIDATE_POLICY_LOAD_BALANCE, 1, 10)
+        enabled._prefetch_ssd_hits_for_dp(req, CANDIDATE_POLICY_C2LB, 9, 99)
+        mock_prefetch.assert_not_called()
 
     # -- helpers ------------------------------------------------------------
 
@@ -900,12 +920,19 @@ def native_lib():
 
 
 async def _client_with_shm(
-    im: InstanceManager, name: str, scheduler_type: str = "load_balance"
+    im: InstanceManager,
+    name: str,
+    scheduler_type: str = "load_balance",
+    enable_ssd_prefetch: bool = False,
 ) -> tuple[AsyncSchedulerClient, WorkloadSharedMemoryOwner]:
     writer = WorkloadSharedMemoryOwner(im, max_entries=8, shm_name=name)
     writer.write_snapshot()
     client = AsyncSchedulerClient(
-        SchedulerClientConfig(scheduler_type=scheduler_type, endpoint_instance_score_weight=0.0)
+        SchedulerClientConfig(
+            scheduler_type=scheduler_type,
+            endpoint_instance_score_weight=0.0,
+            enable_ssd_prefetch=enable_ssd_prefetch,
+        )
     )
     cache = _SchedulerInstanceCache()
     instances = list(im.get_available_instances(PDRole.ROLE_P).values())
@@ -1206,7 +1233,12 @@ class TestSelectAndAllocateCas:
             [_make_cas_instance(1, 10), _make_cas_instance(2, 20)],
         )
         name = _cas_shm_name("gfp")
-        client, writer = await _client_with_shm(im, name, scheduler_type="c2lb")
+        client, writer = await _client_with_shm(
+            im,
+            name,
+            scheduler_type="c2lb",
+            enable_ssd_prefetch=True,
+        )
         _seed_shm_tokens(writer, 1, 10, 1.0)
         _seed_shm_tokens(writer, 2, 20, 50.0)
         inst = next(item for item in client._cache.get_instances(PDRole.ROLE_P) if item.id == 1)
@@ -1214,11 +1246,15 @@ class TestSelectAndAllocateCas:
 
         def fake_select(instances, req_info, **kwargs):
             req_info.c2lb_debug = {(1, 10): (4.0, 0.0, 0.0), (2, 20): (4.0, 0.0, 0.0)}
+            req_info.ssd_prefetch_keys = {(1, 10): ["model@layer:3@aaa"]}
             return [(inst, ep, 0.0)]
 
         try:
             with (
                 patch.object(C2LBPolicy, "select_endpoint_candidates_from_list", side_effect=fake_select),
+                patch(
+                    "motor.coordinator.api_client.memcache_store_client.MemcacheStoreClient.prefetch_disk_blocks"
+                ) as mock_prefetch,
                 patch(
                     "motor.coordinator.scheduler.runtime.scheduler_client.select_authoritative_allocate_candidate"
                 ) as mock_auth,
@@ -1231,6 +1267,7 @@ class TestSelectAndAllocateCas:
             assert result is not None
             assert (result[0].id, result[1].id) == (1, 10)
             mock_auth.assert_not_called()
+            mock_prefetch.assert_called_once_with(["model@layer:3@aaa"])
             scheduled = [rec.message for rec in caplog.records if rec.message.startswith("scheduled role=")]
             assert scheduled
             assert "policy=c2lb" in scheduled[0]

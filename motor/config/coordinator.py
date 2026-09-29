@@ -423,6 +423,9 @@ class SchedulerConfig:
     prefill_scheduler_type: SchedulerType = field(default=SchedulerType.LOAD_BALANCE)
     decode_scheduler_type: SchedulerType = field(default=SchedulerType.LOAD_BALANCE)
     enable_pd_separation_fallback_to_hybrid: bool = True
+    # Prefetch the final C2LB / KV-affinity DP's exclusive SSD hits into DRAM.
+    # Disabled by default because it adds MemCache traffic on the scheduling path.
+    enable_ssd_prefetch: bool = False
     # Weight of the instance average workload in endpoint-first load balancing.
     # 0 means pure global endpoint minimum; small values preserve instance pressure awareness.
     endpoint_instance_score_weight: float = 0.05

@@ -516,6 +516,16 @@ class TestKvCacheAffinityPolicy(unittest.TestCase):
             KvCacheAffinityPolicy._tier_hit_tokens({"matched_tokens": 120}, block_size=128),
         )
 
+    def test_disk_block_hashes_keep_only_memcache_object_keys(self):
+        self.assertEqual(
+            KvCacheAffinityPolicy._disk_block_hashes(
+                {"disk_block_hashes": ["model@layer:3@aaa", 201, None, True, "model@layer:3@bbb"]}
+            ),
+            ["model@layer:3@aaa", "model@layer:3@bbb"],
+        )
+        self.assertEqual(KvCacheAffinityPolicy._disk_block_hashes(200), [])
+        self.assertEqual(KvCacheAffinityPolicy._disk_block_hashes({"disk_block_hashes": "bad"}), [])
+
     @patch.object(KvCacheAffinityPolicy, "_conductor_block_size", return_value=128)
     @patch("motor.coordinator.scheduler.policy.kv_cache_affinity.ConductorApiClient.query_conductor")
     @patch("motor.coordinator.scheduler.policy.kv_cache_affinity.TokenizerManager")
@@ -540,7 +550,13 @@ class TestKvCacheAffinityPolicy(unittest.TestCase):
             TENANT_ID: {
                 "vllm-prefill-inst": {
                     "DP": {
-                        "0": {"npu_blocks": 6, "cpu_blocks": 1, "disk_blocks": 0, "matched_tokens": 800},
+                        "0": {
+                            "npu_blocks": 6,
+                            "cpu_blocks": 1,
+                            "disk_blocks": 2,
+                            "matched_tokens": 800,
+                            "disk_block_hashes": ["model@layer:3@aaa", "model@layer:3@bbb"],
+                        },
                     }
                 }
             }
@@ -549,7 +565,11 @@ class TestKvCacheAffinityPolicy(unittest.TestCase):
         result = KvCacheAffinityPolicy.select_endpoint_from_list(instances, mock_req_info, load_weight=0.0)
         self.assertIsNotNone(result)
         debug = mock_req_info.kv_affinity_debug[(mock_instance.id, ep.id)]
-        self.assertEqual(debug[3], (768, 128, 0))
+        self.assertEqual(debug[3], (768, 128, 256))
+        self.assertEqual(
+            mock_req_info.ssd_prefetch_keys[(mock_instance.id, ep.id)],
+            ["model@layer:3@aaa", "model@layer:3@bbb"],
+        )
 
     @patch('motor.coordinator.scheduler.policy.kv_cache_affinity.ConductorApiClient.query_conductor')
     @patch('motor.coordinator.scheduler.policy.kv_cache_affinity.TokenizerManager')

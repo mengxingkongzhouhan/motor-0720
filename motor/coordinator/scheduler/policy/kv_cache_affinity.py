@@ -195,6 +195,8 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
                 )
                 return None
 
+        KvCacheAffinityPolicy._stash_ssd_prefetch_keys(instances, tenant, req_info)
+
         if mode == KV_AFFINITY_MODE_LOAD_GATED:
             topn = load_gate_topn if (load_gate_topn and load_gate_topn > 0) else _DEFAULT_LOAD_GATE_TOPN
             return KvCacheAffinityPolicy._select_load_gated(
@@ -389,6 +391,36 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
             int(cpu or 0) * block_size,
             int(disk or 0) * block_size,
         )
+
+    @staticmethod
+    def _disk_block_hashes(matched_raw: object) -> list[str]:
+        """Return valid MemCache object keys for exclusive SSD hits."""
+        if not isinstance(matched_raw, dict):
+            return []
+        raw = matched_raw.get("disk_block_hashes") or []
+        if not isinstance(raw, list):
+            return []
+        return [key for key in raw if isinstance(key, str) and key]
+
+    @staticmethod
+    def _stash_ssd_prefetch_keys(
+        instances: list[Instance],
+        tenant: dict,
+        req_info: RequestInfo,
+    ) -> None:
+        """Cache every DP's SSD object keys for the final post-commit selection."""
+        keys_by_endpoint: dict[tuple[int, int], list[str]] = {}
+        for instance in instances:
+            instance_data = tenant.get(conductor_instance_id(instance))
+            dp_map = instance_data.get("DP", {}) if isinstance(instance_data, dict) else {}
+            for endpoint in instance.get_all_endpoints():
+                keys = KvCacheAffinityPolicy._disk_block_hashes(dp_map.get(f"{endpoint.id}", 0))
+                if keys:
+                    keys_by_endpoint[(instance.id, endpoint.id)] = keys
+        try:
+            req_info.ssd_prefetch_keys = keys_by_endpoint
+        except Exception as exc:  # pragma: no cover - req_info may be immutable in some callers
+            logger.debug("Could not cache SSD prefetch keys on req_info: %s", exc)
 
     @staticmethod
     def _collect_load_candidates(

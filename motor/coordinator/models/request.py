@@ -86,6 +86,13 @@ class RequestInfo(BaseModel):
         "pass all three gates, otherwise gates the other two ledger loads, and stamps isl / "
         "cpu_hit_blocks on the committed endpoint. Keyed by (instance_id, endpoint_id).",
     )
+    ssd_prefetch_keys: dict | None = Field(
+        default=None,
+        exclude=True,
+        description="Per-endpoint exclusive SSD-hit MemCache object keys cached from conductor "
+        "disk_block_hashes by C2LB or KV affinity. The final committed DP may use them for "
+        "SSD-to-DRAM prefetch when enabled. Keyed by (instance_id, endpoint_id).",
+    )
     api: str = Field(..., description="API need to be forwarded")
     entry_api: str = Field(
         default="",

@@ -325,7 +325,7 @@ class C2LBPolicy(BaseSchedulingPolicy):
     otherwise the first DP under the two load averages.
 
     Workers run the conductor query (for the stamp values) and re-rank / re-gate against the
-    local cache (schema-5 SHM ``active_tokens`` / ``isl`` / ``cpu_hit_blocks``) before CAS-committing.
+    local cache (schema-6 SHM ``active_tokens`` / ``isl`` / ``cpu_hit_blocks``) before CAS-committing.
     """
 
     def __init__(self, instance_provider: InstanceProvider):

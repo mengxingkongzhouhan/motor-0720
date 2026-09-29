@@ -480,7 +480,7 @@ class WorkloadShm:
         }
 
     def load_entries(self, entry_count: int) -> list[dict[str, Any]]:
-        """Read ``entry_count`` schema-5 slots in one FFI call. Each dict includes ``slot``."""
+        """Read ``entry_count`` schema-6 slots in one FFI call. Each dict includes ``slot``."""
         cap = max(int(entry_count), 0)
         if cap == 0:
             return []

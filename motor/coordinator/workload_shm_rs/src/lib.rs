@@ -1249,7 +1249,7 @@ mod tests {
         }
     }
 
-    // --- schema 5 CAS ---
+    // --- schema 6 CAS ---
 
     unsafe fn v4_single_entry(tag: &str) -> (u64, CString) {
         let cn = CString::new(unique_name(tag)).unwrap();

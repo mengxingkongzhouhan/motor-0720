@@ -9,7 +9,7 @@
 # See the Mulan PSL v2 for more details.
 
 """
-Native shared-memory writer contract (schema 5) and per-slot CAS.
+Native shared-memory writer contract (schema 6) and per-slot CAS.
 
 Drives ``libmindie_workload_shm`` via ctypes and reads back with the production Python reader.
 """

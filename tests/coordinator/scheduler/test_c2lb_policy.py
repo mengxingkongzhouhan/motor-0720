@@ -35,7 +35,6 @@ from motor.coordinator.scheduler.policy.c2lb import (
     C2LBPolicy,
     C2LBTokenizer,
     _cpu_hit_blocks,
-    _disk_block_hashes,
     _request_npu_hit,
     pick_gated,
     sort_candidates,
@@ -103,7 +102,6 @@ def _req_info(token_count: int = 100, req_id: str = "req-gated") -> SimpleNamesp
         req_len=token_count * 4,
         token_ids=list(range(token_count)),
         c2lb_debug=None,
-        c2lb_disk_block_hashes=None,
         kv_affinity_debug=None,
     )
 
@@ -217,13 +215,6 @@ class TestConductorParsing:
         assert _cpu_hit_blocks({"matched_tokens": 8}) == 0
         assert _cpu_hit_blocks({"cpu_blocks": "x"}) == 0
         assert _cpu_hit_blocks({"cpu_blocks": -3}) == 0
-
-    def test_disk_block_hashes_keep_only_memcache_object_keys(self):
-        assert _disk_block_hashes(
-            {"disk_block_hashes": ["model@layer:3@aaa", 201, None, True, "model@layer:3@bbb"]}
-        ) == ["model@layer:3@aaa", "model@layer:3@bbb"]
-        assert _disk_block_hashes(200) == []
-        assert _disk_block_hashes({"disk_block_hashes": "not-a-list"}) == []
 
     def test_npu_hit_rate(self):
         assert _request_npu_hit({"npu_blocks": 2, "cpu_blocks": 5, "matched_tokens": 64}, 128) == 2.0
@@ -445,12 +436,7 @@ class TestPolicy:
             inst_a,
             inst_b,
             dp={
-                (1, 10): {
-                    "npu_blocks": 1,
-                    "cpu_blocks": 4,
-                    "matched_tokens": 90,
-                    "disk_block_hashes": ["model@layer:3@aaa", "model@layer:3@bbb"],
-                },
+                (1, 10): {"npu_blocks": 1, "cpu_blocks": 4, "matched_tokens": 90},
                 (1, 11): {"npu_blocks": 0, "cpu_blocks": 0, "matched_tokens": 0},
                 (2, 20): 50,
             },
@@ -468,25 +454,6 @@ class TestPolicy:
             (2, 20): (50.0, 0.0, 0.0),
             (1, 10): (10.0, 4.0, 1.28),
         }
-        assert req_info.c2lb_disk_block_hashes == {
-            (1, 10): ["model@layer:3@aaa", "model@layer:3@bbb"],
-        }
-
-    @patch("motor.coordinator.api_client.memcache_store_client.MemcacheStoreClient.prefetch_disk_blocks")
-    def test_prefetch_ssd_hits_uses_only_final_c2lb_dp(self, mock_prefetch):
-        req_info = _req_info()
-        req_info.c2lb_disk_block_hashes = {
-            (1, 10): ["model@layer:3@aaa", "model@layer:3@bbb"],
-            (2, 20): ["other-key"],
-        }
-
-        C2LBPolicy.prefetch_ssd_hits_for_dp(req_info, 1, 10)
-        mock_prefetch.assert_called_once_with(["model@layer:3@aaa", "model@layer:3@bbb"])
-
-        mock_prefetch.reset_mock()
-        C2LBPolicy.prefetch_ssd_hits_for_dp(req_info, 9, 99)
-        C2LBPolicy.prefetch_ssd_hits_for_dp(None, 1, 10)
-        mock_prefetch.assert_not_called()
 
     @patch("motor.coordinator.scheduler.policy.c2lb.ConductorApiClient.query_conductor")
     def test_worker_proposal_puts_gated_pick_first(self, mock_query):

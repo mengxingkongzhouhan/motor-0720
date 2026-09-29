@@ -211,16 +211,6 @@ def _cpu_hit_blocks(matched: object) -> float:
         return 0.0
 
 
-def _disk_block_hashes(matched: object) -> list[str]:
-    """Return valid MemCache object keys for exclusive SSD hits."""
-    if not isinstance(matched, dict):
-        return []
-    raw = matched.get("disk_block_hashes") or []
-    if not isinstance(raw, list):
-        return []
-    return [key for key in raw if isinstance(key, str) and key]
-
-
 def _request_npu_hit(matched: object, isl: int) -> float:
     """This request's NPU prefix hit rate: ``npu_blocks * BLOCK_SIZE / isl``."""
     if isl <= 0 or not isinstance(matched, dict):
@@ -368,8 +358,7 @@ class C2LBPolicy(BaseSchedulingPolicy):
         The conductor supplies per-endpoint stamp values (request cost, cpu_blocks).
         ``None`` means it had no data for our instances (caller falls back). Also caches
         ``{(instance_id, endpoint_id): (prefill_cost, cpu_hit_blocks, npu_hit)}`` on
-        ``req_info.c2lb_debug`` for the allocate stamp and exclusive SSD object keys on
-        ``req_info.c2lb_disk_block_hashes`` for post-commit prefetch.
+        ``req_info.c2lb_debug`` for the allocate stamp.
         """
         encoded_ids = _prompt_token_ids(req_info)
         if not encoded_ids:
@@ -389,7 +378,6 @@ class C2LBPolicy(BaseSchedulingPolicy):
             return None
 
         candidates: list[GatedCandidate] = []
-        disk_hashes_by_endpoint: dict[tuple[int, int], list[str]] = {}
         any_instance = False
         for instance in instances:
             instance_data = tenant.get(conductor_instance_id(instance), None)
@@ -399,9 +387,6 @@ class C2LBPolicy(BaseSchedulingPolicy):
             dp_map = instance_data.get("DP", {}) if isinstance(instance_data, dict) else {}
             for ep in instance.get_all_endpoints():
                 matched = dp_map.get(f"{ep.id}", 0)
-                disk_hashes = _disk_block_hashes(matched)
-                if disk_hashes:
-                    disk_hashes_by_endpoint[(instance.id, ep.id)] = disk_hashes
                 candidates.append(
                     GatedCandidate(
                         instance=instance,
@@ -420,7 +405,6 @@ class C2LBPolicy(BaseSchedulingPolicy):
 
         ranked = sort_candidates(candidates)
         req_info.c2lb_debug = {c.key: (c.prefill_cost, c.cpu_hit_blocks, c.npu_hit) for c in ranked}
-        req_info.c2lb_disk_block_hashes = disk_hashes_by_endpoint
         logger.info(
             "c2lb: req_id=%s isl=%s ranked[ins-ep:ledger_isl/active/cpu(+req_cost/+req_cpu)]=%s",
             req_id,
@@ -428,23 +412,6 @@ class C2LBPolicy(BaseSchedulingPolicy):
             format_candidates(ranked),
         )
         return ranked
-
-    @staticmethod
-    def prefetch_ssd_hits_for_dp(
-        req_info: RequestInfo | None,
-        instance_id: object,
-        endpoint_id: object,
-    ) -> None:
-        """Queue SSD-to-DRAM prefetch for the final DP selected by c2lb."""
-        if req_info is None:
-            return
-        hashes_by_endpoint = getattr(req_info, "c2lb_disk_block_hashes", None) or {}
-        object_keys = hashes_by_endpoint.get((instance_id, endpoint_id))
-        if not object_keys:
-            return
-        from motor.coordinator.api_client.memcache_store_client import MemcacheStoreClient
-
-        MemcacheStoreClient.prefetch_disk_blocks(object_keys)
 
     @staticmethod
     def select_endpoint_candidates_from_list(

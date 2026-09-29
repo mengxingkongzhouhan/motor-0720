@@ -1214,11 +1214,13 @@ class TestSelectAndAllocateCas:
 
         def fake_select(instances, req_info, **kwargs):
             req_info.c2lb_debug = {(1, 10): (4.0, 0.0, 0.0), (2, 20): (4.0, 0.0, 0.0)}
+            req_info.c2lb_disk_block_hashes = {(1, 10): ["model@layer:3@aaa"]}
             return [(inst, ep, 0.0)]
 
         try:
             with (
                 patch.object(C2LBPolicy, "select_endpoint_candidates_from_list", side_effect=fake_select),
+                patch.object(C2LBPolicy, "prefetch_ssd_hits_for_dp") as mock_prefetch,
                 patch(
                     "motor.coordinator.scheduler.runtime.scheduler_client.select_authoritative_allocate_candidate"
                 ) as mock_auth,
@@ -1231,6 +1233,7 @@ class TestSelectAndAllocateCas:
             assert result is not None
             assert (result[0].id, result[1].id) == (1, 10)
             mock_auth.assert_not_called()
+            mock_prefetch.assert_called_once_with(req, 1, 10)
             scheduled = [rec.message for rec in caplog.records if rec.message.startswith("scheduled role=")]
             assert scheduled
             assert "policy=c2lb" in scheduled[0]

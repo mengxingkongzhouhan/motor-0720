@@ -198,3 +198,17 @@ class TestSchedulerConnectionManager(unittest.TestCase):
             config.worker_index = None
             SchedulerConnectionManager.from_config(config)
             self.assertFalse(mock_cls.call_args[0][0].log_dp_stats)
+
+    def test_from_config_forwards_ssd_prefetch_switch(self):
+        from motor.config.coordinator import CoordinatorConfig
+
+        with patch(
+            "motor.coordinator.scheduler.runtime.scheduler_connection_manager.SchedulerClient",
+        ) as mock_cls:
+            mock_cls.return_value = Mock()
+            config = CoordinatorConfig()
+            config.scheduler_config.enable_ssd_prefetch = True
+
+            SchedulerConnectionManager.from_config(config)
+
+            self.assertTrue(mock_cls.call_args[0][0].enable_ssd_prefetch)

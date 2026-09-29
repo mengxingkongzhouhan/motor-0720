@@ -715,6 +715,8 @@ class SchedulerClientConfig:
     kv_affinity: KvAffinityConfig | None = None
     # c2lb tunables (see SchedulerConfig.c2lb).
     c2lb: C2LBConfig | None = None
+    # Enable MemCache SSD-to-DRAM prefetch after a C2LB / KV-affinity commit.
+    enable_ssd_prefetch: bool = False
     dp_stats_window: int = 60
     # Worker 0 dumps dp_stats every dp_stats_window seconds.
     # Inference worker_index==0 sets this; Obs/standby (worker_index is None) leave it off.
@@ -765,6 +767,7 @@ class AsyncSchedulerClient:
         self._c2lb_active_factor = max(0.0, float(gated.active_tokens_mean_factor))
         self._c2lb_cpu_factor = max(0.0, float(gated.cpu_hit_blocks_mean_factor))
         self._c2lb_isl_factor = max(0.0, float(gated.isl_mean_factor))
+        self._enable_ssd_prefetch = bool(config.enable_ssd_prefetch)
 
         self._dp_stats = DpStatsLogger(window_sec=config.dp_stats_window)
         self._log_dp_stats = bool(config.log_dp_stats)
@@ -1077,6 +1080,27 @@ class AsyncSchedulerClient:
                 active_tokens=active_tokens
             )
         return demand
+
+    def _prefetch_ssd_hits_for_dp(
+        self,
+        req_info: RequestInfo,
+        candidate_policy: str,
+        instance_id: int,
+        endpoint_id: int,
+    ) -> None:
+        """Queue prefetch for a committed C2LB / KV-affinity DP when enabled."""
+        if not self._enable_ssd_prefetch or candidate_policy not in (
+            CANDIDATE_POLICY_C2LB,
+            CANDIDATE_POLICY_KV_CACHE_AFFINITY,
+        ):
+            return
+        keys_by_endpoint = getattr(req_info, "ssd_prefetch_keys", None) or {}
+        object_keys = keys_by_endpoint.get((instance_id, endpoint_id))
+        if not object_keys:
+            return
+        from motor.coordinator.api_client.memcache_store_client import MemcacheStoreClient
+
+        MemcacheStoreClient.prefetch_disk_blocks(object_keys)
 
     async def _notify_instance_refreshed(self) -> None:
         """Fire the instance-refresh callback with the current active endpoints.
@@ -1439,17 +1463,22 @@ class AsyncSchedulerClient:
                     proposed_instance.id,
                     proposed_endpoint.id,
                 )
-                if candidate_policy == CANDIDATE_POLICY_C2LB:
-                    try:
-                        C2LBPolicy.prefetch_ssd_hits_for_dp(req_info, out_instance.id, out_endpoint.id)
-                    except Exception as exc:  # noqa: BLE001 - allocation is already committed
-                        logger.warning(
-                            "c2lb SSD prefetch after allocate failed req_id=%s instance=%s endpoint=%s: %s",
-                            req_info.req_id,
-                            out_instance.id,
-                            out_endpoint.id,
-                            exc,
-                        )
+                try:
+                    self._prefetch_ssd_hits_for_dp(
+                        req_info,
+                        candidate_policy,
+                        out_instance.id,
+                        out_endpoint.id,
+                    )
+                except Exception as exc:  # noqa: BLE001 - allocation is already committed
+                    logger.warning(
+                        "SSD prefetch after allocate failed req_id=%s policy=%s instance=%s endpoint=%s: %s",
+                        req_info.req_id,
+                        candidate_policy,
+                        out_instance.id,
+                        out_endpoint.id,
+                        exc,
+                    )
                 return (out_instance, out_endpoint, committed)
             if status == STATUS_CHANGED:
                 cas_counts["changed"] += 1

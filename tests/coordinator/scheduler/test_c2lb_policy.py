@@ -103,7 +103,7 @@ def _req_info(token_count: int = 100, req_id: str = "req-gated") -> SimpleNamesp
         req_len=token_count * 4,
         token_ids=list(range(token_count)),
         c2lb_debug=None,
-        c2lb_disk_block_hashes=None,
+        ssd_prefetch_keys=None,
         kv_affinity_debug=None,
     )
 
@@ -468,25 +468,9 @@ class TestPolicy:
             (2, 20): (50.0, 0.0, 0.0),
             (1, 10): (10.0, 4.0, 1.28),
         }
-        assert req_info.c2lb_disk_block_hashes == {
+        assert req_info.ssd_prefetch_keys == {
             (1, 10): ["model@layer:3@aaa", "model@layer:3@bbb"],
         }
-
-    @patch("motor.coordinator.api_client.memcache_store_client.MemcacheStoreClient.prefetch_disk_blocks")
-    def test_prefetch_ssd_hits_uses_only_final_c2lb_dp(self, mock_prefetch):
-        req_info = _req_info()
-        req_info.c2lb_disk_block_hashes = {
-            (1, 10): ["model@layer:3@aaa", "model@layer:3@bbb"],
-            (2, 20): ["other-key"],
-        }
-
-        C2LBPolicy.prefetch_ssd_hits_for_dp(req_info, 1, 10)
-        mock_prefetch.assert_called_once_with(["model@layer:3@aaa", "model@layer:3@bbb"])
-
-        mock_prefetch.reset_mock()
-        C2LBPolicy.prefetch_ssd_hits_for_dp(req_info, 9, 99)
-        C2LBPolicy.prefetch_ssd_hits_for_dp(None, 1, 10)
-        mock_prefetch.assert_not_called()
 
     @patch("motor.coordinator.scheduler.policy.c2lb.ConductorApiClient.query_conductor")
     def test_worker_proposal_puts_gated_pick_first(self, mock_query):

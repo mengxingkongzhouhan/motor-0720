@@ -1531,6 +1531,15 @@ def test_from_json_loads_dp_stats_window(_temp_json_file):
     assert config.scheduler_config.dp_stats_window == 120
 
 
+def test_from_json_loads_ssd_prefetch_switch(_temp_json_file):
+    with open(_temp_json_file, "w", encoding="utf-8") as f:
+        json.dump({"scheduler_config": {"enable_ssd_prefetch": True}}, f)
+
+    config = CoordinatorConfig.from_json(_temp_json_file)
+    assert config.scheduler_config.enable_ssd_prefetch is True
+    assert SchedulerConfig().enable_ssd_prefetch is False
+
+
 def test_coordinator_config_accepts_nested_scheduler_config_kwargs():
     """Kwargs construction must work; a leaked object.__new__ on the class breaks it."""
     assert CoordinatorConfig.__dict__.get("__new__") is not object.__new__

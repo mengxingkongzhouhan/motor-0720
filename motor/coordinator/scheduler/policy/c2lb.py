@@ -28,20 +28,17 @@ The KV Conductor is queried once per request for this request's stamp values
 ``isl = max(0, request_isl)`` and ``cpu_hit_blocks``. RELEASE subtracts both again.
 
 On motor-0924 the authoritative re-pick lives in worker-local ``allocate_arbitration``
-(schema-5 SHM CAS). ``active_tokens``, ``isl``, and ``cpu_hit_blocks`` are all
-cross-worker schema-5 SHM ledger fields.
+(schema-6 SHM CAS). ``active_tokens``, ``isl``, and ``cpu_hit_blocks`` are all
+cross-worker schema-6 SHM ledger fields.
 Prefill / encode / union use ``prefill_scheduler_type``; decode falls back to load_balance
 when this policy is set on decode.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import threading
-import time
 from dataclasses import dataclass
-from pathlib import Path
 
 from motor.common.logger import get_logger
 from motor.common.resources.endpoint import Endpoint
@@ -57,11 +54,7 @@ from motor.coordinator.domain import InstanceProvider
 from motor.coordinator.models.constants import DEFAULT_REQUEST_ID, OpenAIField
 from motor.coordinator.models.request import RequestInfo
 from motor.coordinator.scheduler.policy.base import BaseSchedulingPolicy
-from motor.coordinator.scheduler.policy.utils import (
-    preprocess_input,
-    preprocess_messages_for_dsv4,
-    preprocess_messages_for_standard,
-)
+from motor.coordinator.scheduler.policy.tokenizer_common import SchedulingTokenizerMixin
 
 logger = get_logger(__name__)
 
@@ -72,7 +65,6 @@ C2LB_ROLES = frozenset({PDRole.ROLE_P, PDRole.ROLE_U})
 
 # Gate threshold = candidate mean * factor; 1.0 is the plain average.
 DEFAULT_MEAN_FACTOR = 1.5
-_TOKENIZER_LOAD_RETRY_SECONDS = 30.0
 
 # C2LB discounts a cached prefix 1:1 against prompt length. Not configurable; not shared with
 # kv_cache_affinity's overlap_credit knob.
@@ -94,7 +86,7 @@ PICK_BOTH_GATES = "both_gates"
 PICK_MIN_LEDGER_PREFILL = "min_ledger_prefill"
 
 
-class C2LBTokenizer(ThreadSafeSingleton):
+class C2LBTokenizer(SchedulingTokenizerMixin, ThreadSafeSingleton):
     """Tokenizer owned by c2lb. Does not import other scheduling policies."""
 
     def __init__(self, config: CoordinatorConfig | None = None):
@@ -125,166 +117,6 @@ class C2LBTokenizer(ThreadSafeSingleton):
             self._is_dsv4,
             not c2lb_enabled,
         )
-
-    def get_tokenizer(self):
-        """Load the local tokenizer lazily and retry transient failures after a cooldown."""
-        if self.tokenizer is not None:
-            return self.tokenizer
-        if time.monotonic() < self._next_load_attempt_at:
-            return None
-        with self.config_lock:
-            if self.tokenizer is not None:
-                return self.tokenizer
-            if time.monotonic() < self._next_load_attempt_at:
-                return None
-            if not getattr(self, "model_path", ""):
-                return None
-            try:
-                if self.engine_type == "vllm" and self._is_deepseek_v4_model(self.model_path):
-                    from vllm.tokenizers.deepseek_v4 import DeepseekV4Tokenizer  # pylint: disable=import-error,no-name-in-module
-
-                    self.tokenizer = DeepseekV4Tokenizer.from_pretrained(self.model_path, trust_remote_code=True)
-                    self._is_dsv4 = True
-                else:
-                    from transformers import AutoTokenizer
-
-                    self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
-            except Exception as exc:
-                self._next_load_attempt_at = time.monotonic() + _TOKENIZER_LOAD_RETRY_SECONDS
-                logger.warning(
-                    "C2LBTokenizer load failed; retrying in %.0fs: %s",
-                    _TOKENIZER_LOAD_RETRY_SECONDS,
-                    exc,
-                )
-                return None
-            self._next_load_attempt_at = 0.0
-            return self.tokenizer
-
-    def apply_chat_template(self, messages: list, tools: list | None = None, req_data: dict | None = None) -> list[int]:
-        if self.get_tokenizer() is None:
-            return []
-        try:
-            if self._is_dsv4:
-                return self._apply_chat_template_dsv4(messages, tools, req_data)
-            if self.openai_standard != "STANDARD":
-                return self._apply_chat_template_with_preprocess(messages, tools, req_data)
-            return self._apply_chat_template_standard(messages, tools, req_data)
-        except Exception as exc:
-            if self._is_dsv4:
-                logger.error("c2lb dsv4 tokenize failed; returning []: %s", exc)
-                return []
-            logger.warning("c2lb primary tokenize path failed: %s; trying fallback", exc)
-            return self._safe_fallback_encode(messages, tools, req_data)
-
-    def encode(self, prompt: str) -> list[int]:
-        tokenizer = self.get_tokenizer()
-        return [] if tokenizer is None else tokenizer.encode(prompt)
-
-    @staticmethod
-    def _read_model_config_dict(model_path: str) -> dict | None:
-        try:
-            with open(Path(model_path) / "config.json", encoding="utf-8") as file:
-                data = json.load(file)
-            return data if isinstance(data, dict) else None
-        except (OSError, ValueError) as exc:
-            logger.debug("Could not read config.json from %s: %s", model_path, exc)
-            return None
-
-    @staticmethod
-    def _is_deepseek_v4_model(model_path: str) -> bool:
-        config_dict = C2LBTokenizer._read_model_config_dict(model_path)
-        if not config_dict:
-            return False
-        return config_dict.get("model_type") == "deepseek_v4" or "DeepseekV4ForCausalLM" in (
-            config_dict.get("architectures") or []
-        )
-
-    @staticmethod
-    def _build_dsv4_chat_template_kwargs(req_data: dict | None) -> dict:
-        kwargs: dict = {"tokenize": True, "drop_thinking": True}
-        if not req_data:
-            return kwargs
-        reasoning_effort = req_data.get("reasoning_effort")
-        if reasoning_effort is not None:
-            kwargs["reasoning_effort"] = reasoning_effort
-        chat_template_kwargs = req_data.get("chat_template_kwargs") or {}
-        if isinstance(chat_template_kwargs, dict):
-            kwargs.update(chat_template_kwargs)
-        if reasoning_effort is not None and "enable_thinking" not in kwargs:
-            kwargs["enable_thinking"] = reasoning_effort != "none"
-        return kwargs
-
-    @staticmethod
-    def _build_standard_chat_template_kwargs(req_data: dict | None, *, tokenize: bool) -> dict:
-        kwargs: dict = {"add_generation_prompt": True, "tokenize": tokenize}
-        if tokenize:
-            kwargs["return_dict"] = False
-        if not req_data:
-            return kwargs
-        if isinstance(req_data.get("add_generation_prompt"), bool):
-            kwargs["add_generation_prompt"] = req_data["add_generation_prompt"]
-        if req_data.get("continue_final_message"):
-            kwargs["continue_final_message"] = True
-            kwargs["add_generation_prompt"] = False
-        if req_data.get("documents") is not None:
-            kwargs["documents"] = req_data["documents"]
-        template_kwargs = req_data.get("chat_template_kwargs") or {}
-        if isinstance(template_kwargs, dict):
-            reserved = {
-                "tokenize",
-                "return_dict",
-                "conversation",
-                "tools",
-                "add_generation_prompt",
-                "continue_final_message",
-            }
-            kwargs.update({key: value for key, value in template_kwargs.items() if key not in reserved})
-        reasoning_effort = req_data.get("reasoning_effort")
-        if reasoning_effort is not None:
-            kwargs["reasoning_effort"] = reasoning_effort
-            kwargs.setdefault("enable_thinking", reasoning_effort != "none")
-        thinking = req_data.get("thinking")
-        if isinstance(thinking, dict) and "enable_thinking" not in kwargs:
-            if thinking.get("type") == "enabled":
-                kwargs["enable_thinking"] = True
-            elif thinking.get("type") == "disabled":
-                kwargs["enable_thinking"] = False
-        return kwargs
-
-    def _apply_chat_template_dsv4(self, messages: list, tools: list | None, req_data: dict | None) -> list[int]:
-        messages, tools = preprocess_messages_for_dsv4(messages, tools)
-        result = self.tokenizer.apply_chat_template(
-            messages, tools=tools, **self._build_dsv4_chat_template_kwargs(req_data)
-        )
-        return result if isinstance(result, list) else self.tokenizer.encode(result, add_special_tokens=False)
-
-    def _apply_chat_template_standard(self, messages: list, tools: list | None, req_data: dict | None) -> list[int]:
-        return self.tokenizer.apply_chat_template(
-            conversation=preprocess_messages_for_standard(messages),
-            tools=tools,
-            **self._build_standard_chat_template_kwargs(req_data, tokenize=True),
-        )
-
-    def _apply_chat_template_with_preprocess(
-        self, messages: list, tools: list | None, req_data: dict | None
-    ) -> list[int]:
-        messages, tools = preprocess_input(messages, tools)
-        prompt = self.tokenizer.apply_chat_template(
-            conversation=messages,
-            tools=tools,
-            **self._build_standard_chat_template_kwargs(req_data, tokenize=False),
-        )
-        return self.tokenizer.encode(prompt)
-
-    def _safe_fallback_encode(self, messages: list, tools: list | None, req_data: dict | None) -> list[int]:
-        try:
-            if self.openai_standard == "STANDARD":
-                return self._apply_chat_template_with_preprocess(messages, tools, req_data)
-            return self._apply_chat_template_standard(messages, tools, req_data)
-        except Exception as exc:
-            logger.error("c2lb tokenize failed on both primary and fallback paths; returning []: %s", exc)
-            return []
-
 
 def _prompt_token_ids(req_info: RequestInfo) -> list[int]:
     """Use cached token ids, otherwise tokenize with the local C2LBTokenizer."""
@@ -401,8 +233,17 @@ def sort_candidates(candidates: list[GatedCandidate]) -> list[GatedCandidate]:
     """Lowest ledger ``workload.isl`` first, plus a small share of instance gathered isl."""
     if not candidates:
         return []
-    endpoint_count = max(1, len(candidates[0].instance.get_all_endpoints()))
-    return sorted(candidates, key=lambda c: (c.ledger_isl + 0.05 * (c.instance.gathered_workload.isl / endpoint_count)))
+    return sorted(
+        candidates,
+        key=lambda c: (
+            c.ledger_isl
+            + 0.05
+            * (
+                c.instance.gathered_workload.isl
+                / max(1, len(c.instance.get_all_endpoints()))
+            )
+        ),
+    )
 
 
 def sort_candidates_by_npu_hit(

@@ -9,12 +9,12 @@
 # See the Mulan PSL v2 for more details.
 
 """
-ctypes binding for the Rust ``libmindie_workload_shm`` shared-memory ledger (schema 5).
+ctypes binding for the Rust ``libmindie_workload_shm`` shared-memory ledger (schema 6).
 
 Mgmt owns the segment (create_v4 / membership snapshot / heartbeat / set_blocked). Infer Workers
-attach and CAS tokens plus overlay fields (cas_add / cas_sub_floor0) against per-slot AtomicU64
-plus generation and flags. If the ``.so`` is missing the loader raises ``NativeWorkloadShmUnavailable``
-with a clear message -- callers must fail loudly rather than silently fall back to a wrong ledger.
+attach and atomically update request counters plus token/overlay fields against per-slot atomics,
+generation, and flags. If the ``.so`` is missing the loader raises
+``NativeWorkloadShmUnavailable`` with a clear message.
 """
 
 import ctypes
@@ -84,11 +84,11 @@ STATUS_BAD_ARG = 8
 # Must match Rust SLOT_HINT_NONE: cas_add/cas_sub_floor0 linear-scan when the caller has no slot.
 SLOT_HINT_NONE = 0xFFFFFFFF
 # ctypes arg layout for cas_add/cas_sub/load_entries; older .so must not be bound.
-MIN_ABI_VERSION = 3
+MIN_ABI_VERSION = 4
 
 
 class _LoadedEntry(ctypes.Structure):
-    """40-byte schema-5 entry view returned by mindie_wl_load_entries."""
+    """48-byte schema-6 entry view returned by mindie_wl_load_entries."""
 
     _pack_ = 1
     _fields_ = [
@@ -97,14 +97,15 @@ class _LoadedEntry(ctypes.Structure):
         ("role", ctypes.c_uint8),
         ("flags", ctypes.c_uint8),
         ("generation", ctypes.c_uint16),
-        ("reserved", ctypes.c_uint32),
+        ("request_count", ctypes.c_uint32),
         ("active_tokens", ctypes.c_double),
+        ("total_requests", ctypes.c_uint64),
         ("isl", ctypes.c_double),
         ("cpu_hit_blocks", ctypes.c_double),
     ]
 
 
-# Entry flag bits (must match layout.rs / schema 5).
+# Entry flag bits (must match layout.rs / schema 6).
 FLAG_BLOCKED = 0b0000_0001
 FLAG_VALID = 0b0000_0010
 
@@ -166,7 +167,7 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(ctypes.c_uint64),
     ]
-    # Schema 5 (per-slot CAS) surface. create_v4 / write_entry_v4 names are historical.
+    # Schema 6 (per-slot CAS) surface. create_v4 / write_entry_v4 names are historical.
     lib.mindie_wl_create_v4.restype = ctypes.c_int32
     lib.mindie_wl_create_v4.argtypes = [ctypes.c_char_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64)]
     lib.mindie_wl_snapshot_write_entry_v4.restype = ctypes.c_int32
@@ -221,7 +222,9 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_uint8),
         ctypes.POINTER(ctypes.c_uint8),
         ctypes.POINTER(ctypes.c_uint16),
+        ctypes.POINTER(ctypes.c_uint32),
         ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(ctypes.c_double),
         ctypes.POINTER(ctypes.c_double),
     ]
@@ -312,7 +315,7 @@ class WorkloadShm:
         *,
         lib: ctypes.CDLL | None = None,
     ) -> "WorkloadShm":
-        """Create and own a new schema-5 (per-slot CAS) segment."""
+        """Create and own a new schema-6 (per-slot CAS) segment."""
         lib = lib or load_native_library()
         handle = ctypes.c_uint64(0)
         _check(
@@ -345,7 +348,7 @@ class WorkloadShm:
         _check(self._lib.mindie_wl_heartbeat(self._handle), "heartbeat")
 
     # ------------------------------------------------------------------
-    # Schema 5: per-slot CAS data plane
+    # Schema 6: per-slot CAS data plane
     # ------------------------------------------------------------------
 
     def write_snapshot_v4(
@@ -354,7 +357,7 @@ class WorkloadShm:
         *,
         bump_instance_version: bool = True,
     ) -> None:
-        """Write a schema-5 snapshot: (instance_id, endpoint_id, role, generation, flags, tokens)/slot.
+        """Write a schema-6 snapshot: (instance_id, endpoint_id, role, generation, flags, tokens)/slot.
 
         ``tokens`` seeds a new pair only. A live pair's in-flight CAS value (tokens + overlay)
         is preserved by the native writer (stale caller tokens are ignored). ``(0, 0, *, *, 0, *)`` punches a hole.
@@ -435,13 +438,15 @@ class WorkloadShm:
         return touched.value
 
     def load_entry(self, slot: int) -> dict:
-        """Read one schema-5 entry including overlay ledger fields."""
+        """Read one schema-6 entry including counters and overlay ledger fields."""
         iid = ctypes.c_int32(0)
         eid = ctypes.c_int32(0)
         role = ctypes.c_uint8(0)
         flags = ctypes.c_uint8(0)
         generation = ctypes.c_uint16(0)
+        request_count = ctypes.c_uint32(0)
         tokens = ctypes.c_double(0.0)
+        total_requests = ctypes.c_uint64(0)
         prefill = ctypes.c_double(0.0)
         cpu = ctypes.c_double(0.0)
         _check(
@@ -453,7 +458,9 @@ class WorkloadShm:
                 ctypes.byref(role),
                 ctypes.byref(flags),
                 ctypes.byref(generation),
+                ctypes.byref(request_count),
                 ctypes.byref(tokens),
+                ctypes.byref(total_requests),
                 ctypes.byref(prefill),
                 ctypes.byref(cpu),
             ),
@@ -465,7 +472,9 @@ class WorkloadShm:
             "role": role.value,
             "flags": flags.value,
             "generation": generation.value,
+            "request_count": request_count.value,
             "active_tokens": tokens.value,
+            "total_requests": total_requests.value,
             "isl": prefill.value,
             "cpu_hit_blocks": cpu.value,
         }
@@ -492,7 +501,9 @@ class WorkloadShm:
                     "role": row.role,
                     "flags": row.flags,
                     "generation": row.generation,
+                    "request_count": row.request_count,
                     "active_tokens": row.active_tokens,
+                    "total_requests": row.total_requests,
                     "isl": row.isl,
                     "cpu_hit_blocks": row.cpu_hit_blocks,
                 }

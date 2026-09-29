@@ -215,7 +215,7 @@ async def test_writer_snapshot_and_heartbeat(native_lib):
         writer.write_snapshot()
         writer.write_heartbeat()
         header = writer.native.read_header()
-        assert header["schema_version"] == SCHEMA_VERSION == 5
+        assert header["schema_version"] == SCHEMA_VERSION == 6
         assert header["sequence"] % 2 == 0
         assert header["heartbeat"] == 1
         reader.attach()
@@ -280,6 +280,8 @@ async def test_writer_snapshot_preserves_cas_tokens(native_lib):
         first = writer.native.load_entry(0)
         assert first["instance_id"] == 1
         assert first["active_tokens"] == 10.0
+        assert first["request_count"] == 1
+        assert first["total_requests"] == 1
         assert first["isl"] == pytest.approx(12.0)
         assert first["cpu_hit_blocks"] == pytest.approx(3.0)
         second = writer.native.load_entry(1)

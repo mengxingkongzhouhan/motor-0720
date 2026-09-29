@@ -9,7 +9,7 @@
 # See the Mulan PSL v2 for more details.
 
 """
-WorkloadSharedMemoryReader: Worker-side reader for schema-5 workload shared memory.
+WorkloadSharedMemoryReader: Worker-side reader for schema-6 workload shared memory.
 
 Attaches via the Rust .so (not CPython SharedMemory) so resource_tracker cannot unlink
 a live segment. Token and overlay values are atomic-loaded every scoring pass; membership
@@ -51,7 +51,7 @@ def _shm_role_to_pdrole(role: int) -> PDRole:
 
 
 class WorkloadSharedMemoryReader:
-    """Reads schema-5 workload data from shared memory. Used by Worker process."""
+    """Reads schema-6 workload data from shared memory. Used by Worker process."""
 
     def __init__(self, shm_name: str):
         self._shm_name = shm_name
@@ -66,7 +66,7 @@ class WorkloadSharedMemoryReader:
         return self._native
 
     def entry_meta(self, instance_id: int, endpoint_id: int) -> dict[str, Any] | None:
-        """Last loaded schema-5 slot for (instance_id, endpoint_id), or None."""
+        """Last loaded schema-6 slot for (instance_id, endpoint_id), or None."""
         return self._meta.get((instance_id, endpoint_id))
 
     def attach(self) -> None:
@@ -88,7 +88,7 @@ class WorkloadSharedMemoryReader:
         Atomic-load tokens and overlay fields, then patch cache workload.
 
         Returns (instance_version, heartbeat_stale). Always loads tokens and overlay fields
-        (schema 5 multi-writer); membership seqlock retries reject a torn snapshot.
+        (schema 6 multi-writer); membership seqlock retries reject a torn snapshot.
 
         Heartbeat is checked before the stable-snapshot loop: it is bumped by its own atomic store
         outside the seqlock, so it stays readable even while ``sequence`` is stuck odd.

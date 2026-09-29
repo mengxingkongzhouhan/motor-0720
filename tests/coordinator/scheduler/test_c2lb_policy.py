@@ -190,6 +190,19 @@ class TestC2LBTokenizer:
 
         assert C2LBTokenizer is not TokenizerManager
 
+    def test_dsv4_without_chat_template_uses_sglang_markers(self):
+        tokenizer = Mock(chat_template=None)
+        tokenizer.encode.return_value = [1, 2, 3]
+        manager = C2LBTokenizer.__new__(C2LBTokenizer)
+        manager.tokenizer = tokenizer
+        manager._is_dsv4 = True
+        manager.engine_type = "sglang"
+        manager.openai_standard = "STANDARD"
+
+        assert manager.apply_chat_template([{"role": "user", "content": "hello"}]) == [1, 2, 3]
+        prompt = tokenizer.encode.call_args.args[0]
+        assert prompt == "<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>"
+
 
 class TestConductorParsing:
     def test_cpu_blocks_from_dp_blocks(self):
@@ -226,6 +239,21 @@ class TestPickGated:
     def test_request_cost_does_not_affect_order(self):
         ranked = sort_candidates([_cand(1, ledger_prefill=40, req_cost=90), _cand(2, ledger_prefill=80, req_cost=1)])
         assert [c.endpoint.id for c in ranked] == [1, 2]
+
+    def test_instance_tie_break_uses_each_instances_dp_count(self):
+        two_dp = _instance(1, [_endpoint(10), _endpoint(11)])
+        four_dp = _instance(2, [_endpoint(20), _endpoint(21), _endpoint(22), _endpoint(23)])
+        two_dp.gathered_workload.isl = 100
+        four_dp.gathered_workload.isl = 160
+
+        ranked = sort_candidates(
+            [
+                GatedCandidate(two_dp, two_dp.get_all_endpoints()[0], 0.0, 0.0),
+                GatedCandidate(four_dp, four_dp.get_all_endpoints()[0], 0.0, 0.0),
+            ]
+        )
+
+        assert [candidate.instance.id for candidate in ranked] == [2, 1]
 
     def test_first_under_both_averages_wins(self):
         # ledger isl of the gated pick must stay at or below the candidate mean;

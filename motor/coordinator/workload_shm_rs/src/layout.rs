@@ -11,18 +11,18 @@
 //! Byte layout for the workload shared-memory segment.
 //!
 //! This mirrors, byte-for-byte, the Python layout in
-//! `motor/coordinator/scheduler/runtime/workload_shm/layout.py` (SCHEMA_VERSION 5):
-//! a 64-byte header followed by N 40-byte entries, little-endian. Membership is seqlock-
-//! published by Mgmt; per-slot `active_tokens` / `isl` / `cpu_hit_blocks` are
-//! AtomicU64 CAS'd by Infer Workers.
+//! `motor/coordinator/scheduler/runtime/workload_shm/layout.py` (SCHEMA_VERSION 6):
+//! a 64-byte header followed by N 48-byte entries, little-endian. Membership is seqlock-
+//! published by Mgmt; per-slot request counters and workload ledgers are atomically updated
+//! by Infer Workers.
 
 /// Magic "WKLD" (0x57 0x4B 0x4C 0x44) little-endian.
 pub const MAGIC: u32 = 0x574B_4C44;
 /// Layout schema version. Must match the Python reader/owner.
-pub const SCHEMA_VERSION: u16 = 5;
+pub const SCHEMA_VERSION: u16 = 6;
 
 pub const HEADER_SIZE: usize = 64;
-pub const ENTRY_SIZE: usize = 40;
+pub const ENTRY_SIZE: usize = 48;
 pub const DEFAULT_MAX_ENTRIES: u32 = 10240;
 
 // Header field byte offsets (see layout.py HEADER_FMT "<I H H q I I Q Q Q Q Q").
@@ -44,29 +44,30 @@ pub const ROLE_HYBRID: u8 = 2;
 pub const ROLE_ENCODE: u8 = 3;
 
 // ---------------------------------------------------------------------------
-// Schema 5: per-slot atomic CAS layout. Header is 64B; seqlock covers only membership
-// (token/overlay CAS does NOT bump it), so readers must atomic-load ledger fields every pass.
+// Schema 6: per-slot atomic CAS layout. Header is 64B; seqlock covers only membership
+// (ledger/count updates do NOT bump it), so readers must atomic-load data fields every pass.
 // ---------------------------------------------------------------------------
 
-// Entry field byte offsets within a 40-byte slot.
+// Entry field byte offsets within a 48-byte slot.
 //
-// The three f64 ledgers sit at 16/24/32 so that, with an 8-aligned segment base and a 40B
+// The four 8-byte fields sit at 16/24/32/40 so that, with an 8-aligned segment base and a 48B
 // stride, every slot's atomics are 8-byte aligned (mandatory on aarch64 / Ascend hosts).
 pub const ENTRY_V4_OFF_INSTANCE_ID: usize = 0; // i32 (written on snapshot only)
 pub const ENTRY_V4_OFF_ENDPOINT_ID: usize = 4; // i32 (written on snapshot only)
 pub const ENTRY_V4_OFF_ROLE: usize = 8; // u8 (written on snapshot only)
 pub const ENTRY_V4_OFF_FLAGS: usize = 9; // u8, AtomicU8 (BLOCKED / VALID)
 pub const ENTRY_V4_OFF_GENERATION: usize = 10; // u16 (written on snapshot only; ABA guard)
-pub const ENTRY_V4_OFF_RESERVED: usize = 12; // u32
+pub const ENTRY_V6_OFF_REQUEST_COUNT: usize = 12; // u32, AtomicU32
 pub const ENTRY_V4_OFF_ACTIVE_TOKENS: usize = 16; // u64 (f64::to_bits), AtomicU64
-pub const ENTRY_V5_OFF_ISL: usize = 24; // u64 (f64::to_bits), AtomicU64
-pub const ENTRY_V5_OFF_CPU_HIT_BLOCKS: usize = 32; // u64 (f64::to_bits), AtomicU64
+pub const ENTRY_V6_OFF_TOTAL_REQUESTS: usize = 24; // u64, AtomicU64
+pub const ENTRY_V5_OFF_ISL: usize = 32; // u64 (f64::to_bits), AtomicU64
+pub const ENTRY_V5_OFF_CPU_HIT_BLOCKS: usize = 40; // u64 (f64::to_bits), AtomicU64
 
 // Entry flags bits.
 pub const FLAG_BLOCKED: u8 = 0b0000_0001; // circuit-breaker OPEN: allocate CAS must refuse
 pub const FLAG_VALID: u8 = 0b0000_0010; // slot holds a live (instance, endpoint)
 
-const _: () = assert!(ENTRY_V5_OFF_CPU_HIT_BLOCKS + 8 <= ENTRY_SIZE);
+const _: () = assert!(ENTRY_V5_OFF_CPU_HIT_BLOCKS + 8 == ENTRY_SIZE);
 
 /// Total segment size in bytes for `max_entries` slots.
 pub fn total_size(max_entries: u32) -> usize {
@@ -85,22 +86,33 @@ mod tests {
     #[test]
     fn sizes_match_python_layout() {
         assert_eq!(HEADER_SIZE, 64);
-        assert_eq!(ENTRY_SIZE, 40);
-        assert_eq!(total_size(10240), 64 + 10240 * 40);
+        assert_eq!(ENTRY_SIZE, 48);
+        assert_eq!(total_size(10240), 64 + 10240 * 48);
         assert_eq!(entry_offset(0), 64);
-        assert_eq!(entry_offset(1), 104);
+        assert_eq!(entry_offset(1), 112);
     }
 
     #[test]
-    fn schema5_ledgers_are_8_byte_aligned_for_every_slot() {
+    fn schema6_ledgers_are_aligned_for_every_slot() {
         for slot in 0..1024u32 {
+            let count_off = entry_offset(slot) + ENTRY_V6_OFF_REQUEST_COUNT;
+            assert_eq!(
+                count_off % 4,
+                0,
+                "slot {slot} request_count offset {count_off} not 4-aligned"
+            );
             for field in [
                 ENTRY_V4_OFF_ACTIVE_TOKENS,
+                ENTRY_V6_OFF_TOTAL_REQUESTS,
                 ENTRY_V5_OFF_ISL,
                 ENTRY_V5_OFF_CPU_HIT_BLOCKS,
             ] {
                 let off = entry_offset(slot) + field;
-                assert_eq!(off % 8, 0, "slot {slot} field {field} offset {off} not 8-aligned");
+                assert_eq!(
+                    off % 8,
+                    0,
+                    "slot {slot} field {field} offset {off} not 8-aligned"
+                );
             }
         }
     }

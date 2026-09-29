@@ -6,11 +6,8 @@
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
 
-import json
 import os
 import threading
-import time
-from pathlib import Path
 
 from motor.common.resources.instance import Instance, PDRole
 from motor.common.utils.singleton import ThreadSafeSingleton
@@ -36,11 +33,7 @@ from motor.coordinator.api_client.conductor_api_client import (
     TENANT_ID,
     conductor_instance_id,
 )
-from motor.coordinator.scheduler.policy.utils import (
-    preprocess_input,
-    preprocess_messages_for_dsv4,
-    preprocess_messages_for_standard,
-)
+from motor.coordinator.scheduler.policy.tokenizer_common import SchedulingTokenizerMixin
 
 __all__ = ["KvCacheAffinityPolicy", "TokenizerManager", "adapt_context_budget"]
 
@@ -48,7 +41,6 @@ logger = get_logger(__name__)
 
 # Endpoints kept by the load-gated mode when kv_affinity.load_gate_topn is left unset (0).
 _DEFAULT_LOAD_GATE_TOPN = 2
-_TOKENIZER_LOAD_RETRY_SECONDS = 30.0
 
 
 def adapt_context_budget(
@@ -691,7 +683,7 @@ class KvCacheAffinityPolicy(BaseSchedulingPolicy):
         return LoadBalancePolicy.select_endpoint_from_list(instances, role)
 
 
-class TokenizerManager(ThreadSafeSingleton):
+class TokenizerManager(SchedulingTokenizerMixin, ThreadSafeSingleton):
     """Tokenizer shared directly by KV affinity and context-budget routing."""
 
     def __init__(self, config: CoordinatorConfig | None = None):
@@ -734,162 +726,3 @@ class TokenizerManager(ThreadSafeSingleton):
             self._is_dsv4,
             not eager_load,
         )
-
-    def get_tokenizer(self):
-        """Load the local tokenizer lazily and retry transient failures after a cooldown."""
-        if self.tokenizer is not None:
-            return self.tokenizer
-        if time.monotonic() < self._next_load_attempt_at:
-            return None
-        with self.config_lock:
-            if self.tokenizer is not None:
-                return self.tokenizer
-            if time.monotonic() < self._next_load_attempt_at:
-                return None
-            if not getattr(self, "model_path", ""):
-                return None
-            try:
-                if self.engine_type == "vllm" and self._is_deepseek_v4_model(self.model_path):
-                    from vllm.tokenizers.deepseek_v4 import DeepseekV4Tokenizer  # pylint: disable=import-error,no-name-in-module
-
-                    self.tokenizer = DeepseekV4Tokenizer.from_pretrained(self.model_path, trust_remote_code=True)
-                    self._is_dsv4 = True
-                else:
-                    from transformers import AutoTokenizer
-
-                    self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
-            except Exception as exc:
-                self._next_load_attempt_at = time.monotonic() + _TOKENIZER_LOAD_RETRY_SECONDS
-                logger.warning(
-                    "Tokenizer load failed; retrying in %.0fs: %s",
-                    _TOKENIZER_LOAD_RETRY_SECONDS,
-                    exc,
-                )
-                return None
-            self._next_load_attempt_at = 0.0
-            return self.tokenizer
-
-    def apply_chat_template(self, messages: list, tools: list | None = None, req_data: dict | None = None) -> list[int]:
-        if self.get_tokenizer() is None:
-            return []
-        try:
-            if self._is_dsv4:
-                return self._apply_chat_template_dsv4(messages, tools, req_data)
-            if self.openai_standard != "STANDARD":
-                return self._apply_chat_template_with_preprocess(messages, tools, req_data)
-            return self._apply_chat_template_standard(messages, tools, req_data)
-        except Exception as exc:
-            if self._is_dsv4:
-                logger.error("kv_affinity dsv4 tokenize failed; returning []: %s", exc)
-                return []
-            logger.warning("kv_affinity primary tokenize path failed: %s; trying fallback", exc)
-            return self._safe_fallback_encode(messages, tools, req_data)
-
-    def encode(self, prompt: str) -> list[int]:
-        tokenizer = self.get_tokenizer()
-        return [] if tokenizer is None else tokenizer.encode(prompt)
-
-    @staticmethod
-    def _read_model_config_dict(model_path: str) -> dict | None:
-        try:
-            with open(Path(model_path) / "config.json", encoding="utf-8") as file:
-                data = json.load(file)
-            return data if isinstance(data, dict) else None
-        except (OSError, ValueError) as exc:
-            logger.debug("Could not read config.json from %s: %s", model_path, exc)
-            return None
-
-    @staticmethod
-    def _is_deepseek_v4_model(model_path: str) -> bool:
-        config_dict = TokenizerManager._read_model_config_dict(model_path)
-        if not config_dict:
-            return False
-        return config_dict.get("model_type") == "deepseek_v4" or "DeepseekV4ForCausalLM" in (
-            config_dict.get("architectures") or []
-        )
-
-    @staticmethod
-    def _build_dsv4_chat_template_kwargs(req_data: dict | None) -> dict:
-        kwargs: dict = {"tokenize": True, "drop_thinking": True}
-        if not req_data:
-            return kwargs
-        reasoning_effort = req_data.get("reasoning_effort")
-        if reasoning_effort is not None:
-            kwargs["reasoning_effort"] = reasoning_effort
-        chat_template_kwargs = req_data.get("chat_template_kwargs") or {}
-        if isinstance(chat_template_kwargs, dict):
-            kwargs.update(chat_template_kwargs)
-        if reasoning_effort is not None and "enable_thinking" not in kwargs:
-            kwargs["enable_thinking"] = reasoning_effort != "none"
-        return kwargs
-
-    @staticmethod
-    def _build_standard_chat_template_kwargs(req_data: dict | None, *, tokenize: bool) -> dict:
-        kwargs: dict = {"add_generation_prompt": True, "tokenize": tokenize}
-        if tokenize:
-            kwargs["return_dict"] = False
-        if not req_data:
-            return kwargs
-        if isinstance(req_data.get("add_generation_prompt"), bool):
-            kwargs["add_generation_prompt"] = req_data["add_generation_prompt"]
-        if req_data.get("continue_final_message"):
-            kwargs["continue_final_message"] = True
-            kwargs["add_generation_prompt"] = False
-        if req_data.get("documents") is not None:
-            kwargs["documents"] = req_data["documents"]
-        template_kwargs = req_data.get("chat_template_kwargs") or {}
-        if isinstance(template_kwargs, dict):
-            reserved = {
-                "tokenize",
-                "return_dict",
-                "conversation",
-                "tools",
-                "add_generation_prompt",
-                "continue_final_message",
-            }
-            kwargs.update({key: value for key, value in template_kwargs.items() if key not in reserved})
-        reasoning_effort = req_data.get("reasoning_effort")
-        if reasoning_effort is not None:
-            kwargs["reasoning_effort"] = reasoning_effort
-            kwargs.setdefault("enable_thinking", reasoning_effort != "none")
-        thinking = req_data.get("thinking")
-        if isinstance(thinking, dict) and "enable_thinking" not in kwargs:
-            if thinking.get("type") == "enabled":
-                kwargs["enable_thinking"] = True
-            elif thinking.get("type") == "disabled":
-                kwargs["enable_thinking"] = False
-        return kwargs
-
-    def _apply_chat_template_dsv4(self, messages: list, tools: list | None, req_data: dict | None) -> list[int]:
-        messages, tools = preprocess_messages_for_dsv4(messages, tools)
-        result = self.tokenizer.apply_chat_template(
-            messages, tools=tools, **self._build_dsv4_chat_template_kwargs(req_data)
-        )
-        return result if isinstance(result, list) else self.tokenizer.encode(result, add_special_tokens=False)
-
-    def _apply_chat_template_standard(self, messages: list, tools: list | None, req_data: dict | None) -> list[int]:
-        return self.tokenizer.apply_chat_template(
-            conversation=preprocess_messages_for_standard(messages),
-            tools=tools,
-            **self._build_standard_chat_template_kwargs(req_data, tokenize=True),
-        )
-
-    def _apply_chat_template_with_preprocess(
-        self, messages: list, tools: list | None, req_data: dict | None
-    ) -> list[int]:
-        messages, tools = preprocess_input(messages, tools)
-        prompt = self.tokenizer.apply_chat_template(
-            conversation=messages,
-            tools=tools,
-            **self._build_standard_chat_template_kwargs(req_data, tokenize=False),
-        )
-        return self.tokenizer.encode(prompt)
-
-    def _safe_fallback_encode(self, messages: list, tools: list | None, req_data: dict | None) -> list[int]:
-        try:
-            if self.openai_standard == "STANDARD":
-                return self._apply_chat_template_with_preprocess(messages, tools, req_data)
-            return self._apply_chat_template_standard(messages, tools, req_data)
-        except Exception as exc:
-            logger.error("kv_affinity tokenize failed on both primary and fallback paths; returning []: %s", exc)
-            return []

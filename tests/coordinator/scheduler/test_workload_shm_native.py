@@ -9,7 +9,7 @@
 # See the Mulan PSL v2 for more details.
 
 """
-Native shared-memory writer contract (schema 5) and per-slot CAS.
+Native shared-memory writer contract (schema 6) and per-slot CAS.
 
 Drives ``libmindie_workload_shm`` via ctypes and reads back with the production Python reader.
 """
@@ -85,11 +85,11 @@ def _read_with_python(name: str, role: PDRole | None = None) -> tuple[tuple[int 
 
 
 def test_native_reports_abi(lib):
-    """ABI version is stable; production segments are schema 5."""
+    """ABI version is stable; production segments are schema 6."""
     assert lib.mindie_wl_abi_version() >= MIN_ABI_VERSION
-    assert MIN_ABI_VERSION == 3
-    assert lib.mindie_wl_schema_version() == 5
-    assert ENTRY_SIZE == 40
+    assert MIN_ABI_VERSION == 4
+    assert lib.mindie_wl_schema_version() == 6
+    assert ENTRY_SIZE == 48
     packed = pack_entry(
         WorkloadShmEntry(
             instance_id=1,
@@ -104,13 +104,13 @@ def test_native_reports_abi(lib):
     name = _unique("ab")
     shm = WorkloadShm.create_v4(name, 4, lib=lib)
     try:
-        assert shm.read_header()["schema_version"] == SCHEMA_VERSION == 5
+        assert shm.read_header()["schema_version"] == SCHEMA_VERSION == 6
     finally:
         shm.close(unlink=True)
 
 
 def test_native_writer_roundtrips_to_python_reader(lib):
-    """Rust schema-5 snapshot -> production Python reader."""
+    """Rust schema-6 snapshot -> production Python reader."""
     name = _unique("rt")
     shm = WorkloadShm.create_v4(name, 16, lib=lib)
     try:
@@ -125,7 +125,7 @@ def test_native_writer_roundtrips_to_python_reader(lib):
         shm.heartbeat()
 
         header = shm.read_header()
-        assert header["schema_version"] == 5
+        assert header["schema_version"] == 6
         assert header["sequence"] % 2 == 0
         assert header["entry_count"] == 3
         assert header["instance_version"] == 1
@@ -234,20 +234,20 @@ def test_probe_so_abi_rejects_missing_and_garbage(tmp_path):
 
 
 def test_stale_abi_library_is_refused(tmp_path, monkeypatch):
-    """ABI 2 leftover from a previous branch must not start this checkout."""
+    """ABI 3 leftover from a previous branch must not start this checkout."""
     so = tmp_path / "libmindie_workload_shm.so"
     so.write_bytes(b"fake")
 
     class _FakeLib:
         def mindie_wl_abi_version(self):
-            return 2
+            return 3
 
     monkeypatch.setattr(native, "_bind", lambda _lib: _FakeLib())
     monkeypatch.setattr(native.ctypes, "CDLL", lambda _path: object())
     with pytest.raises(NativeWorkloadShmUnavailable) as exc:
         load_native_library(path=str(so))
     message = str(exc.value)
-    assert "ABI 2 < 3" in message
+    assert "ABI 3 < 4" in message
     assert "SKIP_WORKLOAD_SHM_BUILD=0" in message
     assert "leftover .so" in message
 
@@ -282,18 +282,15 @@ def _poke_schema_version(name: str, schema: int) -> None:
 
 
 def test_schema_mismatch_is_refused(lib):
-    """A non-schema-5 header is refused by the Reader."""
+    """A non-schema-6 header is refused during native attach."""
     name = _unique("sm")
     shm = WorkloadShm.create_v4(name, 8, lib=lib)
     reader = WorkloadSharedMemoryReader(name)
     try:
         shm.write_snapshot_v4([(1, 10, 0, 0, FLAG_VALID, 7.0)])
         _poke_schema_version(name, 3)
-        reader.attach()
-        cache = _FakeCache()
-        instance_version, _stale = reader.read_and_patch_cache(cache, role=None)
-        assert instance_version is None
-        assert cache.patched == {}
+        with pytest.raises(NativeWorkloadShmError, match="SchemaMismatch"):
+            reader.attach()
     finally:
         reader.detach()
         shm.close(unlink=True)
@@ -327,6 +324,8 @@ def test_snapshot_v4_does_not_clobber_cas_tokens(lib):
         shm.write_snapshot_v4([(1, 10, ROLE_PREFILL, 0, FLAG_VALID, 0.0)])
         entry = shm.load_entry(0)
         assert entry["active_tokens"] == 11.0
+        assert entry["request_count"] == 1
+        assert entry["total_requests"] == 1
         assert entry["isl"] == 12.0
         assert entry["cpu_hit_blocks"] == 3.0
         status, _ = shm.cas_add(1, 10, 0, 11.0, float("nan"))
@@ -357,6 +356,8 @@ def test_snapshot_v4_copies_tokens_when_pair_moves_slot(lib):
         assert entry["instance_id"] == 2
         assert entry["endpoint_id"] == 20
         assert entry["active_tokens"] == 7.0
+        assert entry["request_count"] == 1
+        assert entry["total_requests"] == 1
         assert entry["isl"] == 5.0
         assert entry["cpu_hit_blocks"] == 2.0
     finally:
@@ -401,6 +402,8 @@ def test_cas_add_writes_overlay_fields(lib):
         assert actual == 4.0
         entry = shm.load_entry(0)
         assert entry["active_tokens"] == pytest.approx(4.0)
+        assert entry["request_count"] == 1
+        assert entry["total_requests"] == 1
         assert entry["isl"] == pytest.approx(12.0)
         assert entry["cpu_hit_blocks"] == pytest.approx(3.0)
         status, actual = shm.cas_add(
@@ -408,6 +411,8 @@ def test_cas_add_writes_overlay_fields(lib):
         )
         assert status == STATUS_CHANGED
         entry = shm.load_entry(0)
+        assert entry["request_count"] == 1
+        assert entry["total_requests"] == 1
         assert entry["isl"] == pytest.approx(12.0)
         assert entry["cpu_hit_blocks"] == pytest.approx(3.0)
         status, _ = shm.cas_add(1, 10, 0, expected=4.0, delta=1.0, isl=float("nan"))
@@ -421,6 +426,8 @@ def test_cas_add_writes_overlay_fields(lib):
         assert status == STATUS_OK
         entry = shm.load_entry(0)
         assert entry["active_tokens"] == pytest.approx(0.0)
+        assert entry["request_count"] == 0
+        assert entry["total_requests"] == 1
         assert entry["isl"] == pytest.approx(0.0)
         assert entry["cpu_hit_blocks"] == pytest.approx(0.0)
     finally:
@@ -538,7 +545,7 @@ def test_multiprocess_cas_conserves_total(lib):
 
 def test_load_entries_matches_per_slot_and_cas_uses_slot(lib):
     """One FFI refresh must equal N load_entry calls; cas_add with a stale slot is SLOT_INVALID."""
-    assert ctypes.sizeof(native._LoadedEntry) == 40
+    assert ctypes.sizeof(native._LoadedEntry) == 48
     shm = WorkloadShm.create_v4(_unique("batch"), 16, lib=lib)
     try:
         shm.write_snapshot_v4(
@@ -552,6 +559,8 @@ def test_load_entries_matches_per_slot_and_cas_uses_slot(lib):
         assert batched[0]["instance_id"] == 1
         assert batched[1]["instance_id"] == 2
         assert batched[0]["active_tokens"] == shm.load_entry(0)["active_tokens"]
+        assert batched[0]["request_count"] == shm.load_entry(0)["request_count"]
+        assert batched[0]["total_requests"] == shm.load_entry(0)["total_requests"]
         assert batched[0]["isl"] == shm.load_entry(0)["isl"]
         assert batched[0]["cpu_hit_blocks"] == shm.load_entry(0)["cpu_hit_blocks"]
         status, actual = shm.cas_add(1, 10, 0, 0.0, 3.0, slot=0)

@@ -310,7 +310,7 @@ class _SchedulerInstanceCache:
     ) -> None:
         """Accumulate isl / cpu_hit_blocks after a successful SHM CAS and stamp the endpoint.
 
-        Scoring refresh later SETs the same fields from schema-5 SHM.
+        Scoring refresh later SETs the same fields from schema-6 SHM.
         """
         key = (instance_id, endpoint_id)
         old_isl, old_cpu = self._ledger_overlay.get(key, (0.0, 0.0))
@@ -859,7 +859,7 @@ class AsyncSchedulerClient:
         self._dp_stats.emit_window(self._snapshot_dp_stats())
 
     def _snapshot_dp_stats(self) -> list[tuple[int, int, float]]:
-        """Read current per-DP ``active_tokens`` from schema-5 SHM."""
+        """Read current per-DP ``active_tokens`` from schema-6 SHM."""
         reader = self._workload_reader
         native = getattr(reader, "native", None) if reader is not None else None
         if native is None:
@@ -1048,7 +1048,7 @@ class AsyncSchedulerClient:
     ) -> Workload:
         """Same commit formula the former ALLOCATE_ONLY handler used (R4).
 
-        c2lb stamps schema-5 overlay ``isl = max(0, request_isl)`` and cpu_blocks.
+        c2lb stamps schema-6 overlay ``isl = max(0, request_isl)`` and cpu_blocks.
         kv_cache_affinity commits SHM ``active_tokens`` as ``isl - matched`` and leaves
         overlay ``isl`` / ``cpu_hit_blocks`` at 0. RR/LB leave overlay fields at 0.
         """
@@ -1102,7 +1102,7 @@ class AsyncSchedulerClient:
         required_engine_type: str | None = None,
         required_dispatch_capability: str | None = None,
     ) -> tuple[Instance, Endpoint, Workload] | None:
-        """Select locally, then CAS-commit on schema-5 SHM (no ALLOCATE_ONLY ZMQ)."""
+        """Select locally, then CAS-commit on schema-6 SHM (no ALLOCATE_ONLY ZMQ)."""
         from motor.coordinator.scheduler.runtime.workload_shm.layout import FLAG_BLOCKED
         from motor.coordinator.scheduler.runtime.workload_shm.native import (
             STATUS_BLOCKED,
@@ -1650,7 +1650,7 @@ class AsyncSchedulerClient:
         return False
 
     async def update_workload(self, params: UpdateWorkloadParams) -> bool:
-        """Release path: CAS-sub floor 0 on schema-5 SHM (no UPDATE_WORKLOAD ZMQ)."""
+        """Release path: CAS-sub floor 0 on schema-6 SHM (no UPDATE_WORKLOAD ZMQ)."""
         from motor.coordinator.scheduler.runtime.workload_shm.native import STATUS_OK
 
         role_str = params.role.value if hasattr(params.role, "value") else str(params.role)

@@ -27,12 +27,12 @@ class Workload(BaseModel):
         default=0,
         description="In-flight prompt length on this endpoint: sum of max(0, isl) over "
         "requests currently running here (c2lb only); 0 for kv_cache_affinity / RR / LB. "
-        "Carried in schema-5 SHM alongside active_tokens (cross-worker).",
+        "Carried in schema-6 SHM alongside active_tokens (cross-worker).",
     )
     cpu_hit_blocks: float = Field(
         default=0,
         description="CPU-tier KV blocks the in-flight requests on this endpoint matched (c2lb); "
-        "carried in schema-5 SHM alongside active_tokens",
+        "carried in schema-6 SHM alongside active_tokens",
     )
 
     def __iadd__(self, other):

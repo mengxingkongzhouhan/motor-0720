@@ -899,11 +899,14 @@ class TestKvCacheAffinityTokenizationUtils(unittest.TestCase):
 
 
 class TestTokenizerManagerDsv4(unittest.TestCase):
-    def _make_manager(self, tokenizer: Mock, *, is_dsv4: bool) -> TokenizerManager:
+    def _make_manager(
+        self, tokenizer: Mock, *, is_dsv4: bool, engine_type: str = "vllm"
+    ) -> TokenizerManager:
         # Bypass singleton init (which tries to load real tokenizers / config).
         manager = TokenizerManager.__new__(TokenizerManager)
         manager.tokenizer = tokenizer
         manager._is_dsv4 = is_dsv4
+        manager.engine_type = engine_type
         manager.openai_standard = os.environ.get("OPENAI_STANDARD", "STANDARD")
         return manager
 
@@ -996,6 +999,20 @@ class TestTokenizerManagerDsv4(unittest.TestCase):
         out = manager._apply_chat_template_dsv4([{"role": "user", "content": "hi"}], None, None)
         self.assertEqual(out, [9, 9])
         tokenizer.encode.assert_called_once_with("PROMPT", add_special_tokens=False)
+
+    def test_apply_chat_template_dsv4_without_template_uses_sglang_markers(self):
+        tokenizer = Mock(chat_template=None)
+        tokenizer.encode.return_value = [7, 8]
+        manager = self._make_manager(tokenizer, is_dsv4=True, engine_type="sglang")
+
+        out = manager._apply_chat_template_dsv4([{"role": "user", "content": "hi"}], None, None)
+
+        self.assertEqual(out, [7, 8])
+        tokenizer.encode.assert_called_once_with(
+            "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>",
+            add_special_tokens=False,
+        )
+        tokenizer.apply_chat_template.assert_not_called()
 
     def test_apply_chat_template_dsv4_primary_failure_fail_closed(self):
         tokenizer = Mock()
@@ -1595,8 +1612,8 @@ class TestTokenizerManagerFunction(unittest.TestCase):
         self.assertEqual(result, [])
 
     @patch('motor.config.coordinator.CoordinatorConfig')
-    def test_dsv4_tokenizer_only_for_vllm_engine(self, mock_config_class):
-        """DeepSeek V4 vLLM tokenizer must only be used when engine_type=vllm."""
+    def test_dsv4_tokenizer_falls_back_without_vllm_for_sglang(self, mock_config_class):
+        """SGLang DSV4 keeps DSV4 semantics when the vLLM tokenizer is unavailable."""
         mock_config = Mock()
         mock_config.scheduler_config.kv_conductor_config.conductor_service = "test_service"
         mock_config.scheduler_config.kv_conductor_config.model_path = "/path/to/model"
@@ -1604,17 +1621,23 @@ class TestTokenizerManagerFunction(unittest.TestCase):
         mock_config.tracer_config.endpoint = ""
         mock_config_class.return_value = mock_config
 
-        # If the code accidentally tries to import vllm.tokenizers.deepseek_v4 on sglang,
-        # environments without vllm installed would crash. We assert we fall back to transformers.
         mock_tokenizer = Mock()
         transformers_mod = Mock()
         transformers_mod.AutoTokenizer.from_pretrained.return_value = mock_tokenizer
-        with patch.dict("sys.modules", {"transformers": transformers_mod}):
+        with patch.dict(
+            "sys.modules",
+            {
+                "transformers": transformers_mod,
+                "vllm": None,
+                "vllm.tokenizers": None,
+                "vllm.tokenizers.deepseek_v4": None,
+            },
+        ):
             with patch.object(TokenizerManager, "_is_deepseek_v4_model", return_value=True):
                 manager = TokenizerManager(mock_config)
 
         self.assertIs(manager.tokenizer, mock_tokenizer)
-        self.assertFalse(manager._is_dsv4)
+        self.assertTrue(manager._is_dsv4)
         transformers_mod.AutoTokenizer.from_pretrained.assert_called_once()
 
 

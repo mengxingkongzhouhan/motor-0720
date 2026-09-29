@@ -1439,6 +1439,17 @@ class AsyncSchedulerClient:
                     proposed_instance.id,
                     proposed_endpoint.id,
                 )
+                if candidate_policy == CANDIDATE_POLICY_C2LB:
+                    try:
+                        C2LBPolicy.prefetch_ssd_hits_for_dp(req_info, out_instance.id, out_endpoint.id)
+                    except Exception as exc:  # noqa: BLE001 - allocation is already committed
+                        logger.warning(
+                            "c2lb SSD prefetch after allocate failed req_id=%s instance=%s endpoint=%s: %s",
+                            req_info.req_id,
+                            out_instance.id,
+                            out_endpoint.id,
+                            exc,
+                        )
                 return (out_instance, out_endpoint, committed)
             if status == STATUS_CHANGED:
                 cas_counts["changed"] += 1

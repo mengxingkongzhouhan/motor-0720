@@ -282,18 +282,15 @@ def _poke_schema_version(name: str, schema: int) -> None:
 
 
 def test_schema_mismatch_is_refused(lib):
-    """A non-schema-6 header is refused by the Reader."""
+    """A non-schema-6 header is refused during native attach."""
     name = _unique("sm")
     shm = WorkloadShm.create_v4(name, 8, lib=lib)
     reader = WorkloadSharedMemoryReader(name)
     try:
         shm.write_snapshot_v4([(1, 10, 0, 0, FLAG_VALID, 7.0)])
         _poke_schema_version(name, 3)
-        reader.attach()
-        cache = _FakeCache()
-        instance_version, _stale = reader.read_and_patch_cache(cache, role=None)
-        assert instance_version is None
-        assert cache.patched == {}
+        with pytest.raises(NativeWorkloadShmError, match="SchemaMismatch"):
+            reader.attach()
     finally:
         reader.detach()
         shm.close(unlink=True)
